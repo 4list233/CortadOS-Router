@@ -114,20 +114,95 @@ def _plain(raw: bytes) -> str:
     return re.sub(r"[ \t]+", " ", raw.decode("utf-8", "replace"))
 
 
-# A full redraw: erase display (2J, 3J), terminal reset (ESC c), an alternate-screen switch (1049/1047/47, either way), or
-# cursor home followed by erase-below. Text painted before the last one is no longer on screen.
-_SCREEN_RESET = re.compile(rb"\x1b\[[23]J|\x1bc|\x1b\[\?(?:1049|1047|47)[hl]|\x1b\[(?:1?(?:;1)?)?[Hf]\x1b\[0?J")
+# The trust prompt's Enter (#144 fix round 2, review P1): the prompt is answerable only while it is the LAST thing the CLI
+# painted. Round 1 looked at the text since the last full redraw, but a line-by-line erase (cursor up + erase line) or
+# cursor home + SGR + erase-below removed the visible prompt and left it counted, so the Enter reached whatever screen
+# came next. Now: after the end of the last trust-prompt match, only bytes that cannot remove or replace it may follow.
+# Every other byte, escape sequence (erase, cursor move, scroll, alt-screen, reset, title, anything not understood,
+# an unfinished one) or line of text waits until the full prompt is painted again. Fail closed: a missed probe costs one
+# sample, a stray Enter answers a screen nobody read.
+_ESC_TOKEN = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[^\[\]])?")
+_HARMLESS_ESC = re.compile(rb"\x1b\[[0-9;:]*m"            # SGR colour / weight: changes no character on screen
+                           rb"|\x1b\[\?25[hl]"             # cursor show / hide
+                           rb"|\x1b\[>?0?c|\x1b\[6n")      # terminal identity and cursor-position queries: paint nothing
+_TRUST_OPTION_LINE = re.compile(          # the prompt's own option and hint lines, e.g. "> 1. Yes, proceed", "Enter to confirm"
+    r"\s*(?:[>❯›▸•*-]\s*)?(?:\[?\d\]?[.):]?\s*)?"
+    r"(?:yes|no|y/n|\[y/n\]|exit|quit|cancel|(?:do not|don'?t) trust|trust|(?:press |use )?(?:enter|esc|↑|↓))"
+    r"(?:[\s,.!:;/·()-]|$)(?!.*(?:sign|log\s?in|account|auth|google|consent|access|load|wait|connect))"
+    r"[^\n]{0,60}", re.I)
+_TRUST_TAIL_LINES = 6        # option and hint lines allowed after the prompt; more is another screen
 
 
-def _current_screen(raw: bytes) -> bytes:
-    """The bytes painted since the last full redraw (_SCREEN_RESET): what is on screen now, not the whole transcript.
-    The trust prompt's Enter is judged on this alone (#144 fix round: a trust prompt cleared away and replaced by an
-    account picker must not still count as shown). Line-erasing redraws (no full clear) are not cut, so stale text may
-    remain in it; that only ever adds text, and every refusal pattern is also checked on it and on the whole transcript."""
+def _trust_prompt_last(raw: bytes, prompt: str) -> bool:
+    """True only if `prompt` (a regex) was painted and nothing painted after its last match can have removed or replaced
+    it (see the comment above). The match is searched in the printed text alone, SGR dropped; any other escape splits it."""
+    pieces: list[tuple[bool, bytes]] = []      # (is_escape, bytes) in stream order
+    pos = 0
+    for m in _ESC_TOKEN.finditer(raw):
+        if m.start() > pos:
+            pieces.append((False, raw[pos:m.start()]))
+        pieces.append((True, m.group()))
+        pos = m.end()
+    if pos < len(raw):
+        pieces.append((False, raw[pos:]))
+    flat: list[str] = []
+    where: list[tuple[int, int]] = []          # flat char -> (piece index, byte offset after it within the piece)
+    for i, (esc, b) in enumerate(pieces):
+        if esc:
+            if not re.fullmatch(rb"\x1b\[[0-9;:]*m", b):
+                flat.append("\x00")
+                where.append((i, len(b)))
+            continue
+        for j in range(len(b)):
+            flat.append(chr(b[j]))             # bytes as latin-1 chars: the prompt is ASCII, offsets stay byte offsets
+            where.append((i, j + 1))
+    text = "".join(flat)
     last = None
-    for last in _SCREEN_RESET.finditer(raw):
+    for last in re.finditer(prompt, text, re.I):
         pass
-    return raw[last.end():] if last else raw
+    if last is None or last.end() == 0:
+        return False
+    i, off = where[last.end() - 1]
+    tail = [(False, pieces[i][1][off:])] + pieces[i + 1:]
+    line, lines, first = b"", 0, True
+    for k, (esc, b) in enumerate(tail):
+        if esc:
+            if not _HARMLESS_ESC.fullmatch(b):
+                return False
+            continue
+        for j, c in enumerate(b):
+            if c == 0x0D:                      # CR only before LF or at the very end: never a carriage return to overwrite
+                rest = b[j + 1:] or b"".join(x for e, x in tail[k + 1:] if not e)
+                if rest and rest[:1] != b"\n":
+                    return False
+            elif c == 0x0A:
+                if not first and line.strip():
+                    lines += 1
+                    if lines > _TRUST_TAIL_LINES or not _trust_line_ok(line):
+                        return False
+                elif first and not _first_line_ok(line):
+                    return False
+                line, first = b"", False
+            elif c == 0x09 or c >= 0x20:
+                line += bytes([c])
+            else:                              # backspace, BEL, any other control: not understood, so not answerable
+                return False
+    if first:
+        return _first_line_ok(line)
+    return not line.strip() or (lines < _TRUST_TAIL_LINES and _trust_line_ok(line))
+
+
+def _first_line_ok(rest: bytes) -> bool:
+    """The rest of the prompt's own line ("[Y/n]", " folder?"): plain text, short."""
+    return len(rest) <= 80
+
+
+def _trust_line_ok(line: bytes) -> bool:
+    try:
+        shown = line.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return bool(_TRUST_OPTION_LINE.fullmatch(shown))
 
 
 def _boot_failure_kind(text: str) -> str:
@@ -205,9 +280,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `refuse_unsettled` is ((kind, regex), ...) like `refuse`, but checked only when the probe is about to act (at the end
     of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
-    The trust prompt counts only on the CURRENT screen (`_current_screen`: text since the last full redraw), checked when
-    the boot read ends and again in the write path itself: a prompt cleared away and replaced (by an account picker,
-    say) gets no Enter, and every check applies. The read after the answer gets what is left of the one boot_s window.
+    The trust prompt counts only while it is the LAST thing painted (`_trust_prompt_last`: after it only SGR, cursor
+    show/hide, terminal queries, whitespace and its own option lines), checked when the boot read ends and again in the
+    write path itself: a prompt erased or replaced (by an account picker, or by anything at all) gets no Enter, and
+    every check applies. The read after the answer gets what is left of the one boot_s window.
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
     `on_boot` may raise to refuse: it runs before the first keystroke of `command`.
     The trust prompt's Enter is checked against `refuse` only, not `refuse_unsettled`: the prompt is not a sign-in screen,
@@ -278,16 +354,21 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                     raise refusal(kind, where, "unsettled", acting, shown)
 
     def trust_on_screen() -> bool:
-        """The trust prompt is on the CURRENT screen (since the last full redraw), not merely somewhere in the transcript."""
-        return bool(re.search(_TRUST_PROMPT, _plain(_current_screen(buf)), re.I))
+        """The trust prompt is the last thing painted (_trust_prompt_last), not merely somewhere in the transcript."""
+        return _trust_prompt_last(buf, _TRUST_PROMPT)
 
-    def send(data: bytes, name: str, unsettled: bool = True) -> None:
+    def send(data: bytes, name: str, unsettled: bool = True) -> bool:
         """Every keystroke the probe types goes through here: the screen is checked first (deny-all). unsettled=False
-        only for the workspace-trust answer, and only while the trust prompt is on the current screen: `refuse` still
-        applies; `refuse_unsettled` waits for the next keystroke. Without the prompt on screen every check applies."""
-        refused(stage, acting=unsettled or not trust_on_screen())
+        only for the workspace-trust answer, and only while the trust prompt is the last thing painted: `refuse` still
+        applies; `refuse_unsettled` waits for the next keystroke. If the prompt is no longer last, every check applies
+        and the answer is NOT written (returns False): it was meant for that prompt and nothing else."""
+        if not unsettled and not trust_on_screen():
+            refused(stage, acting=True)
+            return False
+        refused(stage, acting=unsettled)
         os.write(fd, data)
         typed.append(name)
+        return True
 
     def pump(max_s: float, quiet_s: float = 1.5, until: str | Callable[[str], bool] | None = None, mark: int = 0) -> None:
         """Read until the screen goes quiet, or (with `until`) until that text is on screen and has had a moment to finish painting."""
@@ -329,14 +410,15 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
-        trust_seen = trust_on_screen()               # the prompt as shown now; a cleared-away prompt is not answered
+        trust_seen = trust_on_screen()               # the prompt as the last thing painted; an erased one is not answered
         refused("boot", acting=not trust_seen)        # a trust prompt is answered first; unsettled is judged after it
         if eof:
             mark = len(buf)
             return ""
         if trust_seen:
             stage = "trust"
-            send(b"\r", "Enter (workspace trust)", unsettled=False)
+            if not send(b"\r", "Enter (workspace trust)", unsettled=False):   # no longer last: no Enter, full checks
+                trust_seen = False
             if ready_after_trust is not None and _screen_has(ready_after_trust, _plain(buf)):
                 pump(boot_left(), mark=len(buf))        # already painted before the prompt: read until quiet
             else:

@@ -428,12 +428,68 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(rec["tier"], "AI Pro")
         self.assertEqual(self.keys(log), b"\r/usage\r")      # one trust Enter, then the normal /usage path
 
-    def test_current_screen_is_the_text_since_the_last_full_redraw(self):
-        self.assertEqual(sc._current_screen(b"old\x1b[2J\x1b[Hnew"), b"\x1b[Hnew")
-        self.assertEqual(sc._current_screen(b"a\x1b[2Jb\x1b[?1049hc"), b"c")
-        self.assertEqual(sc._current_screen(b"a\x1b[1;1H\x1b[0Jb"), b"b")
-        self.assertEqual(sc._current_screen(b"no clear"), b"no clear")
-        self.assertEqual(sc._current_screen(b"a\x1b[2Kb"), b"a\x1b[2Kb")       # a line erase is not a full redraw
+    # ---- #144 fix round 2 (review P1, re-review): a redraw the round-1 "current screen" did not cut (line-by-line erase,
+    # cursor home + SGR + erase-below) removed the visible prompt but left it counted. The prompt is now answerable only
+    # while it is the LAST thing agy painted: after it, only SGR colour, cursor show/hide, terminal queries, whitespace
+    # and the prompt's own option lines; anything else waits for the prompt to be painted again.
+    LINE_ERASE = "\x1b[1A\x1b[2K\x1b[1A\x1b[2K\r\x1b[K"       # cursor up + erase line, per line, as an Ink-style TUI clears
+
+    def _no_keystroke_after(self, cleared: str) -> None:
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, cleared + "Loading workspace\n"],
+                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        self.assertIs(cm.exception.facts["trust_prompt"], False)
+
+    def test_trust_erased_line_by_line_into_loading_gets_no_keystroke(self):
+        self._no_keystroke_after(self.LINE_ERASE)
+
+    def test_trust_erased_by_home_sgr_erase_below_into_loading_gets_no_keystroke(self):
+        self._no_keystroke_after("\x1b[H\x1b[0m\x1b[J")
+
+    def test_unknown_escape_after_trust_gets_no_keystroke(self):
+        for tail in ("\x1b[5S", "\x1b[?2026h", "\x1b[3;1r", "\x1b7", "\x1b[", "\x08", "\rLoading"):
+            with self.subTest(tail=repr(tail)):
+                self.assertFalse(sc._trust_prompt_last((TRUST + tail).replace("\n", "\r\n").encode(), sc._TRUST_PROMPT))
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, "\x1b[5S"],
+                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused):
+                sc._antigravity()
+        self.assertEqual(self.keys(log), b"")
+
+    def test_trust_followed_only_by_colour_and_whitespace_gets_exactly_one_enter(self):
+        tail = "\x1b[0m\x1b[?25l  \n\x1b[38;5;244m\x1b[0m\x1b[?25h\n"
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST + tail], "after_trust": BANNER,
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")
+
+    def test_trust_erased_then_repainted_gets_exactly_one_enter(self):
+        binary, log = self.fake({"boot": SIGNING_IN,
+                                 "boot_later": [TRUST, self.LINE_ERASE + "Loading workspace\n", "\x1b[H\x1b[J" + TRUST],
+                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")
+
+    def test_trust_prompt_last_rule(self):
+        last = lambda raw: sc._trust_prompt_last(raw, sc._TRUST_PROMPT)
+        self.assertTrue(last(b"Do you trust the contents of this folder?\r\nTrust this workspace [Y/n]\r\n"))
+        self.assertTrue(last(b"\x1b[1mTrust\x1b[0m this workspace?\r\n\x1b[36m> 1. Yes, proceed\x1b[0m\r\n"
+                             b"  2. No, exit\r\n\r\n  Enter to confirm \xc2\xb7 Esc to exit\r\n\x1b[6n"))
+        self.assertTrue(last(b"Loading\x1b[2J\x1b[HTrust this workspace [Y/n]"))          # a clear BEFORE it is fine
+        self.assertFalse(last(b"no prompt here\r\n"))
+        for after in (b"\x1b[2K", b"\x1b[K", b"\x1b[0J", b"\x1b[J", b"\x1b[2J", b"\x1b[H", b"\x1b[1;1f", b"\x1b[3A",
+                      b"\x1b[B", b"\x1b[2C", b"\x1b[D", b"\x1b[?1049h", b"\x1bc", b"\x1b]0;t\x07", b"\rX", b"\x1bM",
+                      b"\r\nLoading workspace\r\n", b"\r\nChoose an account\r\n", b"\r\nNo account; sign in\r\n"):
+            with self.subTest(after=after):
+                self.assertFalse(last(b"Trust this workspace [Y/n]" + after))
 
     def test_trust_answer_read_shares_one_boot_window(self):
         # trust shown, nothing after the answer: the probe gives up within boot_s overall, not boot_s again after Enter
