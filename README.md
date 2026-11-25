@@ -371,9 +371,24 @@ R3 models (general index ≥ 79.6; state from cached readings, no vendor CLI ope
 - What a choice becomes: models → `--model cortados@R3:claude-opus-5-5+gpt-6.1-sol` (scarcity picks among only those
   models, on every account and lane that serves them; a turn none of them can carry escalates, E3, and a selection
   that is all spent is refused, E2); `a` → `cortados@R3:*`; `b` → `cortados@R3` (the band window above); `6` →
-  `cortados`; `7` → `sub/<id>`. Local picks are listed but not offered yet: "local orchestrator: coming in the next
-  step (plan-and-delegate profile)"; the provider refuses them until that step.
-- `--route <pick>` takes the same grammar without `cortados@` (`R3:opus+sol`, `R4:*`, `R3`, `any`), `--route last`
+  `cortados`; `7` → `sub/<id>`.
+- **Local orchestrator** (`5 local`, or `--route local` / `--route local:qwen-27b+qwen-35b`; step 8, owner decision E8):
+  the main loop runs on a local model under the `orchestrator` boundary profile, **plan and delegate only**. The menu
+  lists the local pins with their node's state; numbers toggle, `a` = any local model (the first available, config
+  order). The provider takes the first picked model (in the order typed) whose node answers, lists it, is not busy and
+  fits the request; if none can, the request is refused naming each model, its node and why, with the widening line,
+  and nothing runs on any other model, local or cloud. Every turn is fenced on both sides: the provider offers the
+  model only Read / Glob / Grep / LS / NotebookRead, TodoWrite / ExitPlanMode / AskUserQuestion, the six
+  `mcp__cortados-route__*` tools and Bash for start_task's `watch_command` alone (plus BashOutput / KillShell), and
+  blocks a reply calling anything else (edits, other shell commands, Agent, web, other MCP tools, unknown names); the
+  client hook (matcher `*` since this step) checks every provider-marked call against the same profile. `start_task`
+  with `chrome` or `connectors` is refused ([ESCALATE] E13). A turn a sensitivity detector marks (the
+  `x-cortados-local: sensitive` flag, a keyword) keeps the local model but loses delegation and the shell (E5). Without
+  the hook header the shell is not offered. The launcher prints "local orchestrator: plan and delegate only …" and
+  starts Claude Code with only the `cortados-route` MCP server (`--strict-mcp-config`, tool search off, so the
+  delegation tools are declared up front); your own `--strict-mcp-config` set is kept. Subagents and child tasks stay
+  free-routed (E7). Design and limits: docs/ORCHESTRATOR-ROUTE-PICKER.md §5.
+- `--route <pick>` takes the same grammar without `cortados@` (`R3:opus+sol`, `R4:*`, `R3`, `any`, `local[:…]`), `--route last`
   the saved pick. Friendly names become table ids before they reach the wire: the provider's own aliases (`opus`,
   `sonnet`, `haiku`, `fable`), `sol` = `gpt-6.1-sol` (a launcher alias: on the provider `sol` is ambiguous), then the
   words of one served id (`gpt-6.1`). `--route` with `--orchestrator` or `--orchestrator-band` is refused.
@@ -384,7 +399,8 @@ R3 models (general index ≥ 79.6; state from cached readings, no vendor CLI ope
   (`/model cortados@R3:*` or `/model cortados@R3`), a note for a Claude-only pick (no route while S1 is degraded),
   and a warning when the pick names a Haiku model: Claude Code then drives the main loop like a Haiku client (E11).
 - The routes row records the pick in its `route_pick` column. The Tasks view labels its rules
-  `route pick R3:… (2 models)`, `route pick escalated` and `route pick … overridden`, showing a label's ids only when
+  `route pick R3:… (2 models)`, `route pick escalated`, `route pick … overridden` and `route pick local (orchestrator
+  profile)` (with `boundary profile orchestrator` or `… orchestrator-sensitive`), showing a label's ids only when
   they are table ids. The live view gives each conversation and the orchestrator tree its `pick` (the session view and
   the pulse pane: `pick_route`, e.g. `R3:…: Claude Opus 5.5 · claude#b`). The Office desk shows it as a badge, and the
   dashboard's Live tab has a Route options card.

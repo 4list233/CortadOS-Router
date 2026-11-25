@@ -12,13 +12,14 @@ passes the provider's check. The fix is a check on the client machine, with the 
 |---|---|---|
 | Minted ids + ledger | `effect_boundary.Boundary.mark`, `BoundaryLedger`, `LEDGER` | Every tool call a boundary turn lets through reaches the client under an id the provider mints (`toolu_cxb_` + 24 hex), never the node's own id. The provider records it per conversation: tool, profile, the project folder it assumed. Bounded: 256 per conversation, 4096 in all, oldest first. Each record expires after 1 h. Metadata only. Applies to JSON replies, streams (the held `content_block_start` is rewritten) and the refusal fallback (`local_lane.complete`). |
 | Check endpoint | `POST /v1/cortados/boundary/check` (`server._boundary_check`, `effect_boundary.check_answer`) | Owner token. Body `{"tool_use_id": "<id>"}` (1-128 of `[A-Za-z0-9_-]`, else 400). Answers `{"known": false, "marked": <id has the prefix>}` or `{"known": true, "tool", "profile", "project", "bash": <shell allowed>, "write_tools": {tool: input key}, "protected": <PROTECTED_PATHS for the profile>, "expires_in"}`. Never a tool input. |
-| The hook | `cortados_router/boundary_hook.py` (stdlib, standalone) | Claude Code PreToolUse command hook, matcher `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash`. A denial is exit 2 with the reason on stderr. |
+| The hook | `cortados_router/boundary_hook.py` (stdlib, standalone) | Claude Code PreToolUse command hook: matcher `*` from the launcher (`session.BOUNDARY_HOOK_MATCHER`, since route picker step 8), `Write\|Edit\|MultiEdit\|NotebookEdit\|Bash` in the routed-subagents mod. A denial is exit 2 with the reason on stderr. |
 | Hook header | `x-cortados-boundary-hook: 1` (`effect_boundary.HOOK_HEADER`) | Sent by every client that installs the hook, together with it. |
 | No hook, no edits | `effect_boundary.Boundary(hook=False)` | A **sensitive** turn without the header is read-only: Edit, MultiEdit, Write and NotebookEdit are not offered, and one the node emits anyway blocks the reply (rule `write-no-hook`). A **cost** turn without it keeps its edits under the provider-side rules only. |
 
 ## The hook's decision, per call
 
-1. A tool outside the matcher: allowed (exit 0, no output).
+1. A tool outside the matcher, or a tool other than Write / Edit / MultiEdit / NotebookEdit / Bash whose id is not
+   marked: allowed (exit 0, no output, the provider is not asked).
 2. `POST <provider>/v1/cortados/boundary/check` with the call's `tool_use_id`. The provider is `CORTADOS_BOUNDARY_URL`
    or else the session's `ANTHROPIC_BASE_URL`. The token is `CORTADOS_BOUNDARY_TOKEN` or else `ANTHROPIC_AUTH_TOKEN` /
    `ANTHROPIC_API_KEY`. Timeout 5 s.
@@ -26,13 +27,29 @@ passes the provider's check. The fix is a check on the client machine, with the 
    **Denied** when it is marked (the record expired or was never made).
 4. `known: true`:
    - the recorded tool must equal the called tool, else **denied**;
-   - Bash: allowed only when `bash` is true (cost). On a sensitive profile it is **denied**;
+   - the called tool must be in the record's `tools` (the profile's tool names, `effect_boundary.PROFILE_TOOLS`), else
+     **denied** (an answer from an older provider without `tools` skips this check);
+   - `mcp__cortados-route__start_task` on an orchestrator profile: an input named in `delegate_refused` (`chrome`,
+     `connectors`) that is set is **denied**;
+   - Bash: allowed when `bash` is true (cost); when `bash_watch` is true (the `orchestrator` profile) only a command
+     that is exactly start_task's `watch_command` shape (`WATCH_COMMAND_RE`, the provider's pattern); otherwise
+     (sensitive, orchestrator-sensitive) **denied**;
    - a file write: the target (`file_path`, `notebook_path` for NotebookEdit; a relative path is taken from the
      recorded project) and the recorded project are resolved with `os.path.realpath` **on the client**. The real
      target must lie strictly inside the real project folder and match no protected rule the provider sent
      (dotfiles at the project root, `.git` / `.husky` / `.claude` / `.ssh`, CI and launchd pairs, startup files, and on
      sensitive profiles `package.json` / `pyproject.toml` / `Makefile`). Otherwise **denied**. A `~` or `$` path, an
      empty path, or a record with no project folder: **denied**.
+
+## The local orchestrator (route picker step 8)
+
+A `local[:<models>]` route pick runs a session's main loop on a local model under the `orchestrator` profile, plan and
+delegate only (docs/ORCHESTRATOR-ROUTE-PICKER.md §5). Its turns are fenced like automatic moves: every tool call the
+provider lets through is minted and recorded, and the launcher's hook (matcher `*`) checks every one of them, not only
+writes and Bash. The record's answer carries `profile` (`orchestrator`, or `orchestrator-sensitive` for a turn a
+sensitivity detector marks), `tools`, `bash: false`, `bash_watch` and `delegate_refused`. An older hook that only knows
+`bash` denies the watcher (fail closed); an older hook with the narrow matcher does not see the other tools, which the
+provider's own judgement still refuses. A client that does not send the hook header gets no shell at all on these turns.
 
 ## Fail-closed cases
 
@@ -165,7 +182,8 @@ a missing file) and the command.
 ## Tests
 
 `tests/test_boundary_hook.py`: a loopback fake check server, plus the hook run through `sh` exactly as the mod runs
-it. `tests/test_provider_effect_boundary.py`: `SensitiveWithoutHookTests`, `LedgerUnitTests`,
+it. `tests/test_local_orchestrator.py` (`HookTests`): every refused tool class on the client, the watcher, start_task's
+refused inputs, an older answer without `tools`. `tests/test_provider_effect_boundary.py`: `SensitiveWithoutHookTests`, `LedgerUnitTests`,
 `BoundaryCheckEndpointTests` (including the provider and the hook end to end against a link the provider never saw),
 and `prefer` → cost. `tests/test_session.py`: child settings and header. The mod's own tests:
 `claude plugin test integrations/claude-mod/cortados-routed-subagents`.
