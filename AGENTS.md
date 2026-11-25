@@ -197,7 +197,7 @@ a start from a child without `delegate`, `delegate` from anywhere but depth 0 an
 `refused` event (`reason: depth_limit`). A sub-orchestrator gets `SUB_ORCHESTRATOR_DIRECTIVE` and cortados-route
 (route_task allowed by the same record), records each child in `<its task dir>/children/` under `children.lock`
 (cancel writes the `cancelled` marker under the same lock, then cascades), waits in the FOREGROUND with `wait_command`
-(`--timeout 540`, rerun on exit 3), and its runner records the children's states at the end. `--remote` starts carry
+(`--timeout 540`, rerun on exit 3), and its runner records every child's state at the end (by explicit id) and applies the owner defaults: unnamed running workers cancelled + outcome `incomplete`, `HANDOFF: <id>` lines exempt; a failed, cancelled or capped sub-orchestrator's workers cancelled. A start re-checks the parent's marker after launching (a cancel whose lock wait timed out). Remote starts send a requester-chosen id (stub `start_unconfirmed` written first; idempotent on the host; cancel of an unknown id tombstones it); nested starts on another host need its `capabilities` (fail closed). `--remote` starts carry
 `depth`/`delegate`; the host keeps the deeper depth. Tests: `tests/test_nested_tasks.py` (fake claude playing the
 sub-orchestrator and workers under real runners); the suite's ancestry scope is set in `tests/__init__.py`
 (`ANCESTRY_SCOPE = "tasks_dir"`, a module attribute on purpose).

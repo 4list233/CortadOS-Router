@@ -1192,13 +1192,24 @@ class ChildTaskTests(ChildTaskBase):
 
         self._air(transport=transport)
         real_write = ct._write_json
+        # The remote-start intent (fix round 1, P1): the stub is written BEFORE the request is sent, so a failing stub
+        # write starts nothing at all.
         with mock.patch.object(ct, "_write_json", side_effect=lambda path, obj: (_ for _ in ()).throw(OSError("disk full"))
                                if path.endswith(ct.REMOTE_STUB) else real_write(path, obj)):
             r, _ = self.call("start_task", task="x")
         self.assertTrue(r.get("isError"))
+        self.assertIn("not started", r["content"][0]["text"])
+        self.assertEqual(calls, [])
+        self.assertEqual([x for x in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(x)], [])
+        # An older host ignores the requested id and answers with its own (`tid`): the stub then follows that id, and
+        # when THAT write fails the host's task is cancelled.
+        with mock.patch.object(ct, "_write_json", side_effect=lambda path, obj: (_ for _ in ()).throw(OSError("disk full"))
+                               if path.endswith(os.path.join(tid, ct.REMOTE_STUB)) else real_write(path, obj)):
+            r, _ = self.call("start_task", task="x")
+        self.assertTrue(r.get("isError"))
         self.assertIn("remote task was cancelled", r["content"][0]["text"])
         self.assertEqual(calls, ["start", "cancel"])
-        self.assertFalse(os.path.exists(os.path.join(ct.tasks_dir(), tid)))
+        self.assertEqual([x for x in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(x)], [])
 
     def test_remote_start_checks_private_root_before_transport(self):
         self._air(transport=lambda a, s, t: self.fail("transport must not run"))

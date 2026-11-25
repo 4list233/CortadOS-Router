@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -42,6 +43,8 @@ NESTED_FAKE = textwrap.dedent('''\
     def start_child(args, extra):
         env = dict(os.environ)
         env.update(extra)
+        if os.environ.get("FAKE_GC_MAX_S"):     # the worker's own cap, apart from this child's (CORTADOS_CHILD_MAX_S)
+            env["CORTADOS_CHILD_MAX_S"] = os.environ["FAKE_GC_MAX_S"]
         if os.environ.get("FAKE_SCRUB"):         # the forgery: every claim variable removed
             for k in {claims!r}:
                 env.pop(k, None)
@@ -63,7 +66,7 @@ NESTED_FAKE = textwrap.dedent('''\
         r = start_child(json.loads(os.environ.get("FAKE_START_ARGS") or '{{"task": "x"}}'), {{}})
         dump("start-result.json", r)
         result("tried")
-    if mode in ("suborch", "suborch-sleep", "suborch-leave"):
+    if mode in ("suborch", "suborch-sleep", "suborch-leave", "suborch-handoff", "suborch-fail"):
         args = {{"task": "piece", "cwd": os.environ["FAKE_GC_CWD"]}}
         args.update(json.loads(os.environ.get("FAKE_GC_ARGS") or "{{}}"))
         r = start_child(args, {{"FAKE_CLAUDE_MODE": os.environ.get("FAKE_GC_MODE", "ok")}})
@@ -74,7 +77,14 @@ NESTED_FAKE = textwrap.dedent('''\
         if mode == "suborch-sleep":
             time.sleep(60)
         if mode == "suborch-leave":
-            result("started a worker and left")
+            result("started a worker and left; worker " + gid + ": running")
+        if mode == "suborch-handoff":
+            result("started a worker\\nHANDOFF: " + gid + " (still running, yours now)")
+        if mode == "suborch-fail":
+            print(json.dumps({{"type": "result", "subtype": "error_during_execution", "is_error": True,
+                               "result": "gave up"}}))
+            sys.stdout.flush()
+            sys.exit(1)
         # the documented foreground wait, with a short timeout so the exit-3 loop runs here
         cmd = r["out"]["wait_command"].replace(" --timeout 540", " --timeout 1 --interval 0.2")
         codes = []
@@ -390,21 +400,55 @@ class ProcessTreeTests(NestedBase):
                 pass
         self.assertIn("is being cancelled", str(cm.exception))
 
-    def test_a_sub_orchestrator_that_leaves_a_worker_running_unnamed_gets_a_warning(self):
+    def test_a_sub_orchestrator_that_leaves_a_worker_running_unnamed_is_incomplete_and_the_worker_cancelled(self):
+        # owner default: listing the worker's id and state is not a handoff; only a HANDOFF line is
         gc = self.folder("gc")
         out, w, w1 = self.run_child("suborch-leave", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc)
         gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
+        self.assertEqual(w["state"], "failed", w)
+        self.assertEqual(w["outcome"], "incomplete")
+        self.assertIn(gid, w["error"])
+        self.assertIn("HANDOFF", w["error"])
+        self.assertEqual(w["children_cancelled"], [gid])
+        self.assertEqual(self.wait_done(gid)["state"], "cancelled")
+
+    def test_a_named_handoff_keeps_running_and_the_sub_orchestrator_succeeds(self):
+        gc = self.folder("gc")
+        out, w, w1 = self.run_child("suborch-handoff", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc)
+        gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
         try:
-            self.assertEqual(w["state"], "succeeded")              # the state is not changed by it
+            self.assertEqual(w["state"], "succeeded", w)
+            self.assertNotIn("outcome", w)
+            self.assertEqual(w["children_running"], [gid])
             self.assertEqual(w["children"], [{"task_id": gid, "state": "running", "host": "here"}])
-            self.assertTrue(any(gid in x and "does not name" in x for x in w["warnings"]), w.get("warnings"))
+            _, g = self.call("task_status", task_id=gid)
+            self.assertEqual(g["state"], "running")
         finally:
             ct.cancel(gid)
             self.wait_done(gid)
 
+    def test_a_failed_sub_orchestrator_cancels_its_workers(self):
+        gc = self.folder("gc")
+        out, w, w1 = self.run_child("suborch-fail", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc)
+        gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
+        self.assertEqual(w["state"], "failed", w)
+        self.assertNotIn("outcome", w)                             # failed on its own, not "incomplete"
+        self.assertEqual(w["children_cancelled"], [gid])
+        self.assertEqual(self.wait_done(gid)["state"], "cancelled")
+
+    def test_a_sub_orchestrator_at_its_run_time_cap_cancels_its_workers(self):
+        gc = self.folder("gc")
+        out, w, w1 = self.run_child("suborch-sleep", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc,
+                                    CORTADOS_CHILD_MAX_S="6", FAKE_GC_MAX_S="600")
+        gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
+        self.assertEqual(w["state"], "failed", w)
+        self.assertTrue(w.get("timed_out"), w)
+        self.assertEqual(w["children_cancelled"], [gid])
+        self.assertEqual(self.wait_done(gid)["state"], "cancelled")
+
     def test_a_cancel_of_a_finished_sub_orchestrator_still_cancels_its_running_workers(self):
         gc = self.folder("gc")
-        out, w, w1 = self.run_child("suborch-leave", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc)
+        out, w, w1 = self.run_child("suborch-handoff", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc)
         gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
         c = ct.cancel(out["task_id"])
         self.assertFalse(c["cancelled"])                           # itself: already ended
@@ -471,6 +515,236 @@ class RemoteNestingTests(NestedBase):
     def _run_air(self, req):
         argv = ["ssh", "-o", "BatchMode=yes", "--", "air-fake", "x"]
         return ct.exec_hosts.TRANSPORT(argv, json.dumps(req).encode(), 60)
+
+
+OK_RESULT = {"exit_code": 0, "cancelled": False, "ended_at": 1.0, "export": {"ok": True},
+             "output": {"type": "result", "subtype": "success", "is_error": False, "result": "ok"}}
+
+
+class LifecycleFixTests(NestedBase):
+    """Fix round 1 (review r1): every finding reproduced, then shown fixed."""
+
+    def fake_sub(self, running=True):
+        """A sub-orchestrator's record, no runner: within its start grace it reads as running (still starting)."""
+        root = ct._private_root()
+        d = os.path.join(root, "t20261125000000-aaaaaaaa")
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": os.path.basename(d), "depth": 1, "delegate": True,
+                                                      "started_at": time.time() if running else 1.0,
+                                                      "origin": {"origin_session": "cd" * 8}})
+        return ct._identity_of(d)
+
+    def air_tasks(self):
+        d = os.path.join(self.air_home, "tasks")
+        return sorted(x for x in os.listdir(d) if ct.TASK_ID_RE.fullmatch(x)) if os.path.isdir(d) else []
+
+    # --- P1: a lost remote-start reply ---------------------------------------------------------------------------
+    def test_a_lost_start_reply_is_recorded_unconfirmed_then_reconciled_and_cancelled_by_the_cascade(self):
+        self._air()
+        sub = self.fake_sub()
+        real = ct.exec_hosts.TRANSPORT
+
+        def lose_start_reply(argv, stdin, timeout):
+            rc, so, se = real(argv, stdin, timeout)            # the host really starts it...
+            if json.loads(stdin)["op"] == "start":
+                return 0, b"", b""                              # ...and the reply is lost
+            return rc, so, se
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lose_start_reply), \
+                mock.patch.object(ct, "caller_identity", return_value=sub), \
+                mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            r, _ = self.call("start_task", task="x", host="air")
+        msg = r["content"][0]["text"]
+        self.assertIn("start_unconfirmed", msg)
+        kids = ct.children_of(sub["dir"])
+        self.assertEqual(len(kids), 1)                          # under its parent: the cascade reaches it
+        tid = kids[0]
+        self.assertIn(tid, msg)
+        self.assertEqual(self.air_tasks(), [tid])               # the host holds it under the requester's id
+        self.assertTrue(_load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB))[ct.START_UNCONFIRMED])
+        # status by that id reconciles it
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual((st["state"], st["depth"], st["parent_task_id"]), ("running", 2, sub["task_id"]))
+        self.assertNotIn(ct.START_UNCONFIRMED, _load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB)))
+        # and the parent's cancel cascades to it on its host
+        c = ct.cancel(sub["task_id"])
+        self.assertEqual([(x["task_id"], x["cancelled"]) for x in c["children"]], [(tid, True)])
+        self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_a_start_whose_reply_and_arrival_are_both_late_is_tombstoned_by_cancel(self):
+        self._air()
+        sub = self.fake_sub()
+        held = {}
+
+        def time_out(argv, stdin, timeout):                     # the request is in flight when ssh gives up
+            if json.loads(stdin)["op"] == "start":
+                held["req"] = stdin
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return real(argv, stdin, timeout)
+        real = ct.exec_hosts.TRANSPORT
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", time_out), \
+                mock.patch.object(ct, "caller_identity", return_value=sub):
+            r, _ = self.call("start_task", task="x", host="air")
+            self.assertIn("start_unconfirmed", r["content"][0]["text"])
+            tid = ct.children_of(sub["dir"])[0]
+            # status says what it is, and how to settle it
+            r, _ = self.call("task_status", task_id=tid)
+            self.assertIn("cancel_task " + tid, r["content"][0]["text"])
+            c = ct.cancel(sub["task_id"])                       # the cascade: the host tombstones the id
+        self.assertEqual([(x["task_id"], x["cancelled"]) for x in c["children"]], [(tid, True)])
+        # the start arrives late: idempotent on its id, nothing is launched
+        code, so, _ = real(["ssh", "-o", "BatchMode=yes", "--", "air-fake", "x"], held["req"], 60)
+        rep = json.loads(so)["result"]
+        self.assertEqual((rep["task_id"], rep["state"], rep["duplicate"]), (tid, "cancelled", True))
+        tdir = os.path.join(self.air_home, "tasks", tid)
+        self.assertFalse(os.path.exists(os.path.join(tdir, "meta.json")))      # never started
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "cancelled")
+
+    def test_the_remote_start_is_idempotent_on_its_id(self):
+        self._air()
+        req = {"v": ct.exec_hosts.PROTOCOL, "op": "start", "host": "air",
+               "args": {"task": "x", "depth": 1, "task_id": "t20261125000000-bbbbbbbb"}}
+        argv = ["ssh", "-o", "BatchMode=yes", "--", "air-fake", "x"]
+        first = json.loads(ct.exec_hosts.TRANSPORT(argv, json.dumps(req).encode(), 60)[1])["result"]
+        second = json.loads(ct.exec_hosts.TRANSPORT(argv, json.dumps(req).encode(), 60)[1])["result"]
+        self.assertEqual(first["task_id"], "t20261125000000-bbbbbbbb")
+        self.assertNotIn("duplicate", first)
+        self.assertEqual((second["task_id"], second["duplicate"]), (first["task_id"], True))
+        self.assertEqual(self.air_tasks(), ["t20261125000000-bbbbbbbb"])
+        with self.assertRaises(ct.TaskError):                   # a caller never names the id
+            ct.start("x", self.work, task_id="t20261125000000-cccccccc")
+
+    def test_a_clean_refusal_by_the_host_leaves_no_record(self):
+        self._air()
+        sub = self.fake_sub()
+        with mock.patch.object(ct, "caller_identity", return_value=sub):
+            r, _ = self.call("start_task", task="x", host="air", cwd="/no/such/dir/anywhere")
+        self.assertTrue(r.get("isError"))
+        self.assertEqual(ct.children_of(sub["dir"]), [])
+        self.assertEqual([x for x in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(x)], [sub["task_id"]])
+
+    # --- P2: a start racing a cancel whose lock wait timed out ---------------------------------------------------
+    def test_a_start_racing_a_timed_out_cancel_cancels_the_worker_it_launched(self):
+        w1, gc = self.folder("w1"), self.folder("gc")
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            out = self.start_task(cwd=w1, delegate=True)        # a real sub-orchestrator, running
+        sub = ct._identity_of(os.path.join(ct.tasks_dir(), out["task_id"]))
+        in_guard, release = threading.Event(), threading.Event()
+        real_record = ct._record_child
+
+        def slow_record(caller, child_id):                      # past the marker check, holding the children lock
+            in_guard.set()
+            release.wait(30)
+            return real_record(caller, child_id)
+        box = {}
+
+        def starter():
+            try:
+                box["out"] = ct.start("piece", gc, provider_url=self.cfg["url"], token_file=self.cfg["token_file"])
+            except ct.TaskError as exc:
+                box["err"] = str(exc)
+        with mock.patch.object(ct, "_record_child", slow_record), \
+                mock.patch.object(ct, "caller_identity", return_value=sub), \
+                mock.patch.object(ct, "CHILDREN_LOCK_WAIT_S", 0.3), \
+                mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            t = threading.Thread(target=starter)
+            t.start()
+            self.assertTrue(in_guard.wait(30))
+            c = ct.cancel(out["task_id"])                       # its lock wait times out: marked without it
+            self.assertIn("marked cancelled without it", c.get("note", ""))
+            self.assertNotIn("children", c)                     # the worker was not recorded yet
+            release.set()
+            t.join(60)
+        self.assertNotIn("out", box)
+        self.assertIn("was cancelled while this start ran", box["err"])
+        gid = ct.children_of(sub["dir"])[0]
+        self.assertIn(f"the worker {gid} it launched was cancelled", box["err"])
+        self.assertEqual(self.wait_done(gid)["state"], "cancelled")
+        self.assertEqual(self.wait_done(out["task_id"])["state"], "cancelled")
+
+    # --- P2: every child, however many -----------------------------------------------------------------------
+    def test_a_cancel_cascade_reaches_all_501_children(self):
+        sub = self.fake_sub()
+        kids = [f"t20261125{i:06d}-0000000a" for i in range(501)]
+        os.mkdir(os.path.join(sub["dir"], ct.CHILDREN_DIR))
+        for k in kids:
+            open(os.path.join(sub["dir"], ct.CHILDREN_DIR, k), "w").close()
+        seen = []
+        with mock.patch.object(ct, "_cancel_child", lambda k: seen.append(k) or {"task_id": k, "cancelled": True}):
+            c = ct.cancel(sub["task_id"])
+        self.assertEqual(seen, kids)
+        self.assertEqual(len(c["children"]), 501)
+        st = ct.status(sub["task_id"])                          # presentation stays bounded
+        self.assertEqual((len(st["children"]), st["children_total"]), (ct.CHILDREN_SHOWN, 501))
+
+    def test_201_completed_children_are_reported_as_completed(self):
+        sub = self.fake_sub()
+        root = ct.tasks_dir()
+        kids = [f"t20261125{i:06d}-0000000b" for i in range(201)]
+        os.mkdir(os.path.join(sub["dir"], ct.CHILDREN_DIR))
+        for k in kids:
+            os.mkdir(os.path.join(root, k), 0o700)
+            ct._write_json(os.path.join(root, k, "meta.json"), {"task_id": k, "started_at": 1.0, "host": "here"})
+            ct._write_json(os.path.join(root, k, "result.json"), OK_RESULT)
+            open(os.path.join(sub["dir"], ct.CHILDREN_DIR, k), "w").close()
+        result = json.loads(json.dumps(OK_RESULT))
+        with mock.patch.object(ct, "_cancel_child", side_effect=AssertionError("nothing to cancel")):
+            ct._children_report(sub["dir"], result)
+        self.assertEqual(len(result["children"]), 201)
+        self.assertEqual({c["state"] for c in result["children"]}, {"succeeded"})
+        for k in ("children_running", "children_warning", "outcome", "error"):
+            self.assertNotIn(k, result)
+        self.assertEqual(ct.classify(result), "succeeded")
+
+    def test_remote_children_are_read_by_id_in_batches_and_unreachable_is_not_running(self):
+        self._air(transport=lambda a, s, t: (255, b"", b"down"))
+        sub = self.fake_sub()
+        root = ct.tasks_dir()
+        kids = [f"t20261125{i:06d}-0000000c" for i in range(3)]
+        for k in kids:
+            ct._write_stub(root, k, "air", {}, sub["task_id"])
+            ct._record_child(sub, k)
+        result = json.loads(json.dumps(OK_RESULT))
+        ct._children_report(sub["dir"], result)
+        self.assertEqual({c["state"] for c in result["children"]}, {"unreachable"})
+        self.assertNotIn("children_running", result)
+        self.assertEqual([u["task_id"] for u in result["children_unreachable"]], kids)
+        self.assertIn("could not be cancelled", result["children_warning"])
+        self.assertEqual(result["outcome"], "incomplete")       # their end is not known: not a success
+        # batches: the host is asked by explicit ids, CHILDREN_LIST_BATCH at a time
+        calls = []
+
+        def fake_remote(host, op, args, timeout_s=None):
+            calls.append((op, list(args.get("ids") or [])))
+            if op == "list":
+                return [{"task_id": k, "state": "succeeded"} for k in args["ids"]]
+            raise AssertionError(op)
+        with mock.patch.object(ct, "_remote", fake_remote), mock.patch.object(ct, "CHILDREN_LIST_BATCH", 2):
+            rows = ct._children_states(kids)
+        self.assertEqual(calls, [("list", kids[:2]), ("list", kids[2:])])
+        self.assertEqual({r["state"] for r in rows.values()}, {"succeeded"})
+
+    # --- older hosts: the capability handshake --------------------------------------------------------------
+    def test_delegate_to_a_host_without_the_capabilities_is_refused_before_launch(self):
+        self._air()
+        real = ct._remote
+        ops = []
+
+        def old_host(host_name, op, args, timeout_s=None):
+            ops.append(op)
+            if op == "capabilities":
+                raise ct.TaskError("unknown remote operation 'capabilities'")
+            return real(host_name, op, args, timeout_s)
+        with mock.patch.object(ct, "_remote", side_effect=old_host):
+            r, _ = self.call("start_task", task="x", host="air", delegate=True)
+            self.assertIn("did not confirm it supports nested tasks", r["content"][0]["text"])
+            self.assertEqual(ops, ["capabilities"])             # nothing was sent to start
+            self.assertEqual(self.air_tasks(), [])
+            self.assertEqual(self.task_dirs(), [])
+            # a plain task stays backward compatible: no handshake
+            out = self.start_task(cwd=None, host="air")
+        self.assertNotIn("capabilities", ops[1:])
+        self.wait_done(out["task_id"])
 
 
 class RouteTaskInsideChildTests(NestedBase):

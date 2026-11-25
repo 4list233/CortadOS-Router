@@ -67,10 +67,15 @@ reads as depth 1, no delegate). The new task's depth is that + 1 (0 + 1 when the
 - `ps` failing is a refusal ("cannot tell"), never depth 0.
 - Over ssh (`--remote`), the requesting host computed the depth (it can see the caller's process tree) and sends it;
   the host takes the deeper of that and its own ancestry check (a `--remote` started by hand inside a child on the host
-  itself still finds that child's runner) and applies the same rules. A host on an older checkout ignores `depth` and
-  `delegate`; the requesting side then adds a warning to the result (the task runs there as a plain child).
-- A start inside a sub-orchestrator records the child in `<sub task dir>/children/<child id>` before the spawn (after
-  the remote start, with the local stub, for another host), under `<sub task dir>/children.lock`.
+  itself still finds that child's runner) and applies the same rules.
+- **Older hosts fail closed (owner default, fix round 1).** A nested start on another host (`delegate: true`, or any
+  start from a sub-orchestrator) first asks the host's `capabilities` (`depth`, `delegate`, `start_id`,
+  `cancel_tombstone`; `REMOTE_CAPABILITIES`). A host on an older checkout answers "unknown remote operation", and the
+  start is refused with that said, before anything is sent. Plain tasks skip the handshake and stay backward compatible
+  (an older host that ignores the requested id gets its stub under its own id, as before). The warning when a host's
+  reply does not echo `depth`/`delegate` stays as a backstop.
+- A start inside a sub-orchestrator records the child in `<sub task dir>/children/<child id>` before the spawn (for
+  another host: before the request is sent, see the remote-start intent below), under `<sub task dir>/children.lock`.
 
 **Residual, stated plainly.** A child that both detaches from its process tree (double fork) and scrubs its
 environment, or runs its own Python against this module's internals, is running arbitrary code as the owner: it could
@@ -85,15 +90,43 @@ not see that child's runner as the caller of every in-process start. Not an env 
 ### Lifecycle
 
 - **Cancel cascade.** `cancel_task` on a sub-orchestrator: under its children lock it writes the `cancelled` marker
-  (from then on its start_task refuses, "is being cancelled"), signals it, then cancels every recorded child (remote
-  ones on their host) and returns them in `children`. Because a start holds the same lock from its marker check to the
-  child record, a cancel either sees the child or the start sees the marker: no worker escapes. Cancelling a
-  sub-orchestrator that already ended still cancels its running workers. A remote sub-orchestrator's cascade runs on
-  its own host (where its children list is).
-- **Finish report.** When a sub-orchestrator's run ends, its runner records every child with its state now
-  (`result.json` `children`, one `list` per host); `task_status` shows `children` (ids while it runs, states after).
-  Workers still running are `children_running`; those the final text does not name are a warning
-  (`task_status.warnings`, the watcher's `warnings` count). The task's state is not changed by it.
+  (from then on its start_task refuses, "is being cancelled"), signals it, then cancels EVERY recorded child (remote
+  ones on their host; `children_of` is not bounded, only what task_status shows is, `CHILDREN_SHOWN` = 500) and returns
+  them in `children`. Cancelling a sub-orchestrator that already ended still cancels its running workers. A remote
+  sub-orchestrator's cascade runs on its own host (where its children list is).
+- **No worker escapes a cancel, also when the lock wait times out.** A start holds the children lock from its marker
+  check to the child record. If a cancel cannot get the lock in `CHILDREN_LOCK_WAIT_S` (120 s, a stuck holder) it
+  writes the marker without it; a start already past its marker check then records and launches its worker, and
+  re-checks the marker AFTER that (`_start`, `_cancel_late_child`): marked, it cancels the worker it just launched and
+  fails ("was cancelled while this start ran"). The cancel enumerates the children only after writing the marker, so
+  either it sees the child or the start sees the marker. A task cancelled while it is still starting (no runner pid
+  yet) gets the marker alone: its runner checks it before the spawn and, from now on, while the child runs.
+- **The remote-start intent (fix round 1, P1).** For a start on another host the requesting side chooses the task id,
+  writes the stub (flagged `start_unconfirmed`) and the parent's child record BEFORE the request is sent, and sends the
+  id. The host starts the task under exactly that id; a second start with it launches nothing and answers with the
+  existing task (`duplicate: true`; idempotent: mkdir of the task dir is the start's first step). A host that refuses
+  cleanly (or a request that never left: ssh exit 255) drops the intent. A lost or timed-out reply keeps it: the start
+  fails with the id named, `task_status <id>` asks the host (and clears the flag once the host answers for the id),
+  `cancel_task <id>` and the parent's cascade cancel it by id. A cancel of a `start_unconfirmed` id the host never
+  started leaves a TOMBSTONE there (a cancelled record under the id), so a start still in flight finds the dir and
+  launches nothing.
+- **End of a sub-orchestrator (owner defaults 2026-11-25, recommended by the orchestrator; the owner may adjust).** When
+  its run ends, its runner reads every child by explicit id (local ones one by one, remote ones `CHILDREN_LIST_BATCH` =
+  200 ids per host `list` call; never a recent-tasks listing) into `result.json` `children`. A child's state is its own,
+  or `unknown` (no record, not listed) or `unreachable` (its host did not answer); neither is taken for running or ended.
+  Then:
+  - It ended normally (its result would be `succeeded`) with workers not ended: those its final message names on a
+    line saying `HANDOFF` (`HANDOFF: <task id>`) keep running (`children_running`, `children_handoff`); every other one
+    is cancelled (`children_cancelled`) and the sub-orchestrator's outcome is `incomplete`: `outcome: "incomplete"` and
+    an `error` listing them, so its state is `failed` (the watcher exits 1; no new terminal state). Listing a worker's
+    id and state in the report is not a handoff: only a HANDOFF line is.
+  - It failed, was cancelled or hit its run-time cap (also when its runner died and the next status recovers it):
+    every worker not ended is cancelled.
+  - Workers that could not be cancelled (their host did not answer) are `children_unreachable`, with a warning
+    (`task_status.warnings`, the watcher's `warnings` count) for follow-up.
+- **The run-time cap is unchanged** (`CORTADOS_CHILD_MAX_S`, 3 h, for sub-orchestrators too). A sub-orchestrator
+  waiting on 3 h workers can hit it first, which now cancels those workers. A larger cap for `delegate` tasks is an
+  owner decision still pending ([ESCALATE] 2 below).
 
 ### Waiting (the reliable blocking wait)
 
@@ -106,19 +139,39 @@ foreground wait below does not depend on the answer.)
 start_task's result inside a sub-orchestrator carries `wait_command` = `watch_command` + ` --timeout 540`
 (`SUB_WAIT_TIMEOUT_S`). The sub-orchestrator runs it in the FOREGROUND with the Bash tool's timeout at 600000 ms (the
 tool's 10-minute maximum), with every running worker's id in one command; exit 3 means "still running", run it again;
-0/1/2 mean every listed task ended (or could not be watched), then task_status for each. While a tool call runs, the
+0/1/2 mean the watch ended for every listed task, not that every worker ended: exit 1 also means a worker STALLED (no
+progress for 30 minutes) and may still be running, 2 that one could not be watched. So the directive says to read
+each worker's task_status before treating it as ended. While a tool call runs, the
 provider keeps the conversation (a child's run id earns the 3 h tool-wait idle limit, `provider/server.py`). The
 command matches the local orchestrator boundary's watcher rule (`effect_boundary.WATCH_TAIL_RE` allows `--timeout`).
 Tested end to end with the fake claude binary: a fake sub-orchestrator starts a worker from a process under its runner,
 loops the wait command (exit 3, then 0) and reports the worker's state (`tests/test_nested_tasks.py`).
 
-## [ESCALATE] — owner decisions this change did not invent
+## Limitations: same-owner bypasses of the ancestry check
 
-1. **A sub-orchestrator that ends while workers still run.** Now: a warning only (state unchanged), and the workers keep
-   running until their own end or a cancel. Alternatives: fail the sub-orchestrator, or cancel its workers when it ends.
-2. **A sub-orchestrator that fails or hits its time cap.** Its workers are not cancelled (cascade on explicit cancel
-   only). Its cap is the children's (`CORTADOS_CHILD_MAX_S`, 3 h), and a sub-orchestrator waiting on 3 h workers can
-   hit it first. A larger cap for `delegate` tasks would be a new user-visible default.
+The depth check reads the caller's process ancestry on one host. Anything that runs a process OUTSIDE the child's
+process tree, with the claim variables scrubbed, reads as depth 0. Each of these is the child running its own code as
+the owner, which could equally run `claude` itself or call the provider with the token in its settings file; they are
+outside the child-task boundary, stated plainly rather than closed:
+
+- **ssh.** `ssh localhost …` (or `ssh <another host> …`) from inside a child starts the command under that host's
+  sshd, not under the child's runner: no runner among its ancestors. With the claim variables removed, a start_task (or a
+  `--remote` request) made from there is depth 0. The requesting-host depth sent over the ssh hop is trusted like the
+  rest of the request (the ssh key is the authentication).
+- **LaunchAgents / launchd.** `launchctl bootstrap`/`submit` (or `open`, or any other launchd-started job) runs the
+  command as a child of launchd, outside the runner's tree, with an environment of the job's choosing: depth 0 the same
+  way.
+- **Detach + scrub, or its own code.** A double fork that reparents to launchd (pid 1) with the environment scrubbed, or
+  its own Python against this module's internals.
+
+## [ESCALATE] — owner decisions
+
+1. **A sub-orchestrator that ends while workers still run.** Default implemented in fix round 1 (recommended by the
+   orchestrator, the owner may adjust): workers not named on a HANDOFF line are cancelled and the outcome is
+   `incomplete` (state `failed`). See "Lifecycle".
+2. **A sub-orchestrator that fails or hits its time cap.** Default implemented: its workers are cancelled, unreachable
+   ones listed for follow-up. **Still pending:** its cap is the children's (`CORTADOS_CHILD_MAX_S`, 3 h, unchanged); a
+   larger cap for `delegate` tasks would be a new user-visible default.
 3. **No delegation gate in a sub-orchestrator.** Children run with `--no-gate`; "act directly only for trivial steps"
    is an instruction, not enforced by `orchestrator_gate.py`'s budget.
 4. **The refusal counter.** The task named "the existing depth_limit / concurrency_limit / budget counters"; no such
@@ -128,9 +181,9 @@ loops the wait command (exit 3, then 0) and reports the worker's state (`tests/t
    addition to the host's own MCP servers; if the host's user config also registers cortados-route, Claude Code's
    precedence picks one. Both run that host's checkout and decide depth by the process tree, so either is correct; a
    strict config (only cortados-route) would drop the host's other servers from sub-orchestrators.
-6. **Older execution hosts** ignore `depth` / `delegate` (a warning, the task runs as a plain child). Refusing instead
-   would need a protocol bump.
-7. **Threat-model residual** above (detach + scrub, or own code against the module; the ssh hop trusts the requester).
+6. **Older execution hosts.** Default implemented: a nested start fails closed after the capability handshake (see
+   "How depth is enforced"); plain tasks stay backward compatible.
+7. **Threat-model residual**: the same-owner bypasses above.
 
 ## Proposed change to the owner's orchestrator directive (NOT applied)
 
