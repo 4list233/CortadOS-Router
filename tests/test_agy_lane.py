@@ -361,6 +361,44 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(cm.exception.kind, "not-logged-in")
         self.assertEqual(self.keys(log), b"\r")       # one Enter for the trust prompt; /usage never typed
 
+    # ---- #144, the 10:12 sample on the Air: agy signed in from the keyring 0.86 s in, but painted the trust prompt for
+    # the fresh per-run probe folder before its banner. The boot read ended on the prompt (ready) with the notice still
+    # unsettled, and AGY_UNSETTLED refused before the trust answer. The answer is now judged by `refuse` alone.
+    def test_trust_prompt_painted_while_signing_in_is_answered_then_the_banner_is_read(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": BANNER,
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")
+
+    def test_trust_prompt_then_a_sign_in_screen_gets_only_the_trust_answer(self):
+        for after in (LOGGED_OUT, "\x1b[2J\x1b[HYou are currently not signed in.\n ⣷ Signing in...\n"):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST], "after_trust": after,
+                                     "usage": FIXTURE.read_text()})
+            with self.subTest(after=after[:20]), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual(cm.exception.kind, "not-logged-in")
+                self.assertEqual(self.keys(log), b"\r")
+                self.assertEqual(cm.exception.typed, ["Enter (workspace trust)"])
+                self.assertTrue(cm.exception.facts["trust_prompt"])
+
+    def test_trust_prompt_with_a_sign_in_screen_gets_no_keystroke(self):
+        binary, log = self.fake({"boot": LOGGED_OUT + TRUST, "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, self.keys(log), cm.exception.typed), ("not-logged-in", b"", []))
+
+    def test_unsettled_without_a_trust_prompt_records_none(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertIs(cm.exception.facts["trust_prompt"], False)
+
     def test_usage_screen_is_read_through_the_isolated_env(self):
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
         with self.env(binary):

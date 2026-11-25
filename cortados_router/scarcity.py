@@ -171,7 +171,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
                 cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
                 refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = (),
-                refusal_facts: Callable[[str], dict[str, Any]] | None = None) -> str:
+                refusal_facts: Callable[[str], dict[str, Any]] | None = None,
+                ready_after_trust: str | Callable[[str], bool] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -190,6 +191,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
     `on_boot` may raise to refuse: it runs before the first keystroke of `command`.
+    The trust prompt's Enter is checked against `refuse` only, not `refuse_unsettled`: the prompt is not a sign-in screen,
+    and a CLI may paint it before it has finished signing in (agy 1.5.16 on the Air, 2026-11-25: notice, spinner, trust
+    prompt, and only then the banner). After the answer the read goes on until `ready_after_trust` (default `ready`)
+    is painted, within boot_s, and `refuse_unsettled` applies before the first keystroke of `command` as always.
     A ProbeRefused carries `facts`: fixed names and numbers only (which check, mid-read or about to act, ready seen,
     seconds since start), plus `refusal_facts(screen)` when given; never screen text."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
@@ -223,13 +228,13 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 160, 0, 0))
     buf = b""
     eof = False
-    stage, startup_chars, ready_seen = "boot", 0, False
+    stage, startup_chars, ready_seen, trust_seen = "boot", 0, False, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
 
     def refusal(kind: str, where: str, check: str, acting: bool, shown: str) -> ProbeRefused:
         exc = ProbeRefused(kind, where, typed)
         facts: dict[str, Any] = {"check": check, "acting": acting, "after_s": round(time.time() - started, 2),
-                                 "ready_seen": bool(ready and _screen_has(ready, shown))}
+                                 "ready_seen": bool(ready and _screen_has(ready, shown)), "trust_prompt": trust_seen}
         if refusal_facts is not None:
             try:
                 facts.update(refusal_facts(shown))
@@ -253,9 +258,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 if _screen_has(pattern, shown, re.I):
                     raise refusal(kind, where, "unsettled", acting, shown)
 
-    def send(data: bytes, name: str) -> None:
-        """Every keystroke the probe types goes through here: the screen is checked first (deny-all)."""
-        refused(stage)
+    def send(data: bytes, name: str, unsettled: bool = True) -> None:
+        """Every keystroke the probe types goes through here: the screen is checked first (deny-all). unsettled=False
+        only for the workspace-trust answer: `refuse` still applies; `refuse_unsettled` waits for the next keystroke."""
+        refused(stage, acting=unsettled)
         os.write(fd, data)
         typed.append(name)
 
@@ -295,14 +301,18 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
-        refused("boot")
+        trust_seen = bool(re.search(_TRUST_PROMPT, _plain(buf), re.I))
+        refused("boot", acting=not trust_seen)        # a trust prompt is answered first; unsettled is judged after it
         if eof:
             mark = len(buf)
             return ""
-        if re.search(r"trust (this|the contents)|Trust this workspace", _plain(buf), re.I):
+        if trust_seen:
             stage = "trust"
-            send(b"\r", "Enter (workspace trust)")
-            pump(boot_s, until=ready, mark=len(buf))
+            send(b"\r", "Enter (workspace trust)", unsettled=False)
+            if ready_after_trust is not None and _screen_has(ready_after_trust, _plain(buf)):
+                pump(boot_s, mark=len(buf))             # already painted before the prompt: read until quiet
+            else:
+                pump(boot_s, until=ready_after_trust or ready, mark=len(buf))
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
             refused("trust")
@@ -364,6 +374,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             os.rmdir(my_dir)
         except OSError:
             pass
+
+
+_TRUST_PROMPT = r"trust (this|the contents)|Trust this workspace"     # the one prompt tui_capture answers (Enter)
 
 
 def parse_reset(text: str, tz: str | None, now: datetime | None = None) -> float | None:
@@ -699,6 +712,12 @@ def AGY_BOOT_READY(shown: str) -> bool:
     return _agy_iso.banner_tier(shown) is not None or bool(re.search(r"trust (?:this|the contents)", shown, re.I))
 
 
+def AGY_SIGNED_IN(shown: str) -> bool:
+    """After the trust answer the read waits for the banner's account line only: agy 1.5.16 paints the trust prompt
+    while it is still signing in, before the banner (Air, 2026-11-25 10:12, #144)."""
+    return _agy_iso.banner_tier(shown) is not None
+
+
 AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"     # the answer is on screen; complete only by agy_usage_gaps
 # The quota groups agy 1.5.16 shows on Google AI Pro (owner's screen, 2026-11-24): GEMINI MODELS and CLAUDE AND GPT
 # MODELS. A reading without either is partial.
@@ -772,7 +791,7 @@ def _antigravity() -> dict[str, Any]:
     # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
     # capture, before the probe's next keystroke.
     text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
-                       ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag,
+                       ready=AGY_BOOT_READY, ready_after_trust=AGY_SIGNED_IN, inherit_path=False, diagnostics=diag,
                        page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
                        refusal_facts=agy_refusal_facts)
     if not text.strip():
