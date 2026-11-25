@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from cortados_router import core
-from cortados_router.provider import office, sensitive_notice, usage, work_split
+from cortados_router.provider import office, routing, sensitive_notice, usage, work_split
 
 # 200 decisions gives a useful recent task table without shipping history on each 30 s dashboard
 # poll. A smaller cap hides recent tasks; a larger one costs DB read time and DOM size. One
@@ -115,11 +115,13 @@ def _json(value: Any, kind: type) -> tuple[Any, str]:
 # view shows "band window R2" / "band window R2 overridden". The difficulty step ("band window: difficulty …") has its
 # own fixed label.
 _WINDOW_RULE = re.compile(r"band window (R[0-4](?:-R[0-4])?)( overridden)?[: ]")
-# A route pick rule names the pick's label (band names and table ids, routing.Pick) before its colon.
-_PICK_RULE = re.compile(r"route pick (?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|[a-z0-9._+-]{1,600}))?(?: overridden)?: ")
+# A route pick rule names the pick's label (band names and table ids, routing.Pick) before its colon; routing.choose
+# writes `route pick <label>: <n> model(s), <m> route(s)` and `route pick <label> overridden: sensitive`.
+_PICK_RULE = re.compile(r"route pick ((?:any|local|R[0-4](?:-R[0-4])?)(?::(?:\*|[a-z0-9._+-]{1,600}))?)"
+                        r"( overridden)?: (?:(\d{1,2}) models?, )?")
 
 
-def _rule_label(rule: Any) -> str | None:
+def _rule_label(rule: Any, ids: "frozenset[str] | None" = None) -> str | None:
     if not isinstance(rule, str):
         return None
     m = _WINDOW_RULE.match(rule)
@@ -134,8 +136,15 @@ def _rule_label(rule: Any) -> str | None:
             return "route pick escalated"
         if rule.startswith("route pick: local cost routes not taken"):
             return "route pick: local cost route not taken"
-        if _PICK_RULE.match(rule):
-            return "route pick overridden" if rule.endswith(" overridden: sensitive") else "route pick"
+        m = _PICK_RULE.match(rule)
+        if m:
+            # The label is shown only when it is one (routing.view_pick_label) and its every id is a table id (`ids`,
+            # routing.table_model_ids): never text a request could have put there. Else the fixed word alone.
+            label = routing.view_pick_label(m.group(1), ids if ids is not None else frozenset())
+            shown = "route pick" + (" " + label if label else "")
+            if m.group(2):
+                return shown + " overridden"
+            return shown + (f" ({int(m.group(3))} model{'s' if int(m.group(3)) != 1 else ''})" if m.group(3) else "")
         return None
     for prefix, label in _RULES:
         if rule.startswith(prefix):
@@ -146,7 +155,7 @@ def _rule_label(rule: Any) -> str | None:
     return None
 
 
-def _reason(row: dict, pinned: bool) -> str:
+def _reason(row: dict, pinned: bool, ids: "frozenset[str] | None" = None) -> str:
     """The S1 reason as fixed vocabulary: who decided, the band, the typed answers, the rule categories."""
     bits = ["client pin; S1 not asked" if pinned else
             "scorer degraded" if row["degraded"] else "S1 decision"]
@@ -178,7 +187,7 @@ def _reason(row: dict, pinned: bool) -> str:
     if rules:
         labels, withheld = set(), 0
         for rule in rules:
-            label = _rule_label(rule)
+            label = _rule_label(rule, ids)
             if label:
                 labels.add(label)
             else:
@@ -233,13 +242,17 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
             tok_sql = ("tok_input, tok_output, tok_cache_read, tok_cache_write, tok_turns" if has_tok else
                        "NULL AS tok_input, NULL AS tok_output, NULL AS tok_cache_read, NULL AS tok_cache_write, "
                        "NULL AS tok_turns")
-            has_sens = "sensitive_cloud" in {r[1] for r in conn.execute("PRAGMA table_info(routes)")}
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(routes)")}
+            has_sens = "sensitive_cloud" in cols
             sens_sql = "substr(sensitive_cloud,1,?) AS sensitive_cloud" if has_sens else "? AS sensitive_cloud"
+            # route_pick: added by core._db on the writer's next open of an older db; NULL (no pick) until then
+            pick_sql = "substr(route_pick,1,?) AS route_pick" if "route_pick" in cols else "? AS route_pick"
             rows = conn.execute(
                 "SELECT turn_id, ts, session_id, lane, model, actual_model, band, engine, degraded, turn_ms, engine_ms, "
                 "request_chars, response_chars, substr(answers,1,?) AS answers, substr(hard_rules,1,?) AS hard_rules, "
-                f"{tok_sql}, {sens_sql} FROM routes ORDER BY ts DESC LIMIT ?",
-                (ANSWERS_MAX, RULES_MAX, SENS_MAX if has_sens else None, ROW_LIMIT + 1),
+                f"{tok_sql}, {sens_sql}, {pick_sql} FROM routes ORDER BY ts DESC LIMIT ?",
+                (ANSWERS_MAX, RULES_MAX, SENS_MAX if has_sens else None,
+                 core.ROUTE_PICK_MAX + 1 if "route_pick" in cols else None, ROW_LIMIT + 1),
             ).fetchall()
             view["token_totals"] = work_split.routed_tokens(conn, now if now is not None else time.time())
         finally:
@@ -253,6 +266,11 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
     if (view["token_totals"] or {}).get("status") == "recorded":
         view["tokens_status"] = "recorded per routed conversation"
     sessions: dict[str, dict] = {}
+    try:
+        ids = routing.table_model_ids(core)       # a pick label's ids are shown only when they are table ids
+    except Exception as exc:                     # the tables cannot say: no label shows its ids (fixed words only)
+        view["errors"].append({"source": "tables", "error": type(exc).__name__})
+        ids = frozenset()
     for raw in rows[:ROW_LIMIT]:
         row = dict(raw)
         row["task_id"] = office.clean(row.pop("turn_id"), _ID_RE)
@@ -265,7 +283,9 @@ def collect(state_dir: Path, now: float | None = None) -> dict[str, Any]:
         row["band"] = row["band"] if row["band"] in _BANDS else None
         pinned = row.pop("engine") == "pin" or row["band"] == "pin"
         row["degraded"] = bool(row["degraded"])
-        row["s1_reason"] = _reason(row, pinned)          # consumes answers and hard_rules
+        row["s1_reason"] = _reason(row, pinned, ids)     # consumes answers and hard_rules
+        # the route pick the conversation was opened under (routing.choose → core.log_route_pick), re-checked
+        row["pick"] = routing.view_pick_label(row.pop("route_pick"), ids)
         row["ts"] = _number(row["ts"])
         # #132: elapsed_ms is the first turn's time (log_outcome), null — never 0 — until it is recorded; a stored 0
         # can only be a missing measurement. end_to_end_ms adds S1's scoring time (engine_ms: null for a pin, which

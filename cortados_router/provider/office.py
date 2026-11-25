@@ -220,10 +220,11 @@ class OfficeBoard:
 
     def turn_start(self, key: str | None, tags: dict[str, str], *, run_id: str | None, provider: str | None,
                    lane: str | None, model: str | None, now: float | None = None, origin: str | None = None,
-                   backend: str | None = None) -> None:
+                   backend: str | None = None, pick: str | None = None) -> None:
         """`origin`: the request's x-cortados-origin (read_origin), recorded on a run's worker as the provider saw it:
         the first one seen, ORIGIN_CONFLICT once a request of the run names another (note_origin). `backend`: the local
-        node's backend (one of LOCAL_BACKENDS) for a local route; kept only when the provider is `local`."""
+        node's backend (one of LOCAL_BACKENDS) for a local route; kept only when the provider is `local`. `pick`: the
+        conversation's route pick label (routing.view_pick_label: band names and table ids), the main loop desk's badge."""
         if not key:
             return
         now = time.time() if now is None else now
@@ -233,7 +234,7 @@ class OfficeBoard:
             fields = {"provider": provider, "lane": clean(lane, _LANE_RE),
                       "local_backend": backend if provider == "local" and backend in LOCAL_BACKENDS else None,
                       "model": clean(model, _MODEL_RE), "status": "working", "tool": None, "updated": now,
-                      "ended_at": None}
+                      "ended_at": None, "pick": _pick(pick)}
             if key.startswith("main:"):
                 m = self.mains.get(tags["session"]) or {}
                 m.update(fields)
@@ -493,6 +494,13 @@ def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, A
     return out
 
 
+def _pick(label: Any) -> str | None:
+    """A route pick label as the board keeps it (routing.view_pick_label; imported here, not at module load: routing's
+    import chain reaches this module)."""
+    from cortados_router.provider import routing
+    return routing.view_pick_label(label)
+
+
 def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dict[str, Any] | None:
     """The floor's orchestrator: its heartbeat (status and tool as the mod saw them), else its own routed requests when
     the main loop routes; None when neither is known (a floor whose session runs no mod)."""
@@ -500,13 +508,15 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
         model = hb.get("model") or (main or {}).get("model")
         # the routed main loop's backend only describes the model it served
         backend = (main or {}).get("local_backend") if model == (main or {}).get("model") else None
+        # the routed main loop's route pick: the desk's badge (doc §6), only for the model it routed
         return {"model": model, "status": hb.get("status"),
                 "tool": hb.get("tool"), "last_seen": _ts(hb.get("seen")), "source": "heartbeat",
-                "local_backend": backend, "client": hb.get("client") if hb.get("client") in CLIENTS else None}
+                "local_backend": backend, "client": hb.get("client") if hb.get("client") in CLIENTS else None,
+                "pick": _pick((main or {}).get("pick")) if model == (main or {}).get("model") else None}
     if main:
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
                 "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed",
-                "local_backend": main.get("local_backend"), "client": None}
+                "local_backend": main.get("local_backend"), "client": None, "pick": _pick(main.get("pick"))}
     return None
 
 

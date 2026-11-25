@@ -174,7 +174,7 @@ const IN_ = HARNESS_IN, mode = IN_.mode;
 const view = IN_.view, tasksView = IN_.tasks || {tasks: [], sessions: [], errors: []}, liveView = IN_.live || {};
 const html = IN_.page;
 const js = html.slice(html.indexOf("<script>") + 8, html.indexOf("</script>"));
-let tasksAuth = "", tasksPolls = 0, liveAuth = "", livePolls = 0, localAuth = "", localPolls = 0;
+let tasksAuth = "", tasksPolls = 0, liveAuth = "", livePolls = 0, localAuth = "", localPolls = 0, routeUrls = [];
 let localView = IN_.local || {nodes: []};
 const switches = [], confirms = [];
 global.confirm = (m) => { confirms.push(m); return IN_.confirm !== false; };
@@ -206,6 +206,8 @@ global.fetch = async (url, opts) => {
   if (url === "/v1/cortados/tasks") { tasksAuth = (opts.headers || {}).Authorization || ""; tasksPolls++;
     if (mode === "tasks500") return { status: 500, ok: false };
     return { status: 200, ok: true, json: async () => tasksView }; }
+  if (url.indexOf("/v1/cortados/route-options?") === 0) { routeUrls.push(url + " " + ((opts.headers || {}).Authorization || "-"));
+    return { status: 200, ok: true, json: async () => (IN_.route || {band: "R3", errors: [], cloud: null}) }; }
   if (url === "/v1/cortados/local") { localAuth = (opts.headers || {}).Authorization || ""; localPolls++;
     return { status: 200, ok: true, json: async () => localView }; }
   if (url === "/v1/cortados/local/switch") { const hd = opts.headers || {};
@@ -263,6 +265,7 @@ const tick = () => new Promise(r => setImmediate(r));
   out("TASKS: AUTH: " + tasksAuth + " POLLS: " + tasksPolls);
   out("LIVE: AUTH: " + liveAuth + " POLLS: " + livePolls + " TAB: " + (ids.live.hidden ? "hidden" : "shown"));
   out("LOCAL: AUTH: " + localAuth + " POLLS: " + localPolls + " SWITCH: " + JSON.stringify(switches) + " CONFIRMS: " + confirms.length);
+  out("ROUTE: " + JSON.stringify(routeUrls));
   out("SESSION: creds=" + creds + " replaced=" + replaced + " logout=" + logoutCall + " button=" + ids.logout.textContent);
 })().catch(fail);
 """
@@ -324,10 +327,11 @@ class DashboardRenderTest(unittest.TestCase):
         args.update(kw)
         return usage.collect(**args)
 
-    def run_page(self, view, mode="render", tasks_view=None, live_view=None, local_view=None, confirm=True, session=None):
+    def run_page(self, view, mode="render", tasks_view=None, live_view=None, local_view=None, confirm=True, session=None,
+                 route_view=None):
         r = run_harness(_HARNESS, {"page": server._DASHBOARD_PATH.read_text(), "mode": mode, "view": view,
                                    "tasks": tasks_view, "live": live_view, "local": local_view, "confirm": confirm,
-                                   "session": session})
+                                   "session": session, "route": route_view})
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -572,6 +576,36 @@ class DashboardRenderTest(unittest.TestCase):
             self.assertIn(want, panel, want)
         for bad in (ot.CHILD_MCP_TAG, ot.MINE, "pending_runs", ot.SECRET, "undefined", "NaN"):
             self.assertNotIn(bad, out, bad)
+
+    def test_route_options_card_and_pick_labels(self):
+        """Route picker step 5: the Live tab's Route options card (cached readings), the orchestrator row's pick and
+        the Tasks band column's `R3 · pick`."""
+        route = {"band": "R3", "errors": [], "cloud": {
+            "reference": {"general": 79.6}, "not_served": {"count": 1, "why": "only on lanes this endpoint never runs"},
+            "models": [{"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "ceiling": True, "below_face_floor": False,
+                        "index": {"general": 99.8}, "short_of": [],
+                        "routes": [{"provider": "claude-cli", "lane": "claude", "account": "A", "state": "ok",
+                                    "left_pct": 62}, {"provider": "claude-cli#b", "lane": "claude#b", "account": "B",
+                                                      "state": "spent", "left_pct": 0},
+                                   {"provider": "anthropic-api", "state": "ok", "left_usd": 142.3}]}]}}
+        out = self.run_page(None, "live", live_view={}, route_view=route)
+        self.assertIn("Route options", out)
+        self.assertIn("R3 models (general index ≥ 79.6)", out)
+        self.assertIn("Claude Opus 5.5 · frontier", out)
+        self.assertIn("claude A 62% left · claude B spent · API credit $142 left", out)
+        self.assertIn("1 model left out: only on lanes this endpoint never runs", out)
+        self.assertIn('ROUTE: ["/v1/cortados/route-options?band=R3 Bearer tok"]', out)
+        live = {"orchestrators": {"status": "ok", "items": [{"origin": "3f9a1c2e9b7d4a10", "kind": "session",
+                                                             "status": "working", "model": "claude-opus-5-5",
+                                                             "pick": "R3:claude-opus-5-5+gpt-6.1-sol",
+                                                             "pick_route": "R3:claude-opus-5-5+gpt-6.1-sol: Claude Opus 5.5 · claude#b",
+                                                             "counts": {}, "tasks": [], "routed": []}]}}
+        out = self.run_page(None, "live", live_view=live)
+        self.assertIn("route pick R3:claude-opus-5-5+gpt-6.1-sol: Claude Opus 5.5 · claude#b", out)
+        tv = self.tasks_fixture()
+        tv["tasks"][0]["band"], tv["tasks"][0]["pick"] = "R3", "R3:claude-opus-5-5+gpt-6.1-sol"
+        out = self.run_page(self.view(), "refresh", tv)
+        self.assertIn("R3 · pick", out)
 
     def test_live_tasks_grouped_under_their_main_session(self):
         from tests import test_live as tl

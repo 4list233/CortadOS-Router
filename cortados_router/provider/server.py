@@ -1816,6 +1816,9 @@ class Registry:
             # a local route's node backend as its gate last reported it (the Office's llama-or-chip, #77)
             "local_backend": (local_lane.node_backend(rp[len(local_lane.LANE_PREFIX):])
                               if rp.startswith(local_lane.LANE_PREFIX) else None),
+            # the route pick (or band window) the conversation was opened under: its identity label, built by
+            # routing.resolve_pick from band names and table ids only (docs/ORCHESTRATOR-ROUTE-PICKER.md §6)
+            "pick": routing.view_pick_label(route.get(ASKED_WINDOW_KEY)),
             "tokens": dict(tok) if isinstance(tok, dict) else None}
 
     def drop(self, s, reason: str = "dropped") -> None:
@@ -4380,7 +4383,7 @@ class Handler(BaseHTTPRequestHandler):
                        if rp.startswith(local_lane.LANE_PREFIX) else None)
             board.turn_start(key, tags, run_id=run_id or conv, provider=office.provider_of(rp, local_lane.LANE_PREFIX),
                              lane=lane, model=route.get("model") or getattr(session, "model", None), origin=origin,
-                             backend=backend)
+                             backend=backend, pick=routing.view_pick_label(route.get(ASKED_WINDOW_KEY)))
             # Kept on the conversation so an unexpected backend exit (Registry._backend_exited), with no request left
             # to end the turn, can still end this worker on the board. A failure here is reported by the warning below.
             session.office_worker = (key, dict(tags))

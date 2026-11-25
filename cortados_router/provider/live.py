@@ -1139,6 +1139,7 @@ def _sub_node(c: dict[str, Any], now: float) -> dict[str, Any] | None:
             "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else None,
             "lane": office.clean(c.get("lane"), office._LANE_RE), "model": office.clean(c.get("model"), office._MODEL_RE),
             "local_backend": c.get("local_backend") if c.get("local_backend") in office.LOCAL_BACKENDS else None,
+            "pick": office._pick(c.get("pick")),       # the route pick it was opened under (band names, table ids)
             "started_at": _r(opened, 3), "ended_at": _r(closed, 3), "last_activity": _r(c.get("last_used"), 3),
             "elapsed_s": _r(max(0.0, (closed if closed is not None else now) - opened)) if opened is not None else None,
             "tokens": work_split.pub_tokens(c.get("tokens"))}
@@ -1208,6 +1209,20 @@ def _task_node(r: dict[str, Any], subs: list[dict[str, Any]], tokens: Any, via: 
             "sub_sessions_hidden": max(0, len(subs) - SUBSESSIONS_MAX),
             "sub_sessions_failed": sum(1 for x in subs if x.get("status") == "failed"),   # all, listed or not
             "tasks": []}
+
+
+def _pick_fields(o: dict[str, Any] | None) -> dict[str, Any]:
+    """A group's `pick` (its routed main loop's route pick label, office._pick) and `pick_route` (that label with the
+    model and lane the pick chose: re-validated fields only), both None when the main loop opened under no pick."""
+    o = o or {}
+    pick = office._pick(o.get("pick"))
+    if not pick:
+        return {"pick": None, "pick_route": None}
+    model = office.clean(o.get("model"), office._MODEL_RE)
+    lane = office.clean(o.get("lane"), office._LANE_RE)
+    from cortados_router.provider import routing
+    shown = routing.readable_model_name(model) if model else None
+    return {"pick": pick, "pick_route": f"{pick}: {shown}" + (f" · {lane}" if lane else "") if shown else pick}
 
 
 def _rank_task(n: dict[str, Any]) -> tuple:
@@ -1359,6 +1374,9 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
             "project": g.get("project") or (o or {}).get("project"), "device": g.get("device") or (o or {}).get("device"),
             "status": (o or {}).get("status") or ("n/a" if kind != "session" else "not live"),
             "model": (o or {}).get("model"), "tool": (o or {}).get("tool"),
+            # the routed main loop's route pick and the route it chose ("R3:…: Claude Opus 5.5 · claude#b", doc §6):
+            # what the session view and the pulse pane show for the current session
+            **_pick_fields(o),
             "client": client, "client_source": client_source,
             "last_activity": _r(newest, 3) if newest else None,
             "counts": {k: counts.get(k, 0) for k in ("running", "waiting", "done", "failed", "unknown")},
@@ -1388,11 +1406,11 @@ SESSION_PATH = "/v1/cortados/live/session"
 # token counts), workspace and browser (task internals the floor does not draw), parent_hidden, the session filter,
 # conflicts, task_hosts and inputs_truncated (fleet diagnostics, the dashboard's). Every value kept is already
 # re-validated by the live view (office.clean rules, fixed vocabularies, numbers): no request text, path or argument.
-_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "status", "model", "tool", "client", "client_source",
+_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "status", "model", "pick", "tool", "client", "client_source",
                     "last_activity", "counts", "attention", "tasks_hidden", "routed_hidden")
 _TREE_TASK_KEYS = ("task_id", "title", "state", "status", "phase", "tool", "host", "provider", "lane", "local_backend",
                    "model", "started_at", "ended_at", "elapsed_s", "parent_task_id", "origin_via", "sub_sessions_hidden")
-_TREE_SUB_KEYS = ("ref", "role", "status", "phase", "provider", "lane", "local_backend", "model", "started_at",
+_TREE_SUB_KEYS = ("ref", "role", "status", "phase", "provider", "lane", "local_backend", "model", "pick", "started_at",
                   "ended_at", "elapsed_s")
 _TREE_LOBBY_KEYS = ("kind", "title", "tool", "provider", "lane", "model", "started_at", "elapsed_s")
 _TREE_ROUTED_KEYS = ("ref", "role", "title", "status", "phase", "tool", "provider", "lane", "model", "started_at",
@@ -1566,6 +1584,7 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             "provider": c.get("provider") if c.get("provider") in office.PROVIDERS else w.get("provider"),
             "lane": office.clean(c.get("lane"), office._LANE_RE) or w.get("lane"),
             "model": office.clean(c.get("model"), office._MODEL_RE) or w.get("model"),
+            "pick": office._pick(c.get("pick")),       # the route pick it was opened under (band names, table ids)
             "status": status, "tool": w.get("tool") if status == "working" and w.get("status") == "working" else None,
             "phase": "model turn" if busy else ("client running a tool" if waiting else "waiting for the client"),
             "source": "provider",
@@ -1647,7 +1666,7 @@ _CALL_KEYS = ("ts", "task_id", "session_id", "routing_kind", "band", "lane", "mo
               "s1_ms", "end_to_end_ms", "executed_provider", "executed_model")   # #132
 
 
-_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens", "log_sensitive_cloud")
+_LOG_OPS = ("log_route", "log_execution", "log_outcome", "log_tokens", "log_sensitive_cloud", "log_route_pick")
 _TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 
