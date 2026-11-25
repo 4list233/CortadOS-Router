@@ -79,7 +79,7 @@ NESTED_FAKE = textwrap.dedent('''\
         if mode == "suborch-leave":
             result("started a worker and left; worker " + gid + ": running")
         if mode == "suborch-handoff":
-            result("started a worker\\nHANDOFF: " + gid + " (still running, yours now)")
+            result("started a worker\\nHANDOFF: " + gid + "  \\n(still running, yours now)")
         if mode == "suborch-fail":
             print(json.dumps({{"type": "result", "subtype": "error_during_execution", "is_error": True,
                                "result": "gave up"}}))
@@ -745,6 +745,167 @@ class LifecycleFixTests(NestedBase):
             out = self.start_task(cwd=None, host="air")
         self.assertNotIn("capabilities", ops[1:])
         self.wait_done(out["task_id"])
+
+
+class LifecycleFixRound2Tests(NestedBase):
+    """Fix round 2 (review r2 on 880f0e0): every finding reproduced, then shown fixed."""
+
+    fake_sub = LifecycleFixTests.fake_sub
+    air_tasks = LifecycleFixTests.air_tasks
+
+    def stub_dirs(self):
+        return sorted(x for x in self.task_dirs() if ct.TASK_ID_RE.fullmatch(x))
+
+    # --- P1: ssh exit 255 is not proof that nothing launched -----------------------------------------------------
+    def test_ssh_255_after_the_launch_keeps_the_worker_under_its_parent_and_the_cascade_cancels_it(self):
+        self._air()
+        sub = self.fake_sub()
+        real = ct.exec_hosts.TRANSPORT
+
+        def drop_after_launch(argv, stdin, timeout):
+            rc, so, se = real(argv, stdin, timeout)            # the host really starts it...
+            if json.loads(stdin)["op"] == "start":              # ...then the established connection drops
+                return 255, b"", b"Connection to air-fake closed by remote host."
+            return rc, so, se
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", drop_after_launch), \
+                mock.patch.object(ct, "caller_identity", return_value=sub), \
+                mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            r, _ = self.call("start_task", task="x", host="air")
+        self.assertTrue(r.get("isError"))
+        self.assertIn(ct.START_UNCONFIRMED, r["content"][0]["text"])
+        kids = ct.children_of(sub["dir"])
+        self.assertEqual(len(kids), 1)                          # kept under its parent (was: forgotten)
+        tid = kids[0]
+        self.assertEqual(self.air_tasks(), [tid])
+        self.assertTrue(_load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB))[ct.START_UNCONFIRMED])
+        c = ct.cancel(sub["task_id"])
+        self.assertEqual([(x["task_id"], x["cancelled"]) for x in c["children"]], [(tid, True)])
+        self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_ssh_255_before_the_session_drops_the_intent(self):
+        self._air()
+        sub = self.fake_sub()
+        real = ct.exec_hosts.TRANSPORT
+
+        def refused(argv, stdin, timeout):
+            if json.loads(stdin)["op"] == "start":
+                return 255, b"", b"Warning: x\nssh: connect to host air-fake port 22: Connection refused\n"
+            return real(argv, stdin, timeout)
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", refused), \
+                mock.patch.object(ct, "caller_identity", return_value=sub):
+            r, _ = self.call("start_task", task="x", host="air")
+        self.assertIn("Connection refused", r["content"][0]["text"])
+        self.assertNotIn(ct.START_UNCONFIRMED, r["content"][0]["text"])
+        self.assertEqual(ct.children_of(sub["dir"]), [])
+        self.assertEqual(self.stub_dirs(), [sub["task_id"]])
+
+    def test_only_sshs_own_pre_session_failures_count_as_never_delivered(self):
+        nd = ct.exec_hosts._never_delivered
+        for err in (b"ssh: connect to host air port 22: No route to host",
+                    b"ssh: connect to host air port 22: Operation timed out\n",
+                    b"ssh: Could not resolve hostname air: nodename nor servname provided, or not known",
+                    b"Host key verification failed.",
+                    b"Warning: Permanently added 'air'.\nforest@air: Permission denied (publickey).",):
+            self.assertTrue(nd(b"", err), err)
+        for out, err in ((b"", b"Connection to air closed by remote host."),
+                         (b"", b"client_loop: send disconnect: Broken pipe"),
+                         (b"", b"down"), (b"", b""),
+                         (b"{partial", b"ssh: connect to host air port 22: Connection refused"),
+                         (b"", b"ssh: connect to host air port 22: Connection refused\nConnection reset by peer")):
+            self.assertFalse(nd(out, err), (out, err))
+
+    # --- P2: a start paused past META_GRACE_S, then cancelled -----------------------------------------------------
+    def test_a_start_paused_past_the_grace_then_cancelled_launches_nothing(self):
+        w = self.folder("w")
+        paused, release = threading.Event(), threading.Event()
+        real_prepare = ct._prepare
+
+        def slow_prepare(*a, **kw):                             # after mkdir, before meta.json
+            paused.set()
+            release.wait(30)
+            return real_prepare(*a, **kw)
+        box = {}
+
+        def starter():
+            try:
+                box["out"] = ct.start("x", w, provider_url=self.cfg["url"], token_file=self.cfg["token_file"])
+            except ct.TaskError as exc:
+                box["err"] = str(exc)
+        with mock.patch.object(ct, "_prepare", slow_prepare), mock.patch.object(ct, "META_GRACE_S", 0), \
+                mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            t = threading.Thread(target=starter)
+            t.start()
+            self.assertTrue(paused.wait(30))
+            [tid] = self.stub_dirs()
+            self.assertEqual(ct._state(os.path.join(ct.tasks_dir(), tid))[0], "failed")   # past the grace
+            c = ct.cancel(tid)
+            self.assertEqual((c["state"], c["cancelled"]), ("cancelling", True))   # was: "already failed", no marker
+            release.set()
+            t.join(60)
+        self.assertNotIn("out", box)
+        self.assertIn("cancelled before it launched", box["err"])
+        self.assertFalse(os.path.exists(os.path.join(w, "fake-argv.json")))        # claude never ran
+        d = os.path.join(ct.tasks_dir(), tid)
+        self.assertEqual(ct._state(d)[0], "cancelled")
+        self.assertEqual([x for x in os.listdir(d) if x.endswith("settings.json")], [])
+        _, st = self.call("task_status", task_id=tid)
+        self.assertEqual(st["state"], "cancelled")
+
+    def test_a_cancel_marks_an_ended_task_dir_without_changing_its_state(self):
+        sub = self.fake_sub(running=False)
+        ct._write_json(os.path.join(sub["dir"], "result.json"), OK_RESULT)
+        c = ct.cancel(sub["task_id"])
+        self.assertEqual((c["state"], c["cancelled"]), ("succeeded", False))
+        self.assertTrue(os.path.exists(os.path.join(sub["dir"], "cancelled")))
+
+    # --- P2: a taken id is never removed -------------------------------------------------------------------------
+    def _existing(self, tid):
+        d = os.path.join(ct._private_root(), tid)
+        os.mkdir(d, 0o700)
+        ct._write_json(os.path.join(d, "meta.json"), {"task_id": tid, "started_at": 1.0, "host": "here"})
+        ct._write_json(os.path.join(d, "result.json"), OK_RESULT)
+        return d, sorted(os.listdir(d))
+
+    def test_a_stub_id_collision_leaves_the_existing_task_untouched_and_draws_a_new_id(self):
+        self._air()
+        taken, fresh = "t20261125000000-dddddddd", "t20261125000001-eeeeeeee"
+        d, before = self._existing(taken)
+        ids = iter([taken, fresh])
+        with mock.patch.object(ct, "_new_id", lambda: next(ids)):
+            out = self.start_task(cwd=None, host="air")
+        self.assertEqual(out["task_id"], fresh)
+        self.assertEqual(sorted(os.listdir(d)), before)
+        self.assertEqual(ct._state(d)[0], "succeeded")
+        self.assertEqual(self.air_tasks(), [fresh])
+        self.wait_done(fresh)
+
+    def test_ids_that_stay_taken_refuse_the_start_and_touch_nothing(self):
+        self._air()
+        taken = "t20261125000000-dddddddd"
+        d, before = self._existing(taken)
+        sub = self.fake_sub()
+        with mock.patch.object(ct, "_new_id", lambda: taken), mock.patch.object(ct, "caller_identity", return_value=sub):
+            r, _ = self.call("start_task", task="x", host="air")
+        self.assertIn("fresh task ids were all taken", r["content"][0]["text"])
+        self.assertEqual(sorted(os.listdir(d)), before)
+        self.assertEqual(ct.children_of(sub["dir"]), [])
+        self.assertEqual(self.air_tasks(), [])                  # nothing was sent
+
+    # --- P2: only an exact HANDOFF line is a handoff -------------------------------------------------------------
+    def test_only_a_standalone_handoff_line_outside_code_is_a_handoff(self):
+        a, b = "t20261125000000-aaaaaaaa", "t20261125000000-bbbbbbbb"
+        named = ct._named_handoffs
+        for text in (f"No handoff is authorized for {a}",
+                     f"> HANDOFF: {a}",
+                     f"```\nHANDOFF: {a}\n```",
+                     f"~~~text\nHANDOFF: {a}\n~~~",
+                     f"  HANDOFF: {a}",
+                     f"HANDOFF: {a} (still running)",
+                     f"handoff: {a}",
+                     f"HANDOFF: {a}x"):
+            self.assertEqual(named(text, [a]), [], text)
+        self.assertEqual(named(f"done\nHANDOFF: {a} \t\nworker {b}: running", [a, b]), [a])
+        self.assertEqual(named(f"```\nx\n```\nHANDOFF: {b}", [a, b]), [b])   # after a closed fence
 
 
 class RouteTaskInsideChildTests(NestedBase):

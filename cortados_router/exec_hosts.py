@@ -54,7 +54,9 @@ class HostUnreachable(HostError):
     """The host did not answer: ssh could not connect, timed out, or the remote command produced no reply.
     `ambiguous` is True when the request may have reached the host and run there (a timeout once the session was up,
     or a remote command that ran but left no reply): a `start` may then have launched a child nobody heard about.
-    False for failures before anything was sent (ssh could not be run, or exited 255 on connect/authentication)."""
+    False only for failures before anything was sent (ssh could not be run, or exited 255 with ssh's own pre-session
+    message: connect, name resolution, host key, authentication; PRE_SESSION_RE). Any other exit 255 is ambiguous: an
+    established connection that drops after the launch also exits 255."""
 
     def __init__(self, msg: str, ambiguous: bool = False):
         super().__init__(msg)
@@ -224,6 +226,28 @@ def run_ssh(argv: list, stdin: bytes, timeout_s: float):
 TRANSPORT = run_ssh
 
 
+# ssh's own messages for a failure BEFORE the session exists (no request byte has been sent): name resolution, TCP
+# connect, host key, authentication. Matched on the LAST non-empty stderr line only (warnings such as "Permanently
+# added" may precede it; a drop after the session started ends with other text, e.g. "Connection to x closed",
+# "client_loop: send disconnect: Broken pipe"), and only with no stdout at all (a remote command that printed anything
+# ran). Unrecognised text is ambiguous, never "not delivered".
+PRE_SESSION_RE = re.compile(
+    r"^(ssh: connect to host \S+ port \d+: (Connection refused|No route to host|Operation timed out|"
+    r"Connection timed out|Network is unreachable|Host is down)"
+    r"|ssh: Could not resolve hostname \S+: .*"
+    r"|Host key verification failed\."
+    r"|\S+: Permission denied \(.*\)\."
+    r"|Permission denied \(.*\)\.)$")
+
+
+def _never_delivered(out: bytes, err: bytes) -> bool:
+    """True only when ssh exited 255 on a failure that provably precedes the session (PRE_SESSION_RE)."""
+    if out.strip():
+        return False
+    lines = [ln.strip() for ln in err.decode("utf-8", "replace").splitlines() if ln.strip()]
+    return bool(lines) and bool(PRE_SESSION_RE.fullmatch(lines[-1]))
+
+
 def _tail(b: bytes) -> str:
     return b.decode("utf-8", "replace").strip()[-STDERR_TAIL:]
 
@@ -246,8 +270,12 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
                               ambiguous=True) from None
     except OSError as exc:
         raise HostUnreachable(f"cannot run ssh for execution host {host.describe()}: {type(exc).__name__}: {exc}") from None
-    if rc == 255:                                       # ssh's own exit status for a connection/authentication failure
-        raise HostUnreachable(f"execution host {host.describe()} is unreachable: {_tail(err) or 'ssh exited 255'}")
+    if rc == 255:
+        # ssh's exit status for ITS OWN failures, both before the session (connect, authentication) and after it (an
+        # established connection dropped while the remote command ran: the host may have acted, review r2 P1). Only a
+        # failure that provably happened before any request byte was sent is definite; everything else is ambiguous.
+        raise HostUnreachable(f"execution host {host.describe()} is unreachable: {_tail(err) or 'ssh exited 255'}",
+                              ambiguous=not _never_delivered(out, err))
     text = out.decode("utf-8", "replace").strip()
     line = text.rsplit("\n", 1)[-1] if text else ""    # the reply is the last line (a login banner may precede it)
     try:

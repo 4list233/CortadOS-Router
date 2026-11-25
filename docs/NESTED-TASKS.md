@@ -105,21 +105,34 @@ not see that child's runner as the caller of every in-process start. Not an env 
   writes the stub (flagged `start_unconfirmed`) and the parent's child record BEFORE the request is sent, and sends the
   id. The host starts the task under exactly that id; a second start with it launches nothing and answers with the
   existing task (`duplicate: true`; idempotent: mkdir of the task dir is the start's first step). A host that refuses
-  cleanly (or a request that never left: ssh exit 255) drops the intent. A lost or timed-out reply keeps it: the start
+  cleanly, or a request that provably never left, drops the intent. "Provably never left" (fix round 2, P1) is an ssh
+  exit 255 with no output whose last stderr line is ssh's own pre-session failure (connect refused / no route / timed
+  out, name resolution, host key, authentication: `exec_hosts.PRE_SESSION_RE`); any other exit 255 is ambiguous (an
+  established connection that drops after the launch also exits 255) and keeps the intent. The stub is drawn under a
+  fresh id: a taken id is never touched (fix round 2, P2: a collision once removed another task's record); a new id is
+  drawn up to `STUB_ID_TRIES` (5) times, then the start is refused. A lost or timed-out reply keeps it: the start
   fails with the id named, `task_status <id>` asks the host (and clears the flag once the host answers for the id),
   `cancel_task <id>` and the parent's cascade cancel it by id. A cancel of a `start_unconfirmed` id the host never
   started leaves a TOMBSTONE there (a cancelled record under the id), so a start still in flight finds the dir and
   launches nothing.
+- **A cancel always marks an existing task dir (fix round 2, P2).** Whatever `_state()` reads (a start paused between
+  its mkdir and its `meta.json` past `META_GRACE_S` reads as failed), cancel writes the `cancelled` marker into the dir;
+  a dir with no metadata answers `cancelling` (a stalled or still-running start, not a failed task). The start checks
+  the marker immediately before the launch: marked, it records the task as cancelled (result.json, the settings file
+  removed), keeps the dir (a repeated start of the id launches nothing) and fails; the runner checks it again before
+  the spawn and while the child runs.
 - **End of a sub-orchestrator (owner defaults 2026-11-25, recommended by the orchestrator; the owner may adjust).** When
   its run ends, its runner reads every child by explicit id (local ones one by one, remote ones `CHILDREN_LIST_BATCH` =
   200 ids per host `list` call; never a recent-tasks listing) into `result.json` `children`. A child's state is its own,
   or `unknown` (no record, not listed) or `unreachable` (its host did not answer); neither is taken for running or ended.
   Then:
   - It ended normally (its result would be `succeeded`) with workers not ended: those its final message names on a
-    line saying `HANDOFF` (`HANDOFF: <task id>`) keep running (`children_running`, `children_handoff`); every other one
+    HANDOFF line keep running (`children_running`, `children_handoff`); every other one
     is cancelled (`children_cancelled`) and the sub-orchestrator's outcome is `incomplete`: `outcome: "incomplete"` and
     an `error` listing them, so its state is `failed` (the watcher exits 1; no new terminal state). Listing a worker's
-    id and state in the report is not a handoff: only a HANDOFF line is.
+    id and state in the report is not a handoff: only a HANDOFF line is: a whole line exactly `HANDOFF: <task id>`
+    (a valid id, optional trailing whitespace), outside fenced code blocks; a quoted (`> HANDOFF: …`) or indented line,
+    or prose such as "No handoff is authorized for <id>", is not (fix round 2, P2).
   - It failed, was cancelled or hit its run-time cap (also when its runner died and the next status recovers it):
     every worker not ended is cancelled.
   - Workers that could not be cancelled (their host did not answer) are `children_unreachable`, with a warning

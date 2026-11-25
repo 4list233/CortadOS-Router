@@ -315,9 +315,12 @@ CHILDREN_SHOWN = 500                        # children SHOWN per parent in task_
                                             # the end-of-run report always enumerate every child (review r1, P2)
 CHILDREN_LIST_BATCH = 200                   # ids per remote `list` call (the host's list_recent caps one call at 200)
 # A sub-orchestrator leaves a worker running past its own end only by naming it on a line of its final message that
-# says HANDOFF (e.g. `HANDOFF: t20261125000000-aaaaaaaa`). Any other worker still running when it ends normally is
-# cancelled and its task is marked incomplete (owner default 2026-11-25, docs/NESTED-TASKS.md "Lifecycle").
-HANDOFF_RE = re.compile(r"\bhandoff\b", re.IGNORECASE)
+# is EXACTLY `HANDOFF: <task id>` (optional trailing whitespace), outside fenced code and not quoted (review r2, P2: a
+# loose match once took "No handoff is authorized for <id>", "> HANDOFF: <id>" and code-block lines for handoffs).
+# Any other worker still running when it ends normally is cancelled and its task is marked incomplete (owner default
+# 2026-11-25, docs/NESTED-TASKS.md "Lifecycle").
+HANDOFF_RE = re.compile(r"HANDOFF: (t\d{14}-[0-9a-f]{8})[ \t]*")
+FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})")    # a Markdown code fence (CommonMark: up to 3 spaces of indent)
 OUTCOME_INCOMPLETE = "incomplete"
 # What a --remote host answers to `capabilities` (an older checkout answers "unknown remote operation"). A nested start
 # (delegate: true, or any start from a sub-orchestrator) needs all of them on the target host, checked BEFORE the start
@@ -1105,19 +1108,45 @@ def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = N
     """The local record of a task running on execution host `host_name` (status, wait and cancel go there), with the
     orchestrator that started it (clean_origin fields, metadata only) so the live view attributes it here too, and its
     parent task when it has one. `unconfirmed`: written before the start is sent (the remote-start intent); cleared by
-    _confirm_stub once the host has answered for this id."""
+    _confirm_stub once the host has answered for this id.
+    FileExistsError (the id is taken) leaves everything as it was: the dir belongs to another task. Any other failure
+    removes only the dir this call created (review r2, P2: a caller never removes a dir it did not make)."""
     d = os.path.join(root, task_id)
-    os.mkdir(d, 0o700)
-    rec = {"host": host_name, "created_at": time.time()}
-    if unconfirmed:
-        rec[START_UNCONFIRMED] = True
-    if isinstance(parent_task_id, str) and TASK_ID_RE.fullmatch(parent_task_id):
-        rec["parent_task_id"] = parent_task_id
-    o = {k: v for k, v in (origin or {}).items() if v}
-    if o:
-        rec["origin"] = o
-    _write_json(os.path.join(d, REMOTE_STUB), rec)
-    _index_stub(root, task_id, o)
+    os.mkdir(d, 0o700)                          # FileExistsError propagates with nothing touched
+    try:
+        rec = {"host": host_name, "created_at": time.time()}
+        if unconfirmed:
+            rec[START_UNCONFIRMED] = True
+        if isinstance(parent_task_id, str) and TASK_ID_RE.fullmatch(parent_task_id):
+            rec["parent_task_id"] = parent_task_id
+        o = {k: v for k, v in (origin or {}).items() if v}
+        if o:
+            rec["origin"] = o
+        _write_json(os.path.join(d, REMOTE_STUB), rec)
+        _index_stub(root, task_id, o)
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)    # ours: made by the mkdir above
+        raise
+
+
+STUB_ID_TRIES = 5                           # fresh ids tried when one is taken (4 random bytes per second: a
+                                            # collision is rare; five in a row means something else is wrong)
+
+
+def _new_stub(root: str, host_name: str, origin: dict, parent_task_id) -> str:
+    """The remote-start intent's stub under a fresh id (start_unconfirmed). A taken id is never touched (review r2, P2:
+    an id collision once removed another task's record): a new id is drawn, STUB_ID_TRIES times, then refused."""
+    for _ in range(STUB_ID_TRIES):
+        tid = _new_id()
+        try:
+            _write_stub(root, tid, host_name, origin, parent_task_id, unconfirmed=True)
+            return tid
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise TaskError(f"could not record the remote start locally ({type(exc).__name__}); not started") from None
+    raise TaskError(f"could not record the remote start locally: {STUB_ID_TRIES} fresh task ids were all taken in "
+                    f"{root}; not started")
 
 
 def _confirm_stub(root: str, task_id: str) -> None:
@@ -1160,6 +1189,21 @@ def _duplicate_start(d: str, task_id: str, target, depth: int, delegate: bool) -
     return {"task_id": task_id, "state": state, "host": target.name, "dir": d, "duplicate": True,
             "watch_command": watch_command(task_id), "depth": m_depth,
             **({"delegate": True} if (meta.get("delegate") if meta else delegate) else {})}
+
+
+class _CancelledBeforeLaunch(Exception):
+    """_start_task found its task dir's `cancelled` marker immediately before the launch."""
+
+
+def _finish_cancelled_before_launch(d: str, meta: dict) -> None:
+    """The record of a start cancelled before its launch: result.json cancelled, the settings file (token-bearing,
+    written by _prepare) removed, the `cancelled` event logged. No runner ran, so there is nothing to export."""
+    now = time.time()
+    _write_json(os.path.join(d, "result.json"), {
+        "cancelled": True, "exit_code": None, "ended_at": now, "settings_removed": _remove_settings(d),
+        "error": "cancelled while its start ran, before the launch; never started",
+        "export": {"ok": True, "at": round(now, 3), "note": "cancelled before launch: never started, nothing to export"}})
+    log_event("cancelled", **_event_fields(meta), before_launch=True)
 
 
 def _tombstone(task_id: str) -> dict:
@@ -1559,7 +1603,6 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
         # the parent's child record are written BEFORE the request is sent. The host starts the task under exactly
         # this id (idempotent: a second start with it launches nothing), so a lost or timed-out reply leaves a record
         # here that status reconciles and cancel reaches (by id; a cancel that arrives first leaves a tombstone there).
-        tid = _new_id()
         args = {"task": start_red.text(task), "cwd": cwd, "orchestrator": orchestrator,
                 "permission_mode": permission_mode, "allowed_tools": allowed_tools, "chrome": chrome,
                 "connectors": connectors, "client": start_red.text(str(client)) if client else client,
@@ -1568,18 +1611,18 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
                 "parent_task_id": parent_id,   # resolved here: the host's own env does not know this session
                 "origin": origin, **({"local": local} if local else {}),
                 # the caller's depth is known HERE (its process tree); the host records it and refuses what it forbids
-                "depth": depth, **({"delegate": True} if delegate else {}),
-                "task_id": tid}
+                "depth": depth, **({"delegate": True} if delegate else {})}
         stub_origin = clean_origin(origin)
         if stub_origin["origin_session"] is None and parent_id:
             stub_origin = {**stub_origin, **parent_origin(root, parent_id)}   # as the host does (_start, local branch)
+        tid = _new_stub(root, target.name, stub_origin, parent_id)
         try:
-            _write_stub(root, tid, target.name, stub_origin, parent_id, unconfirmed=True)
             _record_child(caller, tid)          # under the children guard: a cancel cascade reaches it
         except OSError as exc:
-            shutil.rmtree(os.path.join(root, tid), ignore_errors=True)
+            shutil.rmtree(os.path.join(root, tid), ignore_errors=True)   # made by _new_stub for this start
             _unrecord_child(caller, tid)
             raise TaskError(f"could not record the remote start locally ({type(exc).__name__}); not started") from None
+        args["task_id"] = tid
         if caller is not None:
             progress["recorded"] = tid
         progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
@@ -1601,7 +1644,7 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
                 if exc.launched == "yes":
                     try:                        # the host has the task: make it trackable here, as a success would
                         _write_stub(root, exc.task_id, target.name, stub_origin, parent_id)
-                    except Exception:
+                    except Exception:           # (a taken id included: that dir is another task's, left untouched)
                         raise StartFailed(exc.exc_type, exc.where, "maybe") from None
             # else: our id (launched maybe/yes) stays recorded, start_unconfirmed until status or cancel settles it
             raise
@@ -1611,7 +1654,9 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
                 msg += (f" (it exists on this machine, {exec_hosts.short_hostname()}, only: child tasks run on "
                         f"{target.describe()}, not here)")
             if not exc.ambiguous:
-                forget()                        # the host refused, or the request never left: nothing runs
+                # the host refused, or the request provably never left (ssh's own pre-session failure; any other ssh
+                # exit 255 is ambiguous, review r2 P1: a connection that drops after the launch exits 255 too)
+                forget()
                 raise TaskError(msg) from None
             # A lost or timed-out reply: the task may run there. Its record stays (start_unconfirmed), under the parent
             # too, so task_status reconciles it and cancel_task (and a sub-orchestrator's cascade) reaches it by id.
@@ -1632,7 +1677,7 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
             try:
                 _write_stub(root, tid, target.name, stub_origin, parent_id)
             except BaseException as exc:
-                shutil.rmtree(os.path.join(root, tid), ignore_errors=True)
+                # _write_stub removed what it made, and never a dir it did not make (a taken id is another task's)
                 try:
                     _remote(target.name, "cancel", {"task_id": tid})
                 except TaskError as cancel_exc:
@@ -1787,6 +1832,11 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
             meta["title"] = launch_red.text(office["title"])
         meta[META_TEXT_MARK] = True             # every caller text above was redacted or refused with launch_red
         _write_json(os.path.join(d, "meta.json"), meta)   # before the spawn: the runner's export reads these
+        if os.path.exists(os.path.join(d, "cancelled")):
+            # Cancelled while this start ran (review r2, P2: a start paused between its mkdir and here, past
+            # META_GRACE_S, read as failed but cancel marks its dir anyway): checked immediately before the launch,
+            # and the runner checks it again before spawning the child and while it runs. Nothing is launched.
+            raise _CancelledBeforeLaunch()
         progress["launched"] = "maybe"         # the spawn itself: a failure inside it may leave a runner behind
         if launchd:
             # chrome: the allowlisted login env (no credential) rides in the plist; routed: nothing does (_prepare
@@ -1801,6 +1851,12 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
     except BaseException as exc:
         if lock_fd is not None:
             os.close(lock_fd)
+        if isinstance(exc, _CancelledBeforeLaunch):
+            # The dir STAYS, recorded as cancelled (a repeated start of this id must find it and launch nothing), as
+            # does the parent's child record (its cascade reads it as cancelled).
+            _finish_cancelled_before_launch(d, meta)
+            raise TaskError(f"start_task: task {task_id} was cancelled before it launched; nothing was started"
+                            ) from None
         if isinstance(exc, LaunchUncertain):
             # launchd may have loaded the job and started the runner: the record stays (meta.json and launchd.json are
             # written), so task_status follows it (a runner that never appears fails it after META_GRACE_S) and
@@ -3151,6 +3207,15 @@ def _mark_cancelled(d: str) -> str | None:
 
 def _cancel_local(d: str, task_id: str, state: str, meta: dict) -> dict:
     if state != "running":
+        # The marker goes into EVERY existing task dir, whatever _state() says (review r2, P2): a start paused between
+        # its mkdir and its meta.json past META_GRACE_S reads as failed, yet it may resume and launch; it checks the
+        # marker immediately before the launch (_start_task) and its runner again. On an ended task it changes nothing.
+        _mark_cancelled(d)
+        if not (os.path.exists(os.path.join(d, "meta.json")) or os.path.exists(os.path.join(d, "result.json"))):
+            # no metadata past the grace: a stalled or still-running start, not a failed task, for a cancel
+            return {"task_id": task_id, "state": "cancelling", "cancelled": True,
+                    "note": "the task's start has not published its record (stalled or still starting); marked "
+                            "cancelled, so it launches nothing if it resumes"}
         return {"task_id": task_id, "state": state, "cancelled": False, "reason": f"task is already {state}"}
     pid = meta.get("runner_pid")
     # Signal ONLY while the runner's lock is held AND the pid's command line is this task's runner: a recorded pid can
@@ -3236,9 +3301,26 @@ def _children_states(kids: list) -> dict:
 
 
 def _named_handoffs(text: str, ids: list) -> list:
-    """The ids among `ids` that the final message names on a line saying HANDOFF (HANDOFF_RE)."""
-    lines = [ln for ln in (text or "").splitlines() if HANDOFF_RE.search(ln)]
-    return [k for k in ids if any(k in ln for ln in lines)]
+    """The ids among `ids` that the final message names on a HANDOFF line: a whole line matching HANDOFF_RE, outside
+    fenced code blocks. Anything else (prose mentioning a handoff, a quoted `> HANDOFF:` line, a line in a code block,
+    leading whitespace) is not a handoff."""
+    named, fence = set(), None
+    for ln in (text or "").splitlines():
+        f = FENCE_RE.match(ln)
+        if f:
+            mark = f.group(1)
+            if fence is None:
+                fence = mark                    # opens a block; its closing fence is the same char, at least as long
+                continue
+            if mark[0] == fence[0] and len(mark) >= len(fence) and not ln.strip()[len(mark):].strip():
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        m = HANDOFF_RE.fullmatch(ln)
+        if m:
+            named.add(m.group(1))
+    return [k for k in ids if k in named]
 
 
 def _children_report(d: str, result: dict) -> None:
