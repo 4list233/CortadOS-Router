@@ -14,6 +14,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `assets/` | sprites, floor tiles, preview; origin and licence in `assets/NOTICE.md` |
 | `claw3d/avatar-profile-hint.patch` | 6-line Claw3D change so the 3D figures wear the family suits |
 | `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
+| `claw3d/system-fonts.patch` | drops `next/font/google` for system font stacks, so the build never fetches from Google Fonts (its `&skey=` font URLs broke the Turbopack build, 2026-11-24) |
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a `connect` through Studio's own proxy must get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
 | `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
