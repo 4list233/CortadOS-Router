@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -276,9 +277,19 @@ class ProbeHonesty(AgyBase):
     def test_account_picker_email_without_the_notice_gets_no_keystroke(self):
         binary, log = self.fake({"boot": "Antigravity CLI 1.5.16\n" + self.PICKER, "usage": FIXTURE.read_text()})
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(iso.SubscriptionUnproven):
+            with self.assertRaises(sc.ProbeRefused) as cm:      # the picker is a sign-in screen: refused mid-read
                 sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed), ("not-logged-in", []))
+        self.assertIn("account-picker", cm.exception.facts["rules"])
         self.assertEqual(self.keys(log), b"")
+
+    def test_account_picker_and_consent_screens_match_a_refusal_rule(self):
+        for screen in (self.PICKER, "Choose an account\n", "Select your account\n",
+                       "Antigravity CLI wants to access your Google Account\n", "Grant access to continue\n"):
+            with self.subTest(screen=screen):
+                self.assertTrue(any(re.search(p, screen, re.I) for _, p in sc.AGY_REFUSE))
+        for benign in (BANNER, FIXTURE.read_text(), TRUST):
+            self.assertFalse(any(re.search(p, benign, re.I) for _, p in sc.AGY_REFUSE))
 
     def test_bare_email_is_not_boot_ready_or_settled_but_the_banner_is(self):
         self.assertFalse(sc.AGY_BOOT_READY("Choose account: test@example.invalid"))
@@ -295,7 +306,9 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(sc.AGY_REFUSE[0][1],
                          r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
                          r"|" + sc._AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
-                         r"|please (?:sign|log) in|login required")
+                         r"|please (?:sign|log) in|login required"
+                         r"|choose (?:an? |your )?account|select (?:an? |your )?account|use another account"
+                         r"|wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b")
 
     def test_notice_repainted_after_the_banner_is_refused_with_facts_and_nothing_typed(self):
         repaint = "\x1b[2J\x1b[HWelcome to the Antigravity CLI. You are currently not signed in.\n> \n"
@@ -384,6 +397,62 @@ class ProbeHonesty(AgyBase):
                 self.assertEqual(self.keys(log), b"\r")
                 self.assertEqual(cm.exception.typed, ["Enter (workspace trust)"])
                 self.assertTrue(cm.exception.facts["trust_prompt"])
+
+    # ---- #144 fix round (review P1): the trust prompt counts only on the CURRENT screen. A prompt painted and then cleared
+    # away (agy repainting into an account picker, say) must not let the trust Enter through.
+    def test_signing_in_trust_then_cleared_into_an_account_picker_gets_no_keystroke(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, "\x1b[2J\x1b[H" + self.PICKER],
+                                 "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+
+    def test_trust_cleared_into_an_unknown_screen_gets_no_keystroke(self):
+        # no refusal rule matches the new screen: only the current-screen check stops the Enter
+        for clear in ("\x1b[2J\x1b[H", "\x1b[H\x1b[J", "\x1b[?1049h", "\x1bc"):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST, clear + "Loading workspace\n"],
+                                     "after_trust": BANNER, "usage": FIXTURE.read_text()})
+            with self.subTest(clear=repr(clear)), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+                self.assertIs(cm.exception.facts["trust_prompt"], False)
+
+    def test_trust_prompt_alone_on_the_current_screen_gets_exactly_one_enter(self):
+        binary, log = self.fake({"boot": SIGNING_IN + "\x1b[2J\x1b[H" + TRUST, "after_trust": BANNER,
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"\r/usage\r")      # one trust Enter, then the normal /usage path
+
+    def test_current_screen_is_the_text_since_the_last_full_redraw(self):
+        self.assertEqual(sc._current_screen(b"old\x1b[2J\x1b[Hnew"), b"\x1b[Hnew")
+        self.assertEqual(sc._current_screen(b"a\x1b[2Jb\x1b[?1049hc"), b"c")
+        self.assertEqual(sc._current_screen(b"a\x1b[1;1H\x1b[0Jb"), b"b")
+        self.assertEqual(sc._current_screen(b"no clear"), b"no clear")
+        self.assertEqual(sc._current_screen(b"a\x1b[2Kb"), b"a\x1b[2Kb")       # a line erase is not a full redraw
+
+    def test_trust_answer_read_shares_one_boot_window(self):
+        # trust shown, nothing after the answer: the probe gives up within boot_s overall, not boot_s again after Enter
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST]})
+        reaped: list[float] = []
+        real_reap = sc._reaper.reap
+
+        def timed_reap(*a, **k):
+            reaped.append(time.time())
+            return real_reap(*a, **k)
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)), \
+                mock.patch.object(sc._reaper, "reap", timed_reap):
+            with self.assertRaises(sc.ProbeRefused):
+                sc._antigravity()
+        self.assertEqual(self.keys(log), b"\r")
+        # from the Enter (the fake's key log) to the end of the read (the reaper's start, which then waits 1.5 s on its
+        # own), so a slow fake start-up cannot flake it: the boot read used ~2.1 s of the 3 s window and leaves under
+        # 1 s; a fresh window would be the full 3 s
+        self.assertLess(reaped[0] - Path(str(log) + ".keys").stat().st_mtime, 2.0)
 
     def test_trust_prompt_with_a_sign_in_screen_gets_no_keystroke(self):
         binary, log = self.fake({"boot": LOGGED_OUT + TRUST, "after_trust": BANNER, "usage": FIXTURE.read_text()})

@@ -114,6 +114,22 @@ def _plain(raw: bytes) -> str:
     return re.sub(r"[ \t]+", " ", raw.decode("utf-8", "replace"))
 
 
+# A full redraw: erase display (2J, 3J), terminal reset (ESC c), an alternate-screen switch (1049/1047/47, either way), or
+# cursor home followed by erase-below. Text painted before the last one is no longer on screen.
+_SCREEN_RESET = re.compile(rb"\x1b\[[23]J|\x1bc|\x1b\[\?(?:1049|1047|47)[hl]|\x1b\[(?:1?(?:;1)?)?[Hf]\x1b\[0?J")
+
+
+def _current_screen(raw: bytes) -> bytes:
+    """The bytes painted since the last full redraw (_SCREEN_RESET): what is on screen now, not the whole transcript.
+    The trust prompt's Enter is judged on this alone (#144 fix round: a trust prompt cleared away and replaced by an
+    account picker must not still count as shown). Line-erasing redraws (no full clear) are not cut, so stale text may
+    remain in it; that only ever adds text, and every refusal pattern is also checked on it and on the whole transcript."""
+    last = None
+    for last in _SCREEN_RESET.finditer(raw):
+        pass
+    return raw[last.end():] if last else raw
+
+
 def _boot_failure_kind(text: str) -> str:
     """Classify startup failures without persisting terminal text or credentials."""
     for kind, pattern in (
@@ -189,6 +205,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `refuse_unsettled` is ((kind, regex), ...) like `refuse`, but checked only when the probe is about to act (at the end
     of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
+    The trust prompt counts only on the CURRENT screen (`_current_screen`: text since the last full redraw), checked when
+    the boot read ends and again in the write path itself: a prompt cleared away and replaced (by an account picker,
+    say) gets no Enter, and every check applies. The read after the answer gets what is left of the one boot_s window.
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
     `on_boot` may raise to refuse: it runs before the first keystroke of `command`.
     The trust prompt's Enter is checked against `refuse` only, not `refuse_unsettled`: the prompt is not a sign-in screen,
@@ -258,10 +277,15 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 if _screen_has(pattern, shown, re.I):
                     raise refusal(kind, where, "unsettled", acting, shown)
 
+    def trust_on_screen() -> bool:
+        """The trust prompt is on the CURRENT screen (since the last full redraw), not merely somewhere in the transcript."""
+        return bool(re.search(_TRUST_PROMPT, _plain(_current_screen(buf)), re.I))
+
     def send(data: bytes, name: str, unsettled: bool = True) -> None:
         """Every keystroke the probe types goes through here: the screen is checked first (deny-all). unsettled=False
-        only for the workspace-trust answer: `refuse` still applies; `refuse_unsettled` waits for the next keystroke."""
-        refused(stage, acting=unsettled)
+        only for the workspace-trust answer, and only while the trust prompt is on the current screen: `refuse` still
+        applies; `refuse_unsettled` waits for the next keystroke. Without the prompt on screen every check applies."""
+        refused(stage, acting=unsettled or not trust_on_screen())
         os.write(fd, data)
         typed.append(name)
 
@@ -297,11 +321,15 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
+    boot_end = time.time() + boot_s      # one boot window for the read before AND after the trust answer
+
+    def boot_left() -> float:
+        return max(0.0, boot_end - time.time())
     try:
         pump(boot_s, until=ready)
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
-        trust_seen = bool(re.search(_TRUST_PROMPT, _plain(buf), re.I))
+        trust_seen = trust_on_screen()               # the prompt as shown now; a cleared-away prompt is not answered
         refused("boot", acting=not trust_seen)        # a trust prompt is answered first; unsettled is judged after it
         if eof:
             mark = len(buf)
@@ -310,9 +338,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             stage = "trust"
             send(b"\r", "Enter (workspace trust)", unsettled=False)
             if ready_after_trust is not None and _screen_has(ready_after_trust, _plain(buf)):
-                pump(boot_s, mark=len(buf))             # already painted before the prompt: read until quiet
+                pump(boot_left(), mark=len(buf))        # already painted before the prompt: read until quiet
             else:
-                pump(boot_s, until=ready_after_trust or ready, mark=len(buf))
+                pump(boot_left(), until=ready_after_trust or ready, mark=len(buf))
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
             refused("trust")
@@ -670,6 +698,10 @@ _AGY_SIGN_IN_RULES = (
     ("authorization-url-or-code", r"authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"),
     ("not-signed-in-notice", _AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"),
     ("please-sign-in", r"please (?:sign|log) in|login required"),
+    # an account choice or a consent screen is part of signing in, never answered (#144 fix round: a picker painted
+    # after a cleared trust prompt matched no pattern and got the trust Enter)
+    ("account-picker", r"choose (?:an? |your )?account|select (?:an? |your )?account|use another account"),
+    ("consent", r"wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b"),
 )
 AGY_REFUSE = (
     ("not-logged-in", "|".join(rule for _, rule in _AGY_SIGN_IN_RULES)),
