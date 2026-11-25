@@ -553,7 +553,20 @@ def canonical_route(text: str, served: list[str] | None = None) -> str:
     if kind == "star":
         return f"{wlabel}:*"
     ids = sorted({resolve_pick_name(n, served) for n in names})
-    return f"{wlabel or 'any'}:{'+'.join(ids)}"
+    return check_route(f"{wlabel or 'any'}:{'+'.join(ids)}", "--route")
+
+
+def check_route(value: str, where: str) -> str:
+    """`value` (a canonical pick label) if the provider's own parser takes it, else SessionError. Reason: resolving
+    friendly names to table ids can lengthen a pick past routing.PIN_NAME_MAX (`R1:fable+…+sol`, 79 typed characters,
+    becomes 130), and the menu can select more than routing.PICK_MAX_MODELS models; either would be refused by the
+    provider, or crash route_notes, after the pick was saved. Checked with routing.parse_pick, the server's grammar and
+    limits, never a copy of them."""
+    try:
+        routing.parse_pick(value)
+    except routing.PickError as exc:
+        raise SessionError(f"{where}: {exc}") from None
+    return value
 
 
 def route_model(value: str) -> str:
@@ -763,10 +776,14 @@ class RoutePrompt:
                 return band
             if got == "":
                 ids = sorted(m["id"] for m, on in zip(models, chosen) if on)
-                if ids:
-                    return f"{band}:{'+'.join(ids)}"
-                self.say("select at least one model, or a / b")
-                continue
+                if not ids:
+                    self.say("select at least one model, or a / b")
+                    continue
+                try:
+                    return check_route(f"{band}:{'+'.join(ids)}", "route pick")
+                except SessionError as exc:          # too many models, or too long: say so and ask again
+                    self.say(f"{exc}; deselect some models, or a / b")
+                    continue
             nums = got.replace(",", " ").split()
             if all(n.isdigit() and 1 <= int(n) <= len(models) for n in nums):
                 for n in nums:

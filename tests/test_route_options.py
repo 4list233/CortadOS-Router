@@ -107,6 +107,22 @@ class CloudSectionTests(OptionsBase):
         codex = m[SOL]["routes"]
         self.assertEqual([(r["provider"], r["state"], r["left_pct"]) for r in codex], [("codex-cli", "unread", None)])
 
+    def test_email_account_ids_never_reach_the_response(self):
+        # review round 1 (P2): an account id is free text in accounts.json and may be a login email; account, provider
+        # and lane show it as a letter by position instead, the second account included.
+        mails = ["review@example.invalid", "second@example.invalid"]
+        core._vendor_accounts = lambda *a: [
+            {"lane": "claude", "provider": "claude-cli", "account": mails[0], "reserve": False, "config_dir": "/x/a"},
+            {"lane": "claude#" + mails[1], "provider": "claude-cli#" + mails[1], "account": mails[1],
+             "reserve": False, "config_dir": "/x/b"}]
+        self.health["claude#" + mails[1]] = row("claude#" + mails[1], ok=False)
+        text = json.dumps(self.view("R3")) + json.dumps(self.view("R0"))
+        for leak in mails + ["@", "example.invalid", "review", "second"]:
+            self.assertNotIn(leak, text)
+        m = {x["id"]: x for x in self.view("R3")["cloud"]["models"]}
+        got = sorted((r["provider"], r["lane"], r["account"], r["state"]) for r in m[OPUS]["routes"])
+        self.assertEqual(got, [("claude-cli", "claude", "A", "ok"), ("claude-cli#B", "claude#B", "B", "spent")])
+
     def test_api_credit_lane_when_offered(self):
         self.api_state = {"on": True, "headroom_usd": 142.317}
         m = {x["id"]: x for x in self.view("R3")["cloud"]["models"]}

@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 from cortados_router import session
-from cortados_router.provider import route_options
+from cortados_router.provider import route_options, routing
 
 SECRET = "tok-SECRET-123"
 OPUS, SOL, ASTRA, FABLE = "claude-opus-5-5", "gpt-6.1-sol", "gpt-6-astra", "claude-fable-5-1"
@@ -160,6 +160,21 @@ class RouteFlagTests(RouteBase):
         with self.assertRaisesRegex(session.SessionError, "coming in the next step"):
             self.prepare("--route", "local:qwen-27b")
 
+    def test_a_route_too_long_once_resolved_is_a_clean_error(self):
+        # review round 1 (P2): 79 typed characters become 130 once the aliases resolve to table ids, past the
+        # provider's routing.PIN_NAME_MAX; refused before anything is saved or launched, never a crash.
+        self.offline = True
+        typed = "R1:fable+haiku+opus+sonnet+claude-opus-5+gpt-5.6-luna+gpt-5.6-terra+gpt-6.1-sol"
+        self.assertLessEqual(len(typed), routing.PIN_NAME_MAX)
+        rc, out, err, ex = self.main("--route", typed)
+        self.assertEqual(rc, 2, err)
+        self.assertIn(f"at most {routing.PIN_NAME_MAX} printable characters", err)
+        self.assertNotIn("Traceback", err)
+        ex.assert_not_called()
+        self.assertFalse(os.path.exists(self.pick_path()))
+        with self.assertRaisesRegex(session.SessionError, f"at most {routing.PICK_MAX_MODELS} models"):
+            self.prepare("--route", "R1:" + "+".join(f"m{i}" for i in range(routing.PICK_MAX_MODELS + 1)))
+
     def test_route_last(self):
         with self.assertRaisesRegex(session.SessionError, "no route pick has been saved"):
             self.prepare("--route", "last")
@@ -262,6 +277,20 @@ class MenuTests(RouteBase):
         self.assertEqual(m, f"cortados@R3:{ASTRA}")
         self.assertIn("select at least one model, or a / b", out)
         self.assertIn("numbers 1-6, a, b, or Enter", out)
+
+    def test_too_many_models_selected_asks_again(self):
+        # review round 1 (P2): the menu accepted routing.PICK_MAX_MODELS + 1 models, then the launch crashed
+        n = routing.PICK_MAX_MODELS + 1
+        models = [{"id": f"model-{i}", "name": f"Model {i}", "routes": []} for i in range(n)]
+        self.views["R3"] = {**R3_VIEW, "cloud": {**R3_VIEW["cloud"], "models": models}}
+        picks = " ".join(str(i + 1) for i in range(n))
+        rc, out, err, ex = self.main(answers=f"3\n{picks}\n\n1\n\n")
+        self.assertEqual(rc, 1, err)                              # execvpe mocked: main returns past it
+        self.assertIn(f"a route pick names at most {routing.PICK_MAX_MODELS} models ({n} given)", out)
+        self.assertIn("deselect some models", out)
+        want = "R3:" + "+".join(sorted(f"model-{i}" for i in range(1, n)))
+        self.assertEqual(session.load_pick(self.home), want)
+        self.assertIn("cortados@" + want, ex.call_args[0][1])
 
     def test_local_is_shown_with_the_note_and_not_picked(self):
         m, out, _ = self.prepare(answers="5\n6\n")

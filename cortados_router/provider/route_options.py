@@ -15,7 +15,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from cortados_router.provider import local_lane, routing
+from cortados_router.provider import local_lane, routing, usage
 
 logger = logging.getLogger("cortados.provider.route_options")
 
@@ -73,11 +73,28 @@ def _route_state(h: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _shown_id(acct: dict[str, Any] | None, index: int) -> str:
+    """The account's id as this view may show it: the configured id when it passes the usage view's string rule
+    (usage._label: no '@', '/', address, …) and is short, else its letter by position (A, B, …). Reason: an account id
+    is free text in accounts.json and may be a login email (`review@example.invalid`); no email leaves this view."""
+    a = (acct or {}).get("account")
+    if isinstance(a, str) and a and len(a) <= 24 and "#" not in a and usage._label(a) == a:
+        return a
+    return chr(ord("A") + index) if index < 26 else str(index + 1)
+
+
 def _account_label(acct: dict[str, Any] | None, index: int, many: bool) -> str | None:
     if not acct or not many:
         return None
-    a = acct.get("account")
-    return (str(a).upper() if isinstance(a, str) and len(a) <= 2 else str(a)[:24]) if a else chr(ord("A") + index)
+    a = _shown_id(acct, index)
+    return a.upper() if len(a) <= 2 else a
+
+
+def _shown_key(key: str | None, acct: dict[str, Any] | None, index: int) -> str | None:
+    """A provider or lane key (`claude-cli#<id>`, `claude#<id>`) with its account suffix as _shown_id shows it."""
+    if not isinstance(key, str) or "#" not in key:
+        return key
+    return key.split("#", 1)[0] + "#" + _shown_id(acct, index)
 
 
 def cloud_section(core, band: str, *, now: float | None = None) -> dict[str, Any]:
@@ -130,7 +147,7 @@ def cloud_section(core, band: str, *, now: float | None = None) -> dict[str, Any
             c = routing._pair_lane(core, p, m, row_of, {k: a for k, (_, a) in acct_of.items()})
             st = _route_state(core.candidate_health(c, health)) if c else {"state": "unread", "left_pct": None,
                                                                            "window": None, "resets_at": None}
-            routes.append({"provider": p, "lane": (c or {}).get("lane"),
+            routes.append({"provider": _shown_key(p, acct, i), "lane": _shown_key((c or {}).get("lane"), acct, i),
                            "account": _account_label(acct, i, len(accounts) > 1),
                            "reserve": bool((acct or {}).get("reserve")), **st})
         if any(p.split("#", 1)[0] == "claude-cli" for p, _ in pairs) and api.get("on"):
