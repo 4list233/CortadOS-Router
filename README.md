@@ -195,6 +195,7 @@ cost = burn weight + 30 × scarcity − 80 × underuse − capacity credit
 - **Underuse split (#143).** When the cheapest qualifying route is on a pool expected to lose quota at its reset, every underused pool with a qualifying route takes part, weighted by the quota it is expected to lose (expected loss % × its size in tokens), and one is picked by a hash of the conversation id (`core.split_pick`): the same conversation always lands on the same pool, and the pools share the work instead of the largest credit taking all of it. The underused frontier pools share hard work the same way. A route the host's admission check refuses (the client floor) takes no part; the switching margin does not override a split.
 - **Frontier for hard work (#143).** The R4 and best knots are at D 9 and 10 (S1 never answers above 10). Planning and research at D ≥ 7, and code at D ≥ 9, need a frontier (ceiling) model while one is available (`selection.ceiling_work.require_frontier`). Fable is sized by the window that binds it: it also draws on the all-models week (`selection.pool_size_from_pool`).
 - **Switching margin.** When the client's previous route in the same band costs at most `selection.switch_margin_points` (3) more than the cheapest one, it stays, so a 1–3 point swing between readings does not move the client from one model to another. It is held only when it also passes the host's own admission check: under a client floor (`x-cortados-min-left-pct`) a previous route below the floor is not held, and the cheapest eligible route is chosen instead of the request being refused.
+- **Band window.** A client may send `x-cortados-band: R2` (or `R1-R2`), or name the model `cortados@R2` (Anthropic wire). S1's band is then clamped into the window, under the hard rules. Precedence is under "Whole session on the router".
 - **Batch hint.** A client may send `x-cortados-workload: batch` (both wires). The band is then capped at R1 and the call runs as background work. The cap applies to the requirement too: the difficulty is counted as at most 5 (the most R1 admits), so the required index is R1's and the frontier rules (planning/research at the R4 reference, the underused-frontier rule) do not fire. A trusted minimum band above R1 undoes the cap. An outward or blast-radius-3 request keeps R3, and a degraded scorer still never defaults to Claude. Unknown values are ignored and logged; the hint is recorded in the route row's `workload` column.
 
 **Final gates:** context fit is hard; a vendor's models come from that vendor's own subscription first; sessions stay on their model while it stays near the cheapest choice; agent-facing turns never fall below a minimum general index. `docs/ROUTER-DESIGN.md` is the full design log.
@@ -345,6 +346,37 @@ What runs where:
 - **Main loop (orchestrator):** pinned with `--model sub/claude-fable-5-1` (default). The short names come from the
   provider's own `sub/` alias table (`routing.SUB_ALIASES`): `opus` = `claude-opus-5-5`, `sonnet` = `claude-sonnet-5`,
   `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
+- **Routed main loop in a band window:** `--orchestrator cortados` routes the main loop through S1 and scarcity (the
+  cheapest capable model wins) but only inside a band window, by default exactly **R4**, the Opus 5.5 / Sol 6.1 band (`--orchestrator-band R4`;
+  a range such as `R1-R2` or `R2-R3` also works; `any` turns the window off). The window is carried in the main
+  loop's model name, `--model cortados@R4`. Claude Code sends that name only on main-loop requests. Subagents are
+  forced to `cortados` and side calls are pinned to haiku, so neither is windowed. (Checked with Claude Code 2.1.330
+  against a capture server, 2026-11-23: the main loop sent `cortados@R1-R2` and its subagent sent `cortados`.) A header
+  in `ANTHROPIC_CUSTOM_HEADERS` would have reached subagents too, so the launcher does not send one.
+  Precedence, strongest first:
+  1. The hard rules. An outward effect (blast radius 3) keeps R3 over the window's max. A degraded scorer still never
+     routes to Claude: the window moves the band, but Claude stays excluded. The sensitive and local rules run after
+     the window, unchanged.
+  2. A trusted capability floor (for example, vision escalation needs R3) beats the window's max.
+  3. The window clamps S1's band. Below the min it is raised, and the band's required index applies. Above the max it
+     is lowered, and the difficulty counts as the most that band admits, as with the batch cap.
+  4. S1's band.
+  The routes row records it: the `band_window` column, plus `band window …` rules. The Tasks view shows them as
+  `band window R2`, or `band window R2 overridden` when a hard rule won. Child tasks launch with
+  `--orchestrator-band any` and keep free routing. A `sub/` pin ignores the window. Other clients can send the same
+  window as the `x-cortados-band` header (both wires; owner token only, like every routing header). An invalid window
+  is refused with a 400, on every request, continuations included, before any conversation is looked up. The window
+  is part of a conversation's identity: a request is matched to, retried (replayed) from or rebuilt from only a
+  conversation opened under the same window (`R2` and `R2-R2` are one window; no window is its own). A request whose
+  history belongs to a conversation of another window opens a new conversation under its own window, seeded with the
+  history it carries; that other conversation is untouched. Identical requests that open such a conversation at the
+  same time open it once: the later one waits for the first and joins it (a stale 409 whose retry is the replay, as
+  for a rebuild). A failure belongs to its window too: a conversation of another window never hides it, so a
+  failed conversation's retry gets the terminal error, never a fresh backend forked from the other window. This covers a forked subagent (it inherits the main loop's
+  history and session id, but sends plain `cortados`: routed in S1's band) and a main loop whose window changed (in
+  Claude Code, `/model cortados@R3`): the change simply re-routes from the next turn, at the cost of the backend
+  session's prompt cache. No `/clear` is needed. A `sub/` pin is outside windows: a pinned conversation continues
+  whatever window a request names, and a pin under a windowed main loop opens its own pinned conversation.
 - **Native subagents:** `CLAUDE_CODE_SUBAGENT_MODEL=cortados` (+ `_FORCE`, and the workflow variant), so S1 routes
   each one. They are Claude Code's own subagents, so they keep every tool, MCP included; the provider bridges the tool
   calls back to this Claude Code, which runs them locally. Caveat: what `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` does is

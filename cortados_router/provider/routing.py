@@ -78,6 +78,20 @@ PLATFORM = "cli"
 # It lowers priority without pinning a model. Any other value is ignored with a log line (workload_hint).
 WORKLOAD_HEADER = "x-cortados-workload"
 WORKLOAD_MODES = ("batch",)
+# The band window (both wires): the band S1 picks is clamped into [min, max] (core.resolve band_window), under the hard
+# rules (an outward request keeps R3 over the max; a degraded scorer still never defaults to Claude; the sensitive and
+# local rules run after it, unchanged). Written `R2` (exactly R2) or `R1-R2`; `any` is no window. Two ways in:
+#   - the x-cortados-band header, for any client whose every request should be windowed;
+#   - a model name `cortados@<window>` on the Anthropic wire. The whole-session launcher (session.py) gives it to the
+#     main loop only (`--model cortados@R2`): Claude Code sends the main loop's --model on every main-loop request,
+#     while its subagents are forced to `cortados` (CLAUDE_CODE_SUBAGENT_MODEL[_FORCE]) and side calls are pinned to
+#     haiku, so the window reaches exactly the main loop. A header (ANTHROPIC_CUSTOM_HEADERS) would reach all three.
+# Both come only from a caller holding the owner token (the model endpoints refuse every other token before routing),
+# the same trust as x-cortados-workload and x-cortados-exclude-model. An invalid window is refused (400), never
+# ignored: the person asked for a window, and routing without it could spend R3 or drop to R0 unannounced. A `sub/`
+# pin ignores it (the person chose the model).
+BAND_HEADER = "x-cortados-band"
+BAND_MODEL_PREFIX = "cortados@"
 # The switching margin's memory (#132): per client, the last route chosen in each band, so a 1–3 point cost swing does
 # not flip the next conversation of the same client (core.resolve `previous`). In memory only, bounded.
 _LAST_ROUTES: "OrderedDict[str, dict[str, dict[str, str]]]" = OrderedDict()
@@ -102,6 +116,39 @@ def workload_hint(raw: Any) -> str | None:
         logger.info("%s: unknown value %s ignored", WORKLOAD_HEADER, wire.log_safe(v[:40]))
         return None
     return v
+
+
+def band_model_window(model: Any) -> str | None:
+    """The `<window>` text of a `cortados@<window>` model name (as written, unvalidated: parse_band_window checks it),
+    or None for any other name. THE one reading of that spelling: band_window takes the window from it, and
+    orchestrator_usage counts a model it matches as routed (the provider echoes the suffixed name into the client's
+    transcript, so a windowed main loop's tokens must not also count as the owner's direct orchestrator usage)."""
+    m = model.strip() if isinstance(model, str) else ""
+    return m[len(BAND_MODEL_PREFIX):] if m.casefold().startswith(BAND_MODEL_PREFIX) else None
+
+
+def band_window(header: Any, model: Any) -> tuple[tuple[str, str] | None, str | None]:
+    """(window, error) of a request: from the BAND_HEADER value and the body's model (`cortados@<window>`). (None,
+    None) when neither names one (or `any`); an error string for an invalid window, or for header and model naming two
+    different windows (which one the person meant cannot be guessed)."""
+    from cortados_router import core
+    found: list[tuple[str, str] | None] = []
+    sources = []
+    raw = header.strip() if isinstance(header, str) else ""
+    if raw:
+        sources.append((BAND_HEADER, raw))
+    from_model = band_model_window(model)
+    if from_model is not None:
+        sources.append((f"model {BAND_MODEL_PREFIX}…", from_model))
+    for where, text in sources:
+        try:
+            found.append(core.parse_band_window(text))
+        except ValueError:
+            return None, (f"{where}: {wire.log_safe(text[:16])} is not a band window "
+                          "(a band R0–R4, a range like R1-R2, or `any`)")
+    if len(found) == 2 and found[0] != found[1]:
+        return None, f"{BAND_HEADER} and the model name ask for different band windows"
+    return (found[0] if found else None), None
 
 
 def previous_routes(client: str) -> dict[str, dict[str, str]] | None:
@@ -689,8 +736,10 @@ def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, 
 def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, claude_bin: str = "claude",
            codex_bin: str = "codex", exclude_model: str | None = None,
            min_left_pct: float | None = None, codex_home: str | None = None,
-           local: str | None = None, workload: str | None = None) -> dict[str, Any]:
-    """Route a new conversation. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
+           local: str | None = None, workload: str | None = None,
+           band_window: tuple[str, str] | None = None) -> dict[str, Any]:
+    """Route a new conversation. `band_window` (lo, hi; see BAND_HEADER, already validated by the caller) clamps S1's
+    band; a pin ignores it. Returns execution_routing.select's result: provider, model, route_id, band, … or error.
     A `sub/`-pinned request skips S1 (choose_pinned). `exclude_model` (the x-cortados-exclude-model header, a comma
     list) keeps the conversation off each listed model on every lane, so a review never runs on a model that wrote the
     code. `local` (the x-cortados-local header: LOCAL_MODES) marks the request for a node's sensitive model
@@ -730,6 +779,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
             return {"router": execution_routing.ROUTER, "client_error": True, "error": str(exc)}
         if local:
             logger.info("%s: %s ignored: the request pins sub/%s", LOCAL_HEADER, local, pinned)
+        if band_window:
+            logger.info("band window %s ignored: the request pins sub/%s", "-".join(band_window), pinned)
         if hit(pinned):
             return {"router": execution_routing.ROUTER, "client_error": True,
                     "error": f"sub/{shown_pin(pinned)} is the excluded model (x-cortados-exclude-model); pin another model or use cortados"}
@@ -766,6 +817,8 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     workload = workload_hint(workload)
     if workload:
         constraints["workload"] = workload      # select applies the table's workloads row (band cap, background)
+    if band_window:
+        constraints["band_window"] = tuple(band_window)   # core.resolve clamps S1's band into it, under the hard rules
     previous = previous_routes(client)
     # The client's floor bounds the switching margin (#132) and, since #143, the underuse split and the frontier
     # rules, so it is passed whenever the client sent one, not only with a previous route.

@@ -110,9 +110,21 @@ def _json(value: Any, kind: type) -> tuple[Any, str]:
     return (parsed, "ok") if isinstance(parsed, kind) else (None, "unreadable")
 
 
+# core.resolve's band window rules ("band window R2: band R1 raised to R2", "band window R2 overridden: blast radius 3
+# …"): labelled with the window itself, which the pattern admits only as band names (never free text), so the Tasks
+# view shows "band window R2" / "band window R2 overridden". The difficulty step ("band window: difficulty …") has its
+# own fixed label.
+_WINDOW_RULE = re.compile(r"band window (R[0-4](?:-R[0-4])?)( overridden)?[: ]")
+
+
 def _rule_label(rule: Any) -> str | None:
     if not isinstance(rule, str):
         return None
+    m = _WINDOW_RULE.match(rule)
+    if m:
+        return "band window " + m.group(1) + (" overridden" if m.group(2) else "")
+    if rule.startswith("band window: difficulty "):
+        return "band window difficulty cap"
     for prefix, label in _RULES:
         if rule.startswith(prefix):
             return label

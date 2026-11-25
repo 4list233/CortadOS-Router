@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import html as html_escape
@@ -441,6 +442,30 @@ _EXCLUDE_MODEL_BAD = "cortados: x-cortados-exclude-model is not a model id"
 # A review may need to stay off several models (every builder of the work), so the header is a comma list; capped so
 # a header cannot fan out into an unbounded exclusion set (or empty the pool by sheer length).
 EXCLUDE_MODEL_MAX = 8
+
+
+def _window_label(window: tuple[str, str] | None) -> str | None:
+    """A validated band window's one spelling (core.band_window_label: `R2`, `R1-R2`), or None for no window."""
+    from cortados_router import core
+    return core.band_window_label(*window) if window else None
+
+
+# Registry.find's "no window" filter (a direct caller, a test); a real request passes its window label or None.
+ANY_WINDOW = object()
+
+
+def _in_window(s, window: Any) -> bool:
+    """Whether conversation `s` (a live session or a ReapedConversation) belongs to band window `window` (a label, None
+    for no window, or ANY_WINDOW). The band window is part of a conversation's identity (round 3 of the band window
+    review, owner 2026-11-24): a request is matched to, replayed from or rebuilt from only a conversation opened under
+    its own window (its route's ASKED_WINDOW_KEY; `R2` and `R2-R2` are one label). A request whose history belongs to a
+    conversation of another window opens a new conversation from that history (Fork). A pinned conversation (sub/) is
+    in every window: a pin ignores the window when it opens (routing.choose), so a continuation of it is matched
+    whatever window it names, as before."""
+    if window is ANY_WINDOW:
+        return True
+    r = getattr(s, "route", None) or {}
+    return bool(r.get("pinned")) or r.get(ASKED_WINDOW_KEY) == window
 
 
 def _exclude_model_header(headers) -> tuple[str | None, bool]:
@@ -970,7 +995,11 @@ class Registry:
 
     def new(self, turn: anthropic_wire.ClientTurn, *, keep: bool, route: dict | None = None,
             scope: str | None = None, wire_path: str | None = None, admitted: bool = False,
-            client: str | None = None):
+            client: str | None = None, seed: list | None = None):
+        """A new conversation for `turn`. `seed` (a fork: Fork, a request in another band window): the inherited history's transcript
+        (anthropic_wire.rebuild_transcript). The conversation then starts from the request's history as a rebuild
+        does (its replies, so its continuations match it exactly in find; the seed sent with its first turn, work()),
+        but on its OWN route and its own rebuild budget: it is a new conversation, not the parent's lineage."""
         if keep and not admitted:
             self.reserve_opening()
         try:
@@ -979,6 +1008,9 @@ class Registry:
             if keep:
                 self.release_opening()
             raise
+        if seed is not None:                            # set before _publish: find may return it from then on
+            s.history = list(turn.history)
+            s.rebuild_seed = None if isinstance(s, LocalSession) else seed   # local: the relay is stateless
         if keep:
             self._publish(s)
         return s
@@ -1164,7 +1196,7 @@ class Registry:
 
     @staticmethod
     def failure_key(turn: anthropic_wire.ClientTurn, *, wire_path: str, client: str,
-                    identity: str | None) -> str | None:
+                    identity: str | None, window: str | None = None) -> str | None:
         """The identity of the conversation a request belongs to, for its tombstone: the wire, the calling client (its
         User-Agent name), the conversation identity the client sent (Handler._conversation_identity), and the wire's
         canonical digest of the history before the new turn (user content, tool results and assistant fingerprints;
@@ -1172,10 +1204,14 @@ class Registry:
         failed request, and the next message a person types after it, carry that same identity and history; an
         unrelated conversation does not. None for an opening request (no conversation to name) and for a request
         without an identity: two independent conversations can share a prefix, so the digest alone would hand one the
-        other's failure. find never matches None, and fail publishes nothing under it."""
+        other's failure. find never matches None, and fail publishes nothing under it. A band `window` (its label) is
+        part of the conversation's identity (_in_window), so a conversation's failure never refuses another window's
+        request (a fork) sharing its history; no window keeps the key it always had."""
         if not turn.history or not identity:
             return None
-        return anthropic_wire.history_digest(wire_path, client, identity, turn.prefix_digest)
+        if window is None:
+            return anthropic_wire.history_digest(wire_path, client, identity, turn.prefix_digest)
+        return anthropic_wire.history_digest(wire_path, client, identity, turn.prefix_digest, window)
 
     @staticmethod
     def conversation_scope(*, wire_path: str, client: str, identity: str | None) -> str | None:
@@ -1185,7 +1221,7 @@ class Registry:
         return anthropic_wire.history_digest(wire_path, client, identity) if identity else None
 
     def find(self, turn: anthropic_wire.ClientTurn, failure_key: str | None = None, scope: str | None = None,
-             wire_path: str | None = None, client: str | None = None):
+             wire_path: str | None = None, client: str | None = None, window: Any = ANY_WINDOW):
         """The live session whose replies are exactly this request's assistant history; None for a new conversation.
         Never continue a conversation on a guess. With no match, a tombstone under `failure_key` makes it a
         FailedSession; a retry of the session's last answered turn (see Replay) raises Replay with the stored
@@ -1197,7 +1233,10 @@ class Registry:
         only on proof that it is the caller of that session: an exact match whose history carries a tool_use id
         (ClientTurn.history_tool_ids: the backend's own random ids, which only a client that received that
         session's output holds). The User-Agent name is no such proof (every Claude Code sends `claude-cli`), so
-        without it the request is refused, terminally (no_identity); it is never rebuilt and never replayed."""
+        without it the request is refused, terminally (no_identity); it is never rebuilt and never replayed.
+        `window` (the request's band window label, None for none; ANY_WINDOW: no filter): only conversations opened
+        in that window are matched, replayed or rebuilt from (_in_window). A request whose history only a conversation
+        of ANOTHER window holds raises Fork (_rebuild_or_refuse): it opens its own conversation from that history."""
         if not turn.history:
             return None
         with self._lock:
@@ -1205,8 +1244,12 @@ class Registry:
             # two clients, or two wires, whose reply histories happen to match must never continue each other's
             # backend (the same rule _replays and _rebuild_or_refuse apply). Identity-less sessions additionally
             # match by the opener's client name (`client`, kept by _new), then need the tool-id proof below.
-            matches = self._exact(turn.history, scope, wire_path, client)
-            replays = [] if matches or scope is None else self._replays(turn, scope, wire_path)
+            matches = self._exact(turn.history, scope, wire_path, client, window)
+            # Identity-less: never rebuilt (_rebuild_or_refuse needs a scope), so another window's conversation holding
+            # this exact history is found here; the same tool-id proof below makes it a Fork.
+            others = [] if matches or scope is not None or window is ANY_WINDOW else [
+                s for s in self._exact(turn.history, scope, wire_path, client) if not _in_window(s, window)]
+            replays = [] if matches or scope is None else self._replays(turn, scope, wire_path, window)
             if len(replays) == 1:
                 # A client in a retry loop touches nothing else, so the replay itself must count as use: otherwise the
                 # idle reaper closes the conversation the client is still trying to recover.
@@ -1215,6 +1258,8 @@ class Registry:
         if scope is None:
             if len(matches) == 1 and turn.history_tool_ids:
                 return matches[0]
+            if not matches and len(others) == 1 and turn.history_tool_ids:
+                raise Fork(others[0])
             # The class: `ambiguous` (several identity-less sessions with this exact history: P1-b's shape),
             # `unproven` (one, but no tool_use id in the history to prove the caller), else _lost_diagnostic's.
             diag = (f"class=ambiguous candidates={len(matches)} request_len={len(turn.history)}" if len(matches) > 1
@@ -1236,25 +1281,27 @@ class Registry:
                 logger.info("conversation %s: replaying its last response to a retry of the answered turn "
                             "(history %d replies); the backend is not called", s.id[:8], len(turn.history))
                 raise Replay(s, last)
-            dead = self.failure(failure_key, turn.history, scope)
+            dead = self.failure(failure_key, turn.history, scope, window)
             if dead:
                 raise dead
-            self._rebuild_or_refuse(turn, scope, wire_path)    # raises Rebuild, or the refusal saying why not
+            self._rebuild_or_refuse(turn, scope, wire_path, window)   # raises Rebuild, or the refusal saying why not
         return matches[0]
 
-    def _exact(self, history: list, scope: str | None, wire_path: str | None, client: str | None = None) -> list:
-        """Live sessions of the request's scope and wire whose replies are exactly `history` (under self._lock).
-        Identity-less (scope None): only identity-less sessions opened by the same client name."""
+    def _exact(self, history: list, scope: str | None, wire_path: str | None, client: str | None = None,
+               window: Any = ANY_WINDOW) -> list:
+        """Live sessions of the request's scope, wire and band window (_in_window) whose replies are exactly `history`
+        (under self._lock). Identity-less (scope None): only identity-less sessions opened by the same client name."""
         return [s for s in self.sessions.values() if s.history == history
                 and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
-                and (scope is not None or getattr(s, "client", None) == client)]
+                and (scope is not None or getattr(s, "client", None) == client) and _in_window(s, window)]
 
     def _rebuild_in_flight(self, scope: str | None, wire_path: str | None) -> bool:
         """Whether a rebuild in this scope and wire is starting right now (under self._lock): while it is, an old and
         a new session can both hold the same replies for a moment, which is no lasting ambiguity."""
         return scope is not None and any(k[0] == scope and k[1] == wire_path for k in self._rebuilding)
 
-    def _rebuild_or_refuse(self, turn: anthropic_wire.ClientTurn, scope: str | None, wire_path: str | None):
+    def _rebuild_or_refuse(self, turn: anthropic_wire.ClientTurn, scope: str | None, wire_path: str | None,
+                           window: Any = ANY_WINDOW):
         """A continuation no live session matches exactly: raise Rebuild for the one live conversation it continues
         with a rewritten history, else a refusal naming why no rebuild is possible (issue #43).
         The conversation it continues is the live session that wrote the request's LAST reply (its fingerprint is in
@@ -1276,20 +1323,30 @@ class Registry:
         the same scope and wire, whose LAST reply is the request's last reply (_recoverable_writers) is the writer: the
         client came back to a conversation this endpoint closed only for idleness. It is rebuilt as a compaction
         (superseded: nothing live to keep) on its kept route and lineage budget. A conversation closed for any other
-        reason (failed, exited, dropped, rebuilt, a boundary refusal) left no record and stays no_writer."""
+        reason (failed, exited, dropped, rebuilt, a boundary refusal) left no record and stays no_writer.
+        Only conversations of the request's band `window` are writers (_in_window). With none, a conversation of
+        ANOTHER window that wrote the anchor (live or recoverable) raises Fork: the request opens its own conversation
+        from the history it carries (a forked subagent, or the main loop after its window changed); that conversation
+        is never rebuilt from, replaced or closed."""
         if not turn.history:
             return
         anchor = turn.history[-1]
         reaped = False
         with self._lock:
-            cands = [] if scope is None or wire_path is None else [
+            writers = [] if scope is None or wire_path is None else [
                 s for s in self.sessions.values()
                 if getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
                 and anchor in s.history]
-            if not cands and scope is not None and wire_path is not None:
-                cands = self._recoverable_writers(scope, wire_path, anchor)
+            recoverable = [] if scope is None or wire_path is None else self._recoverable_writers(scope, wire_path,
+                                                                                                  anchor)
+            cands = [s for s in writers if _in_window(s, window)]
+            if not cands:
+                cands = [r for r in recoverable if _in_window(r, window)]
                 reaped = bool(cands)
+            other = [] if cands else [s for s in writers + recoverable if not _in_window(s, window)]
             inflight = self._rebuild_in_flight(scope, wire_path)
+        if other:
+            raise Fork(other[0])
         if REBUILD_MAX <= 0:
             # Rebuilds switched off: the pre-#43 409 (tests use it to pin what find and the replay guard decide alone).
             logger.warning("409 lost conversation: %s rebuild=refused:disabled", self._lost_diagnostic(turn))
@@ -1374,46 +1431,58 @@ class Registry:
         BridgeError when the new backend cannot start; the old session is then untouched and the slot returned."""
         anchor = turn.history[-1] if turn.history else None
         key = (scope, wire_path, anchor)
+        with self._gate(key, "cortados: conversation busy: another request is rebuilding this conversation; retry "
+                             "once it has finished"):
+            fp = anthropic_wire.turn_fingerprint(turn)
+            n = len(turn.history)
+            # Only `old`'s own window joins (_in_window): a conversation of another window is never this one.
+            r = getattr(old, "route", None) or {}
+            win = ANY_WINDOW if r.get("pinned") else r.get(ASKED_WINDOW_KEY)
+            with self._lock:
+                joined = self._exact(turn.history, scope, wire_path, client, win)
+                # Review round 3, P1: an identical request may have rebuilt AND finished its first turn while this
+                # one waited (before the gate, or on it). That session no longer matches exactly (it holds the
+                # reply), but it is this very request's rebuild: by the gate key and the new turn's fingerprint.
+                advanced = [] if joined else [
+                    s for s in self.sessions.values()
+                    if getattr(s, "rebuilt_for", None) == (key, fp) and _in_window(s, win)
+                    and len(s.history) == n + 1 and s.history[:n] == turn.history]
+                last = getattr(advanced[0], "last_reply", None) if len(advanced) == 1 else None
+                if last and last[0] == n + 1 and last[1] == fp:
+                    advanced[0].last_used = time.time()     # a retry loop's use, as in find()
+            if len(joined) == 1:
+                logger.info("conversation %s: an identical request rebuilt it first; joined, not rebuilt again",
+                            str(joined[0].id)[:8])
+                return joined[0]
+            if advanced:
+                if last and last[0] == n + 1 and last[1] == fp:
+                    logger.info("conversation %s: an identical request rebuilt it and was answered first; "
+                                "replaying that answer, not rebuilding again", str(advanced[0].id)[:8])
+                    raise Replay(advanced[0], last)
+                # Its reply was not kept for a replay (REPLAY_MAX_BYTES): this request is the stale twin of a
+                # served one, answered as work() answers a stale continuation; a second backend would leave two
+                # sessions with one history.
+                logger.info("conversation %s: an identical request rebuilt it and was answered first, with no "
+                            "reply kept to replay; stale continuation (409)", str(advanced[0].id)[:8])
+                raise LostSession("the conversation moved on while this request waited for it: another request "
+                                  "with the same history was served first; send the current history")
+            return self._rebuild_gated(old, turn, superseded=superseded, transcript=transcript, scope=scope,
+                                       wire_path=wire_path, client=client, anchor=anchor, rebuilt_for=(key, fp))
+
+    @contextlib.contextmanager
+    def _gate(self, key, busy: str):
+        """Hold the in-flight gate `key` of self._rebuilding (one Lock and its holder count per key) for the block:
+        requests on one key run one at a time, so the later one can look up again and join what the earlier one
+        published instead of opening a duplicate. Waiting past REBUILD_WAIT_S is ConversationBusy(`busy`), retryable.
+        The entry is removed when its last holder leaves. Used by rebuild() and fork_gate()."""
         with self._lock:
             gate = self._rebuilding.setdefault(key, [threading.Lock(), 0])
             gate[1] += 1
         try:
             if not gate[0].acquire(timeout=REBUILD_WAIT_S):
-                raise ConversationBusy("cortados: conversation busy: another request is rebuilding this conversation; "
-                                       "retry once it has finished")
+                raise ConversationBusy(busy)
             try:
-                fp = anthropic_wire.turn_fingerprint(turn)
-                n = len(turn.history)
-                with self._lock:
-                    joined = self._exact(turn.history, scope, wire_path, client)
-                    # Review round 3, P1: an identical request may have rebuilt AND finished its first turn while this
-                    # one waited (before the gate, or on it). That session no longer matches exactly (it holds the
-                    # reply), but it is this very request's rebuild: by the gate key and the new turn's fingerprint.
-                    advanced = [] if joined else [
-                        s for s in self.sessions.values()
-                        if getattr(s, "rebuilt_for", None) == (key, fp)
-                        and len(s.history) == n + 1 and s.history[:n] == turn.history]
-                    last = getattr(advanced[0], "last_reply", None) if len(advanced) == 1 else None
-                    if last and last[0] == n + 1 and last[1] == fp:
-                        advanced[0].last_used = time.time()     # a retry loop's use, as in find()
-                if len(joined) == 1:
-                    logger.info("conversation %s: an identical request rebuilt it first; joined, not rebuilt again",
-                                str(joined[0].id)[:8])
-                    return joined[0]
-                if advanced:
-                    if last and last[0] == n + 1 and last[1] == fp:
-                        logger.info("conversation %s: an identical request rebuilt it and was answered first; "
-                                    "replaying that answer, not rebuilding again", str(advanced[0].id)[:8])
-                        raise Replay(advanced[0], last)
-                    # Its reply was not kept for a replay (REPLAY_MAX_BYTES): this request is the stale twin of a
-                    # served one, answered as work() answers a stale continuation; a second backend would leave two
-                    # sessions with one history.
-                    logger.info("conversation %s: an identical request rebuilt it and was answered first, with no "
-                                "reply kept to replay; stale continuation (409)", str(advanced[0].id)[:8])
-                    raise LostSession("the conversation moved on while this request waited for it: another request "
-                                      "with the same history was served first; send the current history")
-                return self._rebuild_gated(old, turn, superseded=superseded, transcript=transcript, scope=scope,
-                                           wire_path=wire_path, client=client, anchor=anchor, rebuilt_for=(key, fp))
+                yield
             finally:
                 gate[0].release()
         finally:
@@ -1421,6 +1490,20 @@ class Registry:
                 gate[1] -= 1
                 if gate[1] == 0 and self._rebuilding.get(key) is gate:
                     del self._rebuilding[key]
+
+    def fork_gate(self, turn: anthropic_wire.ClientTurn, scope: str | None, wire_path: str | None, window: Any):
+        """The join gate of a Fork (review round 4 of the band window, P2): the new conversation's identity is its window
+        and the history it inherits, so two identical requests (same scope, wire, window, history and new turn) that
+        were both told Fork open it one at a time. The handler looks up again under the gate: the later request then
+        finds the conversation the earlier one published (an exact match: a fork is published with its inherited
+        history, Registry.new(seed=...)) and joins it, or replays its answer, instead of opening a second backend with
+        the same history (which made the next continuation a terminal ambiguity). The same gate as rebuild()'s
+        (_gate), keyed apart from a rebuild's anchor by its leading "fork"; a request with another new turn (a sibling
+        fork of the same point) has another key and is not held."""
+        key = (scope, wire_path, ("fork", window, anthropic_wire.history_digest(turn.history),
+                                  anthropic_wire.turn_fingerprint(turn)))
+        return self._gate(key, "cortados: conversation busy: another request is opening this conversation in its "
+                               "band window; retry once it has finished")
 
     def _rebuild_gated(self, old, turn, *, superseded: bool, transcript: list, scope: str | None,
                        wire_path: str | None, client: str | None, anchor, rebuilt_for=None):
@@ -1519,7 +1602,7 @@ class Registry:
                     budget.pending -= 1         # the backend never ran: the slot is the lineage's again
 
     def _replays(self, turn: anthropic_wire.ClientTurn, scope: str | None = None,
-                 wire_path: str | None = None) -> list:
+                 wire_path: str | None = None, window: Any = ANY_WINDOW) -> list:
         """(session, last_reply) for each live session this request is an exact retry of: its history is the session's
         minus the last reply, and its new user turn (turn_fingerprint) is the one that reply answered. Caller holds
         self._lock. last_reply[0] is the history length the reply belongs to, so a reply recorded for an older turn
@@ -1529,13 +1612,15 @@ class Registry:
         identity (scope None, see CONVERSATION_ID_HEADERS) is never replayed: two identity-less sessions share the None
         scope, so None == None would hand one client's reply to a stranger (another User-Agent, even another wire); it
         gets the ordinary 409. The session must also have been opened on the request's wire (`wire_path`), so a
-        /v1/messages reply is never replayed on /v1/responses."""
+        /v1/messages reply is never replayed on /v1/responses. Nor is a reply replayed across band windows
+        (`window`, _in_window): another window's request is a Fork, never that conversation's retry."""
         if scope is None or wire_path is None:
             return []
         n, fp, out = len(turn.history), None, []
         for s in self.sessions.values():
             last = getattr(s, "last_reply", None)
             if (last and getattr(s, "scope", None) == scope and getattr(s, "wire_path", None) == wire_path
+                    and _in_window(s, window)
                     and last[0] == len(s.history) == n + 1
                     and s.history[:n] == turn.history):
                 fp = fp or anthropic_wire.turn_fingerprint(turn)
@@ -1610,9 +1695,10 @@ class Registry:
             return [dict(e) for e in self.ended]
 
     def failure(self, key: str | None, history: list | None = None,
-                scope: str | None = None) -> "FailedSession | None":
+                scope: str | None = None, window: Any = ANY_WINDOW) -> "FailedSession | None":
         """The FailedSession for this conversation's live tombstone, or None; expired tombstones are pruned on the way.
-        None too when a live session in the same `scope` has a history that strictly extends `history`: see below."""
+        None too when a live session in the same `scope` and band `window` (_in_window; the request's window label,
+        as its failure_key carries) has a history that strictly extends `history`: see below."""
         if not key:
             return None
         now = time.time()
@@ -1629,10 +1715,13 @@ class Registry:
             # lost-response retry of a healthy conversation, and A's terminal error would kill B. A live session in
             # the same scope whose history strictly extends the request's names that case: the ordinary 409 instead.
             # Checked under the same lock as the tombstone lookup, so no fail() or turn can slip in between.
+            # Only a live session of the failure's own window (review round 4 of the band window, P2): the tombstone
+            # is keyed by window, and a conversation of another window that advanced from the same inherited history
+            # is not this conversation; letting it hide the failure resurrected the failed one through a Fork.
             if dead and scope and history is not None:
                 n = len(history)
                 if any(getattr(s, "scope", None) == scope and len(s.history) > n and s.history[:n] == history
-                       for s in self.sessions.values()):
+                       and _in_window(s, window) for s in self.sessions.values()):
                     dead = None
         if not dead:
             return None
@@ -1909,6 +1998,17 @@ class Rebuild(Exception):
         self.session, self.superseded = session, superseded
 
 
+class Fork(Exception):
+    """The request's history belongs only to a conversation of ANOTHER band window (Registry._rebuild_or_refuse;
+    _in_window): a forked subagent of a windowed main loop, or the main loop after its window changed. It opens a new
+    conversation under its own window, seeded with the history it carries (Registry.new(seed=...)). `parent` is that
+    other conversation, named in the log only: it is never rebuilt from, replaced, closed or annotated."""
+
+    def __init__(self, parent):
+        super().__init__("fork")
+        self.parent = parent
+
+
 class RebuildBudget:
     """How many rebuilds one conversation lineage has used (REBUILD_MAX). One object is shared by a session and every
     session rebuilt from it, compacted or branched. `used` counts committed rebuilds (a backend that started and was
@@ -1969,6 +2069,10 @@ class FailedSession(LostSession):
 REBUILD_LIMIT_REASON = "the conversation reached its rebuild limit (terminal)"
 REBUILD_TOO_LARGE_REASON = "the rebuilt history does not fit the conversation's model (terminal)"
 MODEL_CHANGE_REASON = "the continuation asks for another model than its conversation runs (terminal)"
+# The band window a conversation was opened with (routing.band_window's label, or None), kept in its route: it is part of
+# the conversation's identity, so only requests in the same window match it (_in_window). Its own key: the route's `band_window` comes from select
+# and a later rule (a local bind) may rewrite the route without it.
+ASKED_WINDOW_KEY = "asked_band_window"
 # Refused.code -> the fixed record reason (_note_refusal); never request-derived text.
 REFUSED_REASONS = {
     "no_identity": "the continuation carries no conversation identity (terminal)",
@@ -2906,7 +3010,7 @@ class Handler(BaseHTTPRequestHandler):
         return outcome
 
     def _relay_api(self, session: "ApiSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
-                   wire: Wire) -> str:
+                   wire: Wire, findable: bool = False) -> str:
         """One turn of a conversation routing moved to the API credit lane (routing.prefer_api_credit): relayed
         statelessly by _api_turn (the client sends the whole history), under the conversation's lock and the same
         history rules as a local relay (_relay_local): the reply's fingerprint is recorded just before its terminal
@@ -2920,11 +3024,11 @@ class Handler(BaseHTTPRequestHandler):
                         "it has finished", wire)
             return "refused"
         try:
-            if not created and reg.get(session.id) is not session:
+            if (not created or findable) and reg.get(session.id) is not session:
                 self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or closed "
                             "while this request waited for it; retry", wire)
                 return "refused"
-            if not created and session.history != turn.history:
+            if (not created or findable) and session.history != turn.history:
                 self._error(409, "invalid_request_error", "the conversation moved on while this request waited for "
                             "it: another request with the same history was served first; send the current history",
                             wire)
@@ -2992,10 +3096,13 @@ class Handler(BaseHTTPRequestHandler):
         return outcome
 
     def _open_conversation(self, turn, body: dict[str, Any], wire: Wire, *, one_shot: bool, floor: float | None,
-                           scope: str | None, also_exclude: str | None = None):
+                           scope: str | None, window: tuple[str, str] | None = None, also_exclude: str | None = None,
+                           seed: list | None = None):
         """Route and open a new conversation (or a one-shot) for `turn`: the session, or None when the request was
-        refused (the answer is sent). `also_exclude`: a model to keep the route off on top of the client's
-        x-cortados-exclude-model (a local model whose node cannot hold the request: the caller's re-route)."""
+        refused (the answer is sent). `window`: the request's band window, already validated by _messages.
+        `seed`: a fork's inherited history as a transcript (Fork; Registry.new).
+        `also_exclude`: a model to keep the route off on top of the client's x-cortados-exclude-model (a local model
+        whose node cannot hold the request: the caller's re-route)."""
         reg = self.server.registry
         route = None
         if floor is not None and not reg.router:
@@ -3022,6 +3129,7 @@ class Handler(BaseHTTPRequestHandler):
                                  **({"exclude_model": exclude} if exclude else {}),
                                  **({"local": local} if local else {}),
                                  **({"workload": workload} if workload else {}),
+                                 **({"band_window": window} if window else {}),
                                  **({"min_left_pct": floor} if floor is not None else {}))
             except Exception as exc:                # scorer, tables or route log failed: a dependency, not the client
                 logger.exception("routing failed")
@@ -3042,10 +3150,12 @@ class Handler(BaseHTTPRequestHandler):
                                    reason="no route is available")
             logger.info("route %s: %s/%s band %s%s", route["route_id"], route["provider"], route["model"],
                         route["band"], " (S1 degraded)" if route.get("degraded") else "")
+            # The conversation's band window, part of its identity (_in_window); None when the request asked for none.
+            route = dict(route, **{ASKED_WINDOW_KEY: _window_label(window)})
         try:
             return reg.new(turn, keep=not one_shot, route=route, scope=scope,
                            wire_path=self.path.split("?")[0], admitted=bool(reg.router and not one_shot),
-                           client=self._client())
+                           client=self._client(), **({"seed": seed} if seed is not None else {}))
         except UnservedProvider as exc:
             return self._error(503, "overloaded_error", f"cortados: {exc}", wire)
         except BridgeError as exc:                  # the backend refused to start (version pin, isolation, login)
@@ -3053,7 +3163,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(502, "api_error", str(exc), wire, reason=failure_diagnostic(exc))
 
     def _relay_local(self, session: "LocalSession", turn, body: dict[str, Any], *, created: bool, one_shot: bool,
-                     wire: Wire, reroute: bool | None = None) -> str | None:
+                     wire: Wire, reroute: bool | None = None, findable: bool = False) -> str | None:
         """One turn of a local-pinned conversation: relayed statelessly to its Ollama node (local_lane.serve), under
         the conversation's lock and the same stale-history rule as a CLI turn. The reply's fingerprint is appended to
         the session's history, so the next turn finds this conversation and keeps its model (_model_change). A node
@@ -3070,7 +3180,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy; retry once the other "
                                "request on it has finished", wire)
         try:
-            if not created and reg.get(session.id) is not session:
+            if (not created or findable) and reg.get(session.id) is not session:
                 # Review round 3, P2: the lookup ran before the lock, and the conversation's session was replaced
                 # (a compaction rebuilt it) or closed meanwhile. Relaying on the retired session would answer from a
                 # conversation no later request can find; the retry is looked up afresh. Nothing reaches the node.
@@ -3078,7 +3188,7 @@ class Handler(BaseHTTPRequestHandler):
                             str(session.id)[:8])
                 return self._error(BUSY_STATUS, "overloaded_error", "cortados: conversation busy: it was rebuilt or "
                                    "closed while this request waited for it; retry", wire)
-            if not created and session.history != turn.history:
+            if (not created or findable) and session.history != turn.history:
                 return self._error(409, "invalid_request_error", "the conversation moved on while this request waited "
                                    "for it: another request with the same history was served first; send the current "
                                    "history", wire)
@@ -3316,6 +3426,9 @@ class Handler(BaseHTTPRequestHandler):
             if not why_out:
                 why_out.append("no_answer")
             return None
+        # routing._moved builds a new route without the opener's own keys: the window the conversation was opened with
+        # must survive the move, or every later continuation would miss it (_in_window) and open a new conversation.
+        moved = {**moved, ASKED_WINDOW_KEY: (route or {}).get(ASKED_WINDOW_KEY)}
         if one_shot:
             session.route = moved                       # a throwaway backend: nothing to rebind; the record is local
             return session, got["turn"]
@@ -3511,7 +3624,13 @@ class Handler(BaseHTTPRequestHandler):
             logger.info("client gone while a server-tool reply was written (%s)", gone)
 
     def _messages(self, body: dict[str, Any], wire: Wire) -> None:
-        """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape."""
+        """One client request on `wire`: find or start its session, run one turn, answer in the wire's shape.
+        `fork_hold` holds a Fork's join gate (Registry.fork_gate) from the gated lookup until the conversation is
+        opened; it is released there, and on every other way out of the request here."""
+        with contextlib.ExitStack() as fork_hold:
+            return self._messages_held(body, wire, fork_hold)
+
+    def _messages_held(self, body: dict[str, Any], wire: Wire, fork_hold: contextlib.ExitStack) -> None:
         reg = self.server.registry
         dump = getenv("CORTADOS_PROVIDER_DUMP_DIR")     # debugging aid: every request body as received
         if dump:
@@ -3540,6 +3659,17 @@ class Handler(BaseHTTPRequestHandler):
             floor, floor_valid = _min_left_header(self.headers)
             if not floor_valid:
                 return self._error(400, "invalid_request_error", _MIN_LEFT_BAD, wire)
+            # The band window (x-cortados-band, or the main loop's `cortados@<window>` model; routing.BAND_HEADER), read
+            # on EVERY request, before the session lookup or a replay: an invalid one is refused on a continuation
+            # exactly as on an opening turn (review of b1d3075: a continuation once ran, and echoed the model, under
+            # `cortados@NOT-A-BAND`). A fixed-model endpoint does not route, so it reads no routing header, as before.
+            # Only an owner-token request reaches here (do_POST's _authorized), the trust of every routing header.
+            window = None
+            if reg.router:
+                window, bad = routing.band_window(self.headers.get(routing.BAND_HEADER), body.get("model"))
+                if bad:
+                    return self._error(400, "invalid_request_error", f"cortados: {bad}", wire,
+                                       reason="the band window is invalid")
             turn = wire.parse_request(body)
             server_tools = anthropic_wire.server_tool_names(body) if wire is ANTHROPIC else []
             if server_tools and not turn.tools:
@@ -3558,16 +3688,40 @@ class Handler(BaseHTTPRequestHandler):
             one_shot = not turn.tools
             identity = self._conversation_identity()
             fail_key = None if one_shot else reg.failure_key(turn, wire_path=self.path.split("?")[0],
-                                                              client=self._client(), identity=identity)
+                                                              client=self._client(), identity=identity,
+                                                              window=_window_label(window))
             unkeyed = (None if identity or not turn.history else
                        "the client sent no conversation identity: none of " + ", ".join(CONVERSATION_ID_HEADERS))
             scope = reg.conversation_scope(wire_path=self.path.split("?")[0], client=self._client(), identity=identity)
-            rebuild = None
-            try:
-                session = None if one_shot else reg.find(turn, fail_key, scope, self.path.split("?")[0],
-                                                         client=self._client())
-            except Rebuild as rb:                       # served below, once the request is known to be well-formed
-                session, rebuild = None, rb
+            rebuild = fork_of = None
+
+            def lookup():
+                """(session, Rebuild, the Fork's parent): find's answer; FailedSession, Refused, Replay and the
+                others propagate to the handlers below."""
+                try:
+                    # The band window is part of the conversation's identity (_in_window): find matches, replays and
+                    # rebuilds only conversations opened in this request's window.
+                    return reg.find(turn, fail_key, scope, self.path.split("?")[0], client=self._client(),
+                                    window=_window_label(window)), None, None
+                except Rebuild as rb:                   # served below, once the request is known to be well-formed
+                    return None, rb, None
+                except Fork as fk:                      # its history is another window's conversation's: opened below
+                    return None, None, fk.parent
+            session = None
+            if not one_shot:
+                session, rebuild, fork_of = lookup()
+            if fork_of is not None:
+                # Review round 4, P2: two identical requests both told Fork must not open two backends with one
+                # history. Under the fork's join gate the lookup runs again: an identical request that opened it
+                # meanwhile is joined (exact match) or replayed; still a Fork, this request opens it, holding the gate
+                # until it is published (released after _open_conversation below).
+                fork_hold.enter_context(reg.fork_gate(turn, scope, self.path.split("?")[0], _window_label(window)))
+                session, rebuild, fork_of = lookup()
+                if fork_of is None:
+                    fork_hold.close()
+                    if session is not None:
+                        logger.info("conversation %s: an identical request in this band window opened it first; "
+                                    "joined, not opened again", str(session.id)[:8])
             if session is not None and getattr(session, "system", turn.system) != turn.system:
                 # A running CLI keeps the system prompt it started with; a continuation that sends a different one
                 # (changed `instructions`, a rewritten developer item) is served under the original, and says so here
@@ -3610,30 +3764,47 @@ class Handler(BaseHTTPRequestHandler):
         except ConversationBusy as exc:                 # a rebuild in this scope is starting: the retry sees it done
             return self._error(BUSY_STATUS, "overloaded_error", str(exc), wire)
         except Replay as rp:
-            return self._serve_replay(rp, turn, body, wire)
+            return self._serve_replay(rp, turn, body, wire, window)
         except LostSession as exc:
             return self._error(409, "invalid_request_error", str(exc), wire)
         if rebuild is not None:
-            session = self._rebuild(rebuild, turn, body, wire, scope)
+            session = self._rebuild(rebuild, turn, body, wire, scope, window)
             if session is None:
                 return                                  # refused; the answer is sent
-        changed = self._model_change(session, body) if session is not None else None
-        if changed:
-            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        if session is not None and self._fixed_route_refused(session, turn, body, wire, window):
+            return
+        seed = None
+        if fork_of is not None:
+            try:
+                seed = anthropic_wire.rebuild_transcript(wire.history_messages(body))
+            except (wire.WireError, RecursionError) as exc:
+                return self._error(400, "invalid_request_error", f"cortados: the history cannot be replayed: {exc}",
+                                   wire, reason="the request does not parse on this wire")
+            logger.info("conversation %s: a request in another band window (%s, the conversation's %s) continues its "
+                        "history; opened as its own conversation from that history, the conversation is untouched",
+                        str(fork_of.id)[:8], _window_label(window) or "none",
+                        (fork_of.route or {}).get(ASKED_WINDOW_KEY) or "none")
         created = session is None                       # this request opens the conversation (or is a one-shot)
+        # A conversation opened from a Fork is published with its inherited history (Registry.new(seed=...)), so an
+        # identical request can find and join it before this one takes its turn lock (review round 4, P2): this
+        # request then gets the same stale checks as a continuation, never the seed-less turn after the joiner's.
+        findable = seed is not None
         if session is None:
-            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope)
+            session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
+                                              window=window, seed=seed)
+            fork_hold.close()                           # published (or refused): an identical request may look again
             if session is None:
                 return                                  # refused; the answer is sent
         if isinstance(session, ApiSession):             # the API credit lane: relayed to the API, never a CLI turn
             if not created and self._api_continuation_refused(session, body, wire):
                 return
-            self._relay_api(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+            self._relay_api(session, turn, body, created=created, one_shot=one_shot, wire=wire, findable=findable)
             return
         if isinstance(session, LocalSession):           # a local lane: relayed to its node, never a CLI turn
             if not created and self._local_continuation_refused(session, body, wire):
                 return
-            outcome = self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire)
+            outcome = self._relay_local(session, turn, body, created=created, one_shot=one_shot, wire=wire,
+                                        findable=findable)
             if outcome not in local_lane.REROUTE:
                 return
             # The node's gate can never take this opening turn (TOO_LARGE: more memory than its whole budget;
@@ -3651,11 +3822,12 @@ class Handler(BaseHTTPRequestHandler):
                        else "answered the opening turn with an HTTP 5xx before any byte reached the client")
             bound = session.route or {}
             session = self._open_conversation(turn, body, wire, one_shot=one_shot, floor=floor, scope=scope,
+                                              window=window, seed=seed,
                                               also_exclude=str((moved.get("model") or {}).get("id") or ""))
             if session is None:
                 return
             if isinstance(session, ApiSession):
-                self._relay_api(session, turn, body, created=True, one_shot=one_shot, wire=wire)
+                self._relay_api(session, turn, body, created=True, one_shot=one_shot, wire=wire, findable=findable)
                 return
             if not isinstance(session, LocalSession):
                 # #124: a request a detector marked now leaves the machine because the node could not take it. The
@@ -3667,7 +3839,8 @@ class Handler(BaseHTTPRequestHandler):
                     session.route = {**(session.route or {}),
                                      sensitive_notice.ROUTE_KEY: sensitive_notice.mark(det, outcome)}
             if isinstance(session, LocalSession):
-                self._relay_local(session, turn, body, created=True, one_shot=one_shot, wire=wire, reroute=False)
+                self._relay_local(session, turn, body, created=True, one_shot=one_shot, wire=wire, reroute=False,
+                                  findable=findable)
                 return
         if not created:
             # A continuation's paid turn under the client's floor: the session keeps the tightest floor it was ever sent,
@@ -3743,15 +3916,15 @@ class Handler(BaseHTTPRequestHandler):
                                    f"for over {TURN_TIMEOUT_S:.0f}s; retry once that request has finished")
                 return
             try:
-                if not created and reg.get(session.id) is not session:
+                if (not created or findable) and reg.get(session.id) is not session:
                     # Registry.find ran before the lock, and the conversation was closed while this request waited:
                     # its backend failed under the request that held the lock (Registry.fail), or it was reaped. The
                     # backend is gone, so nothing is sent to it; the request is told what a fresh lookup would say.
-                    outcome["stale"] = reg.failure(fail_key, turn.history, scope) or LostSession(
+                    outcome["stale"] = reg.failure(fail_key, turn.history, scope, _window_label(window)) or LostSession(
                         "the conversation was closed while this request waited for it; start a new conversation")
                     outcome["stale_class"] = "closed_while_waiting"
                     return
-                if not created and session.history != turn.history:
+                if (not created or findable) and session.history != turn.history:
                     # Registry.find ran before the lock: a second continuation with the same history (a client
                     # retry, two overlapping requests) found the session too, and the one that lost the lock now
                     # sees a conversation that has moved on. Delivering its results would fail inside the backend
@@ -3993,13 +4166,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(TERMINAL_STATUS, wire.error_json(TERMINAL_ERROR, message), headers={"x-should-retry": "false"})
 
-    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire) -> None:
+    def _serve_replay(self, rp: "Replay", turn, body: dict[str, Any], wire: Wire,
+                      window: tuple[str, str] | None = None) -> None:
         """Answer a retry of an answered turn with the stored reply (Registry.find, or rebuild()'s identical twin).
         A retry that also changes the sub/ pin gets the same refusal as any continuation that does: the stored
-        answer came from the conversation's own model, which the request no longer asks for."""
-        changed = self._model_change(rp.session, body)
-        if changed:
-            return self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        answer came from the conversation's own model, which the request no longer asks for. The replay is always of
+        a conversation of the request's own band window (Registry._replays, _in_window)."""
+        if self._fixed_route_refused(rp.session, turn, body, wire, window):
+            return
         _, _, msg_id, model, blocks, stop, usage = rp.last
         if turn.stream:
             try:
@@ -4019,14 +4193,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._json(200, wire.message_json(msg_id, model, blocks, stop, usage), session=rp.session)
 
-    def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None):
+    def _rebuild(self, rb: "Rebuild", turn, body: dict[str, Any], wire: Wire, scope: str | None,
+                 window: tuple[str, str] | None = None):
         """Serve a continuation whose client rewrote the history on a rebuilt backend (Registry.rebuild); the new
         session, or None once a refusal has been answered. The conversation's model is fixed (a changed sub/ pin is
         refused exactly as on any continuation); a refusal to rebuild names its reason."""
         reg = self.server.registry
-        changed = self._model_change(rb.session, body)
-        if changed:
-            self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+        if self._fixed_route_refused(rb.session, turn, body, wire, window):
             return None
         try:
             transcript = anthropic_wire.rebuild_transcript(wire.history_messages(body))
@@ -4050,7 +4223,7 @@ class Handler(BaseHTTPRequestHandler):
         except Refused as exc:                          # the limit, committed by a concurrent rebuild
             self._terminal(turn, wire, str(exc), reason=REFUSED_REASONS.get(exc.code, REBUILD_LIMIT_REASON))
         except Replay as rp:                            # an identical request rebuilt it and was answered first
-            self._serve_replay(rp, turn, body, wire)
+            self._serve_replay(rp, turn, body, wire, window)
         except LostSession as exc:                      # ...and its answer was not kept: a stale continuation
             self._error(409, "invalid_request_error", str(exc), wire)
         except ConversationBusy as exc:
@@ -4231,6 +4404,17 @@ class Handler(BaseHTTPRequestHandler):
             return (self.headers.get(REVEAL_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             return False
+
+    def _fixed_route_refused(self, session, turn, body: dict[str, Any], wire: Wire,
+                             window: tuple[str, str] | None) -> bool:
+        """True once a continuation that asks for another model (_model_change) than its conversation has been refused
+        (terminal; the answer is sent). A band window never refuses here: it is part of the conversation's identity, so
+        a request in another window was never matched to this conversation (Registry.find, _in_window)."""
+        changed = self._model_change(session, body)
+        if changed:
+            self._terminal(turn, wire, changed, reason=MODEL_CHANGE_REASON)
+            return True
+        return False
 
     @staticmethod
     def _model_change(session, body: dict[str, Any]) -> str | None:
@@ -4439,10 +4623,10 @@ def serve(host: str, port: int, token: str, *, claude_bin: str, codex_bin: str, 
         from cortados_router import core                  # loads the tables and the live scarcity reader
         from cortados_router.provider import routing
 
-        def router(body, client, exclude_model=None, min_left_pct=None, local=None, workload=None):
+        def router(body, client, exclude_model=None, min_left_pct=None, local=None, workload=None, band_window=None):
             return routing.choose(core, body, client=client, conversation_id=uuid.uuid4().hex, claude_bin=claude_bin,
                                   codex_bin=codex_bin, exclude_model=exclude_model, min_left_pct=min_left_pct,
-                                  codex_home=codex_home, local=local, workload=workload)
+                                  codex_home=codex_home, local=local, workload=workload, band_window=band_window)
 
         def executed(route):
             core.log_execution(route["route_id"], route["provider"], route["model"])

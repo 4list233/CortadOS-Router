@@ -82,7 +82,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
            previous=None, hold_ok=None):
     """`constraints['workload']` (a host-validated client hint, e.g. 'batch') applies the routing table's
     `workloads` row: a band cap (core.resolve maximum_band, under the hard rules) and the unit kind, so a batch call is
-    background work (fallback band R1, no face floor). `previous` (band -> {lane, model}, the host's memory of this
+    background work (fallback band R1, no face floor). `constraints['band_window']` (lo, hi) clamps the band into a
+    window (core.resolve band_window; the hard rules win over its max). `previous` (band -> {lane, model}, the host's memory of this
     client's last route per band) is passed to core.resolve for the switching margin, with `hold_ok` (the host's
     admission check on a candidate, e.g. its quota floor): the margin holds only a route that passes it, and the
     underuse split and frontier rules never take one that fails it (#143). `session_id` seeds the underuse split."""
@@ -94,6 +95,11 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         raise ValueError('Unknown workload hint')
     if hint.get('unit_kind') in ('interactive', 'background'):
         unit = hint['unit_kind']
+    # constraints['band_window'] (lo, hi): a host-validated band window (core.resolve band_window, under the hard rules).
+    window = (constraints or {}).get('band_window')
+    if window is not None:
+        window = core.check_band_window(tuple(window))
+    window_label = core.band_window_label(*window) if window else None
     request, projection = scoring_input(prompt, task_context, recall)
     version = core.S1_CURRENT
     revision = version.stat().st_mtime_ns if version.exists() else None
@@ -161,6 +167,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                              allowed_routes=tuple(sorted(allowed)), execution=True,
                              minimum_band=(constraints or {}).get('min_band'), accounts_aware=supports_accounts,
                              **({'maximum_band': hint['max_band']} if hint.get('max_band') else {}),
+                             **({'band_window': window} if window else {}),
                              **({'previous': previous} if previous else {}),
                              # #143: the host's admission check also bounds the underuse split and the frontier rules
                              **({'hold_ok': hold_ok} if hold_ok is not None else {}),
@@ -188,7 +195,8 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
         core.log_route(route_id, {'session_id': session_id, 'platform': log_platform or 'execution-' + (platform or entrypoint),
                        'unit_kind': unit, 'actual_model': None, 'request': str(prompt)[:8000],
                        'context': recall or None, 'task_context': task_context,
-                       **({'workload': workload} if workload else {})}, decision, route)
+                       **({'workload': workload} if workload else {}),
+                       **({'band_window': window_label} if window_label else {})}, decision, route)
         cap = core.lane_ceiling(choice['lane'], model)
         if provider == 'codex-cli':
             cap = int(core._context_cfg().get('provider_ceiling_tokens', {}).get(provider, 200000))
@@ -199,6 +207,7 @@ def select(core, *, prompt, session_id='', face='default', platform='', entrypoi
                 'config_dir': choice.get('config_dir') if supports_accounts else None, 'context_length': cap,
                 'route_id': route_id, 'api_request_id': api_request_id, 'degraded': bool(decision.get('degraded')),
                 'band': route['band'], 'projection': projection, **({'workload': workload} if workload else {}),
+                **({'band_window': window_label} if window_label else {}),
                 'decision': decision, 'route': route}
     return {'router': ROUTER, 'error': 'No authenticated, available model fits the assembled request and route constraints. '
             + '; '.join(failures), 'degraded': bool(decision.get('degraded'))}
