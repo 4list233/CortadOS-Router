@@ -156,6 +156,7 @@ class ProbeRefused(RuntimeError):
         self.kind = kind
         self.stage = stage
         self.typed = list(typed)
+        self.facts: dict[str, Any] = {}   # set by tui_capture: fixed names and counts only (#144)
 
 
 def _screen_has(test: str | Callable[[str], bool], shown: str, flags: int = 0) -> bool:
@@ -169,7 +170,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
                 page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
                 cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
-                refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = ()) -> str:
+                refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = (),
+                refusal_facts: Callable[[str], dict[str, Any]] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -187,7 +189,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
-    `on_boot` may raise to refuse: it runs before the first keystroke of `command`."""
+    `on_boot` may raise to refuse: it runs before the first keystroke of `command`.
+    A ProbeRefused carries `facts`: fixed names and numbers only (which check, mid-read or about to act, ready seen,
+    seconds since start), plus `refusal_facts(screen)` when given; never screen text."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -198,6 +202,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             import shutil
             shutil.rmtree(my_dir, ignore_errors=True)
             raise
+    started = time.time()
     pid, fd = pty.fork()
     if pid == 0:
         try:
@@ -221,6 +226,18 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     stage, startup_chars, ready_seen = "boot", 0, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
 
+    def refusal(kind: str, where: str, check: str, acting: bool, shown: str) -> ProbeRefused:
+        exc = ProbeRefused(kind, where, typed)
+        facts: dict[str, Any] = {"check": check, "acting": acting, "after_s": round(time.time() - started, 2),
+                                 "ready_seen": bool(ready and _screen_has(ready, shown))}
+        if refusal_facts is not None:
+            try:
+                facts.update(refusal_facts(shown))
+            except Exception:                  # diagnostics never change the refusal itself
+                facts["facts_error"] = True
+        exc.facts = facts
+        return exc
+
     def refused(where: str, acting: bool = True) -> None:
         if EXEC_FAILED_MARK in buf:
             raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
@@ -229,12 +246,12 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             shown = _plain(buf)
             for kind, pattern in refuse:
                 if re.search(pattern, shown, re.I):
-                    raise ProbeRefused(kind, where, typed)
+                    raise refusal(kind, where, "refuse", acting, shown)
         if acting and refuse_unsettled:
             shown = _plain(buf)
             for kind, pattern in refuse_unsettled:
                 if _screen_has(pattern, shown, re.I):
-                    raise ProbeRefused(kind, where, typed)
+                    raise refusal(kind, where, "unsettled", acting, shown)
 
     def send(data: bytes, name: str) -> None:
         """Every keystroke the probe types goes through here: the screen is checked first (deny-all)."""
@@ -632,10 +649,17 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
 # same function the tier check uses: a bare email elsewhere (a "Choose account: x@y" picker, a sign-in prompt) neither
 # ends the boot read nor clears the notice (#144 fix round 1: a picker's email let the probe type "/usage" into it).
 _AGY_NOT_SIGNED_IN = r"not (?:signed|logged) in"
+# The sign-in alternatives by a fixed name: AGY_REFUSE's not-logged-in pattern is exactly their join (same order), and the
+# name of the one that matched goes into a refusal's diagnostics (agy_refusal_facts), never the screen text (#144).
+_AGY_SIGN_IN_RULES = (
+    ("google-accounts-url", r"accounts\.google\.com"),
+    ("sign-in-with-google", r"sign in with google"),
+    ("authorization-url-or-code", r"authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"),
+    ("not-signed-in-notice", _AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"),
+    ("please-sign-in", r"please (?:sign|log) in|login required"),
+)
 AGY_REFUSE = (
-    ("not-logged-in", r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
-                      r"|" + _AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
-                      r"|please (?:sign|log) in|login required"),
+    ("not-logged-in", "|".join(rule for _, rule in _AGY_SIGN_IN_RULES)),
     ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
 )
 
@@ -647,6 +671,27 @@ def _agy_unsettled(shown: str) -> bool:
 
 
 AGY_UNSETTLED = (("not-logged-in", _agy_unsettled),)
+
+
+def agy_refusal_facts(shown: str) -> dict[str, Any]:
+    """What a refused agy boot screen held, as fixed names and counts only (never screen text or an email): which sign-in
+    rule matched, how many "not signed in" notices, "Signing in" spinners and banner account lines were painted, and
+    whether an account line came before the last notice. Kept on the failed record so a refusal of a signed-in agy can
+    be told apart from a real sign-in screen without a hand run (#144, the 06:41 sample on the Air)."""
+    scrubbed = _agy_iso.scrub_account(shown)        # one text for every offset below
+    notices = list(re.finditer(_AGY_NOT_SIGNED_IN, scrubbed, re.I))
+    accounts = list(_agy_iso.TIER_PATTERN.finditer(scrubbed))
+    last_notice = notices[-1] if notices else None
+    return {
+        "rules": [name for name, rule in _AGY_SIGN_IN_RULES if re.search(rule, shown, re.I)],
+        "notices": len(notices),
+        "signing_in": len(re.findall(r"signing in", shown, re.I)),
+        "account_lines": len(accounts),
+        "account_line_before_last_notice": bool(last_notice and accounts and accounts[0].start() < last_notice.end()),
+        "account_line_after_last_notice": bool(last_notice and accounts and accounts[-1].start() >= last_notice.end()),
+        "chars_after_last_notice": len(scrubbed) - last_notice.end() if last_notice else None,
+        "chars": len(scrubbed),
+    }
 
 
 def AGY_BOOT_READY(shown: str) -> bool:
@@ -728,7 +773,8 @@ def _antigravity() -> dict[str, Any]:
     # capture, before the probe's next keystroke.
     text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
                        ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag,
-                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot)
+                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
+                       refusal_facts=agy_refusal_facts)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
@@ -927,6 +973,12 @@ def _failed_record(lane: str, old: dict[str, Any] | None, exc: BaseException) ->
     # stale list from an earlier failure never describes a different one.
     # The same for the binary a probe ran and the discovery problems met on the way (a malformed manifest that fell
     # back to a glob): a boot or parser failure after discovery must still show how the binary was chosen.
+    # A refusal's facts (fixed names and counts, never screen text: tui_capture, #144) say which screen rule fired.
+    facts = getattr(exc, "facts", None)
+    if isinstance(facts, dict) and facts:
+        rec["refusal"] = dict(facts)
+    else:
+        rec.pop("refusal", None)
     for field in ("searched", "binary", "discovery_notes"):
         value = getattr(exc, field, None)
         if value:
