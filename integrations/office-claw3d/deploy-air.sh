@@ -67,7 +67,8 @@ STUDIO_SETTINGS="$STUDIO_STATE/claw3d/settings.json"
 HEALTH_DEADLINE_S=60
 STAGE="$ROOT/stage"                        # root 0700: launchers, plists and a new token, before activation
 ADAPTER_FILES=(adapter.mjs bridge.mjs sprites.mjs claw3d/avatar-profile-hint.patch claw3d/studio-login.patch
-  claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch claw3d/proxy-auth.patch)
+  claw3d/studio-login.cjs claw3d/cortados-rooms.patch claw3d/system-fonts.patch claw3d/proxy-auth.patch
+  claw3d/cortados-brand.patch)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -203,7 +204,7 @@ fi
 # ======================================================================================
 [[ -f "$HERE/claw3d/avatar-profile-hint.patch" && -f "$HERE/claw3d/studio-login.patch" \
   && -f "$HERE/claw3d/cortados-rooms.patch" && -f "$HERE/claw3d/system-fonts.patch" \
-  && -f "$HERE/claw3d/proxy-auth.patch" && -f "$HERE/bridge.mjs" ]] \
+  && -f "$HERE/claw3d/proxy-auth.patch" && -f "$HERE/claw3d/cortados-brand.patch" && -f "$HERE/bridge.mjs" ]] \
   || die "run from a CortadOS-Router checkout"
 xcode-select -p >/dev/null 2>&1 || die "git needs the Xcode command line tools (xcode-select --install)"
 # captured first: a failed `git status` prints nothing, which must not read as "clean"
@@ -454,6 +455,8 @@ fi
 # proxy-auth.patch makes Studio's gateway proxy always send its configured token to the bridge and
 # drop the browser's device block and credentials: over HTTPS the stock proxy took the browser's
 # signed device block as its auth, sent no token, and the bridge refused (1012 in the Office), 2026-11-25.
+# cortados-brand.patch brands the Office as the CortadOS router, removes the flag poles and hides the OpenClaw
+# controls the read-only bridge cannot serve (the chat composer included), 2026-11-25.
 step "4. Claw3D $CLAW3D_COMMIT -> $BUILD (build as $STUDIO_USER; switched in only after it succeeds)"
 as_studio() { run sudo -u "$STUDIO_USER" -H env HOME="$STUDIO_HOME" PATH="$ROOT/node-$NODE_VERSION/bin:/usr/bin:/bin" \
   NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false "$@"; }
@@ -464,7 +467,8 @@ else
   [[ ! -e "$BUILD" ]] || run sudo -u "$STUDIO_USER" rm -rf "$BUILD"
   as_studio git clone --no-checkout "$CLAW3D_REPO" "$BUILD"
   as_studio git -C "$BUILD" checkout --detach "$CLAW3D_COMMIT"
-  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch proxy-auth.patch; do
+  for p in avatar-profile-hint.patch studio-login.patch cortados-rooms.patch system-fonts.patch proxy-auth.patch \
+      cortados-brand.patch; do
     as_studio git -C "$BUILD" apply --check "$ADAPTER_DIR/$p"
     as_studio git -C "$BUILD" apply "$ADAPTER_DIR/$p"
   done
