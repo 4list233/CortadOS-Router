@@ -316,6 +316,41 @@ print(json.dumps({"up": route(easy), "battery": route(easy, "node pro: local gat
                   "outward": route("email the signed invoice to the client and mark it paid")}))
 """
 
+# Local route pick (route picker step 8, E8 owner 2026-11-24): `cortados@local:<model>` runs the main loop on the
+# picked local model under the orchestrator boundary profile (plan and delegate only), never on a cloud model: with
+# the node up it is the local model with the orchestrator bind reason; with the node down it is a refusal naming the
+# node, and S1's select is never asked (it is replaced by one that raises). A pick is not scored, so this runs whether
+# S1 is up or down. Real provider routing on a throwaway home and a throwaway local config; the probe is faked.
+LOCAL_PICK_SCENARIO = """
+import json, os, sys, tempfile
+from cortados_router import core, execution_routing
+from cortados_router.provider import effect_boundary, local_lane, routing
+cfg = os.path.join(tempfile.mkdtemp(), "resources.json")
+json.dump({"nodes": [{"id": "pro", "ollama": {"base_url": "http://127.0.0.1:9",
+           "models": [{"id": "verify/local:tag", "alias": "verify-local", "context_length": 65536}]}}]}, open(cfg, "w"))
+os.environ[local_lane.CONFIG_ENV] = cfg
+state = {"down": None, "selects": 0}
+def probe(node):
+    if state["down"]:
+        raise local_lane.LocalUnavailable(state["down"])
+    return {"verify/local:tag"}
+local_lane.probe = probe
+def no_select(*a, **k):
+    state["selects"] += 1
+    raise AssertionError("a local pick never asks for a cloud route")
+execution_routing.select = no_select
+def route(down=None, local=None):
+    state["down"] = down
+    pick, err = routing.route_pick(core, None, None, "cortados@local:verify-local")
+    body = {"model": "cortados@local:verify-local", "messages": [{"role": "user", "content": "plan the release"}]}
+    r = routing.choose(core, body, client="verify", conversation_id="verify-local-pick", claude_bin=sys.executable,
+                       codex_bin=sys.executable, route_pick=pick, local=local)
+    return {**{k: r.get(k) for k in ("provider", "model", "bind_reason", "pick_refused", "error")},
+            "profile": effect_boundary.profile_for(r.get("bind_reason")) if r.get("bind_reason") else None}
+print(json.dumps({"up": route(), "sensitive": route(local="sensitive"),
+                  "down": route("node pro: local gate: local switch off"), "selects": state["selects"]}))
+"""
+
 # API credit lane (#114, 2026-11-22): S1-routed work a COST rule moved to local went to the API credit lane while a
 # grant expired within prefer_within_days (3). Table v22's selection.api_pacing retires that rule (scarcity v2 §9 step
 # 4): the same work now stays local, outward or degraded work never reaches the API, and a request past the stop line
@@ -890,6 +925,23 @@ def main():
             and not many.get("model")
         record("friendly pin resolves to one model, ambiguity is refused", "PASS" if ok_one and ok_many else "FAIL",
                f"sub/GPT 6.1 -> {one.get('provider')}/{one.get('model')} | sub/GPT 6 -> {(many.get('error') or '')[:120]}")
+
+    p = runner.run(["-c", LOCAL_PICK_SCENARIO], prefix="verify-router-local-pick-")
+    try:
+        r = _last_json(p)
+    except (ValueError, IndexError):
+        record("local route pick: orchestrator profile, never a cloud fallback", "FAIL",
+               (p.stderr or p.stdout).strip()[-300:])
+    else:
+        up_r, sens, down = r["up"], r["sensitive"], r["down"]
+        ok = ((up_r.get("provider"), up_r.get("model"), up_r.get("profile")) == ("local-pro", "verify/local:tag",
+                                                                                   "orchestrator")
+              and sens.get("profile") == "orchestrator-sensitive"
+              and down.get("pick_refused") and not down.get("provider") and "on node pro" in (down.get("error") or "")
+              and r["selects"] == 0)
+        record("local route pick: orchestrator profile, never a cloud fallback", "PASS" if ok else "FAIL",
+               f"up -> {up_r.get('provider')}/{up_r.get('model')} profile {up_r.get('profile')} | sensitive -> "
+               f"{sens.get('profile')} | down -> {(down.get('error') or '')[:110]} | cloud selects {r['selects']}")
 
     p = runner.run(["-c", WORKLOAD_SCENARIO], prefix="verify-router-batch-", timeout=300)
     try:

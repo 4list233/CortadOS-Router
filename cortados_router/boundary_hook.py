@@ -4,7 +4,8 @@
 When the CortadOS provider routes a turn automatically to a local model, its effect boundary limits what the model's
 tool calls may do (cortados_router/provider/effect_boundary.py). The tools run here, on the client, which is often not
 the provider's machine: a symlink that exists only here (/repo/escape -> /outside) is invisible to the provider. This
-hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash call it:
+hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash call, and, in a session launched with a
+local pick (session.py installs it there with matcher "*"), for every call of any tool whose id the provider minted, it:
 
   1. asks the provider about the call's tool_use id (POST <provider>/v1/cortados/boundary/check, the provider token,
      metadata only: the id);
@@ -13,7 +14,12 @@ hook closes that gap. For each Write, Edit, MultiEdit, NotebookEdit and Bash cal
      os.path.realpath HERE and denied unless it lies strictly inside the realpath of the project folder the provider
      assumed, and off the protected paths the provider names;
   4. fails CLOSED for a boundary call: an id starting with MARK_PREFIX (minted only by the provider's boundary) is
-     denied on any error (provider unreachable, a bad answer, an expired or unknown record, a crash of this script).
+     denied on any error (provider unreachable, a bad answer, an expired or unknown record, a crash of this script);
+  5. a known call of a tool off the record's profile (its tools list) is denied; on a local orchestrator's profile (the
+     route pick "local", plan and delegate only) Bash is allowed only as start_task's exact watch_command (the
+     --watch-prefix the launcher passes this hook, then WATCH_TAIL_RE, the provider's effect_boundary pattern), no
+     BashOutput / KillShell / KillBash, and start_task may not ask for the inputs the provider names
+     (delegate_refused: chrome, connectors).
 
 A denial is exit 2 with the reason on stderr (Claude Code blocks the call and shows the reason to the model).
 
@@ -40,6 +46,7 @@ if __name__ == "__main__" and not sys.flags.isolated:   # an install without -I:
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -49,6 +56,35 @@ TIMEOUT_S = 5.0
 WRITE_KEYS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 HOOK_TOOLS = frozenset(WRITE_KEYS) | {"Bash"}
 MAX_ANSWER = 65536
+START_TASK_TOOL = "mcp__cortados-route__start_task"
+# start_task's watch_command, the one shell command of a local orchestrator (review localorch3 P1): EXACTLY the watcher
+# prefix the launcher gave this hook (--watch-prefix: child_tasks.watch_prefix of the delegation MCP server session.py
+# configures, i.e. the interpreter real path and child_tasks.py path start_task itself puts in watch_command), then
+# WATCH_TAIL_RE (effect_boundary.WATCH_TAIL_RE's pattern; tests/test_local_orchestrator.py keeps the two equal): task ids
+# and --stall / --timeout / --interval with an integer, nothing else. Without a prefix (a session not launched with a
+# local pick, the routed-subagents mod) no shell command is the watcher.
+WATCH_TAIL_RE = re.compile(
+    r" --watch(?: --(?:stall|timeout|interval) [0-9]{1,7})* t[0-9]{14}-[0-9a-f]{8}"
+    r"(?: (?:t[0-9]{14}-[0-9a-f]{8}|--(?:stall|timeout|interval) [0-9]{1,7})){0,63}")
+# The background-job tools a local orchestrator never has (effect_boundary.ORCHESTRATOR_SHELL, review localorch3 P2).
+JOB_TOOLS = frozenset({"BashOutput", "KillShell", "KillBash"})
+WATCH_PREFIX_FLAG = "--watch-prefix"
+
+
+def is_watch_command(command, prefix):
+    """Whether command is exactly prefix + WATCH_TAIL_RE (no prefix: never)."""
+    return (isinstance(command, str) and isinstance(prefix, str) and bool(prefix) and command.startswith(prefix)
+            and bool(WATCH_TAIL_RE.fullmatch(command[len(prefix):])))
+
+
+def watch_prefix_from(argv):
+    """The --watch-prefix value of the hook's own command line (written by session.py into the private settings
+    file), or None."""
+    argv = list(argv or ())
+    for i, a in enumerate(argv[:-1]):
+        if a == WATCH_PREFIX_FLAG:
+            return argv[i + 1] or None
+    return None
 
 
 class Denied(Exception):
@@ -154,13 +190,14 @@ def check_self(project) -> None:
             raise Denied("the boundary hook's %s lies inside the project folder, which the model may write" % what)
 
 
-def decide(event: dict) -> None:
-    """Raise Denied when the call must not run; return when it may."""
+def decide(event: dict, watch_prefix=None) -> None:
+    """Raise Denied when the call must not run; return when it may. watch_prefix: the launcher's watcher prefix
+    (watch_prefix_from), the only program a local orchestrator's Bash may run."""
     tool = event.get("tool_name")
-    if tool not in HOOK_TOOLS:
-        return
     tid = event.get("tool_use_id")
     marked = isinstance(tid, str) and tid.startswith(MARK_PREFIX)
+    if tool not in HOOK_TOOLS and not marked:
+        return                                           # nothing the boundary minted: no question to ask
     if not isinstance(tid, str) or not tid:
         if marked:
             raise Denied("no tool_use id")
@@ -177,18 +214,40 @@ def decide(event: dict) -> None:
         return
     if answer.get("tool") != tool:
         raise Denied("the call does not match the provider's record of it")
+    tools = answer.get("tools")
+    if tools is not None and (not isinstance(tools, list) or tool not in tools):
+        raise Denied("%s is not allowed on this local-routed turn's profile (%s)"
+                     % ("no shell: Bash" if tool == "Bash" else "the tool", answer.get("profile")))
+    inp = event.get("tool_input")
+    if tool in JOB_TOOLS and answer.get("bash") is not True:        # only a profile with a free shell has jobs
+        raise Denied("a local orchestrator does not read or stop background jobs (task_status / wait_task do)")
+    if tool not in HOOK_TOOLS:
+        if tool == START_TASK_TOOL:
+            refused = answer.get("delegate_refused") or []
+            if not isinstance(inp, dict) or not isinstance(refused, list):
+                raise Denied("the delegation call cannot be checked")
+            for key in refused:
+                if isinstance(key, str) and inp.get(key):
+                    raise Denied("a local orchestrator may not start a task with %s" % key)
+        return
     check_self(answer.get("project"))
     if tool == "Bash":
-        if answer.get("bash") is not True:
-            raise Denied("no shell on a sensitive local-routed turn")
-        return
-    inp = event.get("tool_input")
+        if answer.get("bash") is True:
+            return
+        if answer.get("bash_watch") is True:
+            command = inp.get("command") if isinstance(inp, dict) else None
+            if is_watch_command(command, watch_prefix):
+                return
+            raise Denied("a local orchestrator runs no shell command but start_task's exact watch_command"
+                         + ("" if watch_prefix else " (this session was not launched with a local pick)"))
+        raise Denied("no shell on a sensitive local-routed turn")
     key = (answer.get("write_tools") or {}).get(tool) or WRITE_KEYS[tool]
     check_write(inp.get(key) if isinstance(inp, dict) else None, answer.get("project"), answer.get("protected"))
 
 
-def main(stdin=None, stderr=None, standalone=False) -> int:
-    """standalone: run as the hook program (not imported), where a run without -I denies every marked call."""
+def main(stdin=None, stderr=None, standalone=False, argv=None) -> int:
+    """standalone: run as the hook program (not imported), where a run without -I denies every marked call. argv: the
+    hook's arguments (default sys.argv[1:] when standalone), read for --watch-prefix."""
     stdin = stdin or sys.stdin
     stderr = stderr or sys.stderr
     marked = False
@@ -203,7 +262,7 @@ def main(stdin=None, stderr=None, standalone=False) -> int:
         if standalone and marked and not sys.flags.no_site:
             raise Denied("the hook runs without python -S, so a site-packages .pth file could have run project code "
                          "before it")
-        decide(event)
+        decide(event, watch_prefix_from(sys.argv[1:] if argv is None and standalone else argv))
         return 0
     except Denied as exc:
         stderr.write("cortados boundary: denied: %s. Nothing was run.\n" % exc)

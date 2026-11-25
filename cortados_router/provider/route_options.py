@@ -23,9 +23,9 @@ PATH = "/v1/cortados/route-options"
 VERSION = 1
 CLOUD_BANDS = ("R0", "R1", "R2", "R3", "R4")
 BANDS = CLOUD_BANDS + ("local",)
-# Shown on every local row until step 8 builds the `orchestrator` boundary profile (E8, owner 2026-11-24): a local
-# pick is parsed and validated, and refused by the provider with routing.LOCAL_PICKS_REFUSED.
-LOCAL_NOTE = "local orchestrator: coming in the next step (plan-and-delegate profile)"
+# Shown with the local section (E8, owner 2026-11-24; built in step 8): a local pick is served under the
+# `orchestrator` boundary profile (routing.choose_local_pick, effect_boundary).
+LOCAL_NOTE = "local orchestrator: plan and delegate only (orchestrator profile)"
 # The lanes a model may live on that this endpoint never runs (routing.SERVED_PROVIDERS): said once, by count, so
 # "where is Sonnet 5.5?" has an answer without listing every reach row.
 NOT_SERVED_WHY = ("only on lanes this endpoint never runs (Cursor, Antigravity, local rows): the provider serves "
@@ -190,7 +190,7 @@ def local_section(core, local_view: Callable[[], dict[str, Any]] | None) -> dict
     """Every local pin (local_lane.pins) with its node, alias, tag, context length, published proxy index and the node's
     state as its gate reports it (the GET /v1/cortados/local rows). A clashing or broken local config is said as such
     (node named, never the file path), never guessed around."""
-    out: dict[str, Any] = {"status": "ok", "error": None, "note": LOCAL_NOTE, "enabled": False, "models": []}
+    out: dict[str, Any] = {"status": "ok", "error": None, "note": LOCAL_NOTE, "enabled": True, "models": []}
     try:
         pins = routing.local_pins(core)
     except local_lane.LocalConfigError as exc:

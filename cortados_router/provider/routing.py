@@ -164,11 +164,11 @@ def band_window(header: Any, model: Any) -> tuple[tuple[str, str] | None, str | 
 PICK_HEADER = "x-cortados-pick"
 PICK_MAX_MODELS = 8                 # a picker list, not a catalogue: beyond this the person means `*`
 _PICK_MODEL = re.compile(r"[A-Za-z0-9._-]{1,64}")
-# E8 (owner 2026-11-24): a local orchestrator is opt-in under the `orchestrator` boundary profile, built after this
-# step. Until then a local pick is parsed and validated, and refused with this text (a 400: retrying cannot help).
-LOCAL_PICKS_REFUSED = ("local orchestrator picks are not enabled yet: they wait for the `orchestrator` boundary profile "
-                       "(plan and delegate only; docs/ORCHESTRATOR-ROUTE-PICKER.md step 8). Pin one local model with "
-                       "sub/<model>, or pick cloud models")
+# E8 (owner 2026-11-24, built in step 8): a local orchestrator is opt-in under the `orchestrator` boundary profile
+# (effect_boundary: plan and delegate only). A `local[:<models>]` pick is served by choose_local_pick: the first picked
+# local model whose node can take the conversation, never a cloud model.
+PICK_LOCAL_KEY = "pick_local"          # a route choose_local_pick made: the pick's label (identity: server._in_window)
+PICK_LOCAL_RULE = "(orchestrator profile)"   # the routes row's rule marker; tasks.py labels it
 
 
 class PickError(ValueError):
@@ -467,6 +467,9 @@ def _when(w: dict[str, Any]) -> tuple[float, str] | None:
 def pick_widen(pick: "Pick") -> str:
     """The exact `/model` line(s) that widen a pick (E2's refusal and the launcher's hint)."""
     from cortados_router import core
+    if pick.local:
+        return ("`/model cortados@R3:*` (cloud models: any capable R3 model) or `/model cortados` (free routing); "
+                "either starts a new conversation from this one")
     if pick.window is None:
         return "`/model cortados` (free routing)"
     w = core.band_window_label(*pick.window)
@@ -1147,6 +1150,123 @@ def _choose_local(core, body: dict[str, Any], node: dict[str, Any], entry: dict[
             "route": route, "local": {"node": node, "model": entry}}
 
 
+def pick_local_reason(body: dict[str, Any], local: str | None) -> tuple[str, str | None]:
+    """(bind reason, detector) of one turn of a local route pick: PICK_LOCAL_REASON (the orchestrator profile), or
+    PICK_LOCAL_SENSITIVE_REASON when a sensitivity detector marks the request (E5: the sensitive rule wins, so the turn
+    neither delegates nor runs a shell: read and plan only). The detectors are request_sensitivity's without S1 (a pick
+    does not ask S1): the x-cortados-local: sensitive flag and the nodes' keyword lists; a detector that cannot answer
+    ("unknown") counts as sensitive, the stricter choice. `prefer` is a cost preference and marks nothing."""
+    why = request_sensitivity(body, {}, local)
+    if why is None:
+        return effect_boundary.PICK_LOCAL_REASON, None
+    return effect_boundary.PICK_LOCAL_SENSITIVE_REASON, why
+
+
+def choose_local_pick(core, body: dict[str, Any], pick: "Pick", *, client: str, conversation_id: str,
+                      local: str | None = None, excluded: Callable[[str], bool] = lambda name: False
+                      ) -> dict[str, Any]:
+    """Serve a `local[:<models>]` route pick (E8, docs/ORCHESTRATOR-ROUTE-PICKER.md §4.5 and §5): the conversation's main
+    loop runs on a local model under the orchestrator boundary profile (plan and delegate only), never on a cloud model.
+    A pin over a set: the picked models in the order typed (bare `local`: every local pin, config order), and the first
+    whose node answers the probe, lists the model, is not busy (this process's in-flight count, the gate's latest
+    report) and fits the request (the model's context, the gate's memory) takes it. No quota, so no scarcity ranking.
+
+    None can: refused, naming each picked model, its node and why, plus the widening line (E2's shape: 413 when every
+    one is too large, else 503 with `pick_refused`). Nothing is tried on any other model, cloud or local.
+    Logged as a pin row (engine `pin`, band `pin`) with the pick (core.log_route_pick), the rule
+    `route pick <label> (orchestrator profile): …` and `boundary profile: <profile>`. The route carries `pinned` (the
+    owner's choice: no reroute, no S1 continuation re-check, pin wording), PICK_LOCAL_KEY (server._in_window keeps the
+    pick's identity, unlike a sub/ pin) and the bind reason (pick_local_reason), which fences every turn
+    (effect_boundary.fenced)."""
+    label = pick.label
+    widen = pick_widen(pick)
+    try:
+        pins = local_pins(core)
+    except local_lane.LocalConfigError as exc:      # a broken local config refuses, never guesses a node
+        return {"router": execution_routing.ROUTER, "pick_refused": True,
+                "error": f"route pick {label}: {misconfigured(label, exc)}; nothing ran on any other model"}
+    by_id = {local_lane.pin_id(m): (n, m) for n, m in pins}
+    wanted = list(pick.models) or list(by_id)
+    tried: list[tuple[str, str, str]] = []           # (pin id, node id, why it was skipped)
+    probes: dict[str, Any] = {}
+    too_large = 0
+    choice = None
+    for pid in wanted:
+        if pid not in by_id:
+            tried.append((pid, "?", "no longer configured on the provider"))
+            continue
+        node, entry = by_id[pid]
+        if excluded(pid) or excluded(entry["id"]):
+            tried.append((pid, node["node"], "excluded by the client (x-cortados-exclude-model)"))
+            continue
+        nid = node["node"]
+        if nid not in probes:
+            try:
+                probes[nid] = local_lane.probe(node)
+            except local_lane.LocalUnavailable as exc:
+                probes[nid] = exc
+        got = probes[nid]
+        why = None
+        if isinstance(got, Exception):
+            why = str(got)
+        elif not local_lane.lists(got, entry["id"]):
+            why = f"node {nid} does not list {entry['id']} (ollama pull it there)"
+        elif local_lane.busy(node):
+            why = f"node {nid} is busy (it already relays its {int(node.get('max_inflight') or 1)} turn(s))"
+        elif local_lane.gate_busy(node) is not None:
+            why = f"node {nid} is busy ({local_lane.gate_busy(node) or 'its gate is full'})"
+        else:
+            need = local_lane.input_tokens(body, entry)
+            fit = local_lane.gate_fit(node, local_lane.request_tokens(body, entry))
+            if need > entry["context_length"]:
+                why = (f"the request (≈{need // 1000}k tokens) exceeds {entry['id']}'s configured context "
+                       f"({entry['context_length'] // 1000}k)")
+                too_large += 1
+            elif fit is not None:
+                why = f"node {nid}: {fit[1]}"
+                too_large += fit[0] == "too_large"
+        if why:
+            tried.append((pid, nid, why))
+            continue
+        choice = (pid, node, entry)
+        break
+    if choice is None:
+        parts = "; ".join(f"{pid} on node {nid}: {why}" for pid, nid, why in tried) or "no local model is configured"
+        out = {"router": execution_routing.ROUTER, "pick_refused": True,
+               "error": f"route pick {label}: no picked local model can take this conversation now ({parts}); nothing "
+                        f"ran on any other model, local or cloud. Retry when the node is back, or widen: {widen}"}
+        if tried and too_large == len(tried):
+            out["fit_blocked"] = True
+        return out
+    pid, node, entry = choice
+    reason, detector = pick_local_reason(body, local)
+    profile = effect_boundary.profile_for(reason)
+    chosen = {"lane": node["lane"], "provider": node["lane"], "model": entry["id"], "account": None,
+              "config_dir": None, "reserve": False, "pool": None}
+    rules = [f"route pick {label} {PICK_LOCAL_RULE}: {pid} on node {node['node']}",
+             f"boundary profile: {profile}"]
+    if detector:
+        rules.append(f"route pick {label}: marked sensitive by {sensitive_notice.detector(detector)} (E5): read and "
+                     "plan only, no delegation")
+    rules += [f"route pick {label}: {p} on node {n} skipped: {why}" for p, n, why in tried]
+    skipped = [{"lane": by_id[p][0]["lane"] if p in by_id else None, "model": p, "pool": None, "why": why}
+               for p, _n, why in tried]
+    route = {"band": "pin", "chosen": chosen, "answers": None, "subagents": 0, "verifier": False,
+             "hard_rules": rules, "skipped": skipped or None}
+    decision = {"answers": None, "degraded": False, "engine": "pin", "engine_ms": None}
+    route_id = f"execution:provider:pin:{uuid.uuid4().hex[:12]}"
+    core.log_route(route_id, {"session_id": conversation_id, "platform": f"provider:{client}", "unit_kind": "interactive",
+                              "actual_model": None,
+                              "request": request_text(body.get("messages") or [], standalone=not body.get("tools"))[:8000]},
+                   decision, route)
+    core.log_route_pick(route_id, label)
+    logger.info("route pick %s: %s on node %s, %s profile", label, pid, node["node"], profile)
+    return {"router": execution_routing.ROUTER, "provider": node["lane"], "model": entry["id"], "account": None,
+            "config_dir": None, "context_length": entry["context_length"], "route_id": route_id,
+            "api_request_id": "", "degraded": False, "band": "pin", "pinned": True, "decision": decision,
+            "route": route, "local": {"node": node, "model": entry}, "bind_reason": reason, PICK_LOCAL_KEY: label}
+
+
 def _excluded_route_usable(core, routes, body: dict[str, Any], claude_bin: str, codex_bin: str) -> bool | None:
     """Whether any excluded route would itself have served this request had it not been excluded: its binary on PATH,
     its lane (and pool) healthy by core.candidate_health, and the request within its token ceiling. That is a subset
@@ -1285,9 +1405,9 @@ def choose(core, body: dict[str, Any], *, client: str, conversation_id: str, cla
     pick_models: tuple[str, ...] = ()
     base_notes = list(constraints.get("notes") or [])
     if restrict:
-        if route_pick.local:                      # E8: parsed and validated, not served until step 8
-            return {"router": execution_routing.ROUTER, "client_error": True,
-                    "error": f"route pick {route_pick.label}: {LOCAL_PICKS_REFUSED}"}
+        if route_pick.local:                      # E8 (step 8): a local orchestrator, never a cloud model
+            return choose_local_pick(core, body, route_pick, client=client, conversation_id=conversation_id,
+                                     local=local, excluded=hit)
         pick_models = pick_star_models(core, route_pick.window) if route_pick.star else route_pick.models
         if not pick_models:
             # `*` with unreadable model scores: a dependency failed (503), never a guess at which models clear the band

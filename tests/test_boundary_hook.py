@@ -210,9 +210,14 @@ class ProfileTests(HookBase):
         FakeCheck.answers[MARKED] = record(eb.COST, self.project, tool="Bash")
         self.assertAllowed(self.run_hook("Bash", {"command": "ls"}))
 
-    def test_other_tools_are_not_the_hooks(self):
-        self.assertAllowed(self.run_hook("Read", {"file_path": "/etc/hosts"}))
+    def test_other_tools_are_not_the_hooks_unless_marked(self):
+        # An unmarked call of a tool outside HOOK_TOOLS returns at once: the provider is not asked.
+        self.assertAllowed(self.run_hook("Read", {"file_path": "/etc/hosts"}, tid="toolu_01CloudModelOwnId"))
         self.assertEqual(FakeCheck.asked, [])
+        # Since step 8 (matcher "*"), a provider-marked call of ANY tool is checked, and fails closed without a record.
+        self.assertDenied(self.run_hook("Read", {"file_path": "/etc/hosts"}), "no live record")
+        FakeCheck.answers[MARKED] = record(eb.SENSITIVE, self.project, tool="Read")
+        self.assertAllowed(self.run_hook("Read", {"file_path": "/etc/hosts"}))
 
 
 class UnknownAndFailClosedTests(HookBase):
@@ -594,7 +599,9 @@ class SharedSourceTests(unittest.TestCase):
         self.assertEqual(hook.WRITE_KEYS, eb.WRITE_TOOLS)
         self.assertEqual(hook.HOOK_TOOLS, eb.HOOK_TOOLS)
         self.assertEqual(session.BOUNDARY_HOOK_HEADER, eb.HOOK_HEADER)
-        self.assertEqual(set(session.BOUNDARY_HOOK_MATCHER.split("|")), set(eb.HOOK_TOOLS))
+        # the file writers and Bash; every tool only in a local-pick session (review localorch3: ~158 ms per Read)
+        self.assertEqual(set(session.BOUNDARY_HOOK_MATCHER.split("|")), set(hook.HOOK_TOOLS))
+        self.assertEqual(session.BOUNDARY_HOOK_MATCHER_LOCAL, "*")
         from cortados_router.provider import server
         self.assertEqual(hook.CHECK_PATH, server.BOUNDARY_CHECK_PATH)
 

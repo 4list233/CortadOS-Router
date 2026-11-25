@@ -2162,20 +2162,35 @@ def _last_output_at(d: str):
     return round(best, 3) if best is not None else None
 
 
-def watch_command(task_id: str) -> str:
-    """The shell command the orchestrator runs IN THE BACKGROUND on this machine to be woken when the task ends: this
-    interpreter and this checkout's module, both absolute, in --watch mode. The two settings that decide where tasks
-    and hosts are looked up ride along when they are set (paths, never secrets), so the command sees the same tasks
-    the server does. Returned by start_task as `watch_command`."""
+# The two settings that decide where a watcher looks tasks and hosts up; watch_prefix carries them when they are set.
+WATCH_ENV_VARS = ("CORTADOS_TASKS_DIR", "CORTADOS_EXEC_HOSTS_FILE")
+
+
+def watch_prefix(environ=None) -> str:
+    """Everything of watch_command before ` --watch`: [env VAR=value ...] <this interpreter's real path> -B <this
+    checkout's child_tasks.py, resolved>, each shell-quoted. `environ` (default os.environ) supplies WATCH_ENV_VARS.
+    THE one source of the watcher's program: start_task's watch_command, the provider's effect boundary
+    (effect_boundary.expected_watch_prefix) and the launcher, which hands the client boundary hook the prefix of the
+    delegation MCP server it configures (session.py), all build it here. The real path of the interpreter, so the
+    launcher (which starts that server with os.path.realpath(sys.executable)) and the server agree."""
+    environ = os.environ if environ is None else environ
     parts = []
-    for var in ("CORTADOS_TASKS_DIR", "CORTADOS_EXEC_HOSTS_FILE"):
-        v = os.environ.get(var)
+    for var in WATCH_ENV_VARS:
+        v = environ.get(var)
         if v:
             parts.append(f"{var}={shlex.quote(v)}")
     if parts:
         parts.insert(0, "env")
-    parts += [shlex.quote(sys.executable), "-B", shlex.quote(str(Path(__file__).resolve())), "--watch", task_id]
+    parts += [shlex.quote(os.path.realpath(sys.executable)), "-B", shlex.quote(str(Path(__file__).resolve()))]
     return " ".join(parts)
+
+
+def watch_command(task_id: str) -> str:
+    """The shell command the orchestrator runs IN THE BACKGROUND on this machine to be woken when the task ends: this
+    interpreter and this checkout's module, both absolute, in --watch mode (watch_prefix). The two settings that decide
+    where tasks and hosts are looked up ride along when they are set (paths, never secrets), so the command sees the
+    same tasks the server does. Returned by start_task as `watch_command`."""
+    return watch_prefix() + " --watch " + task_id
 
 
 def _watch_row(task_id: str, st: dict, watched_s: float) -> dict:

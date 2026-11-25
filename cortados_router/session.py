@@ -156,8 +156,13 @@ LOCAL_MODES = ("sensitive", "prefer")
 # The provider's effect_boundary.HOOK_HEADER (checked by a test): this session's PreToolUse boundary hook is installed,
 # so a sensitive local-routed turn may offer file writes (docs/BOUNDARY-HOOK.md). Without it such a turn is read-only.
 BOUNDARY_HOOK_HEADER = "x-cortados-boundary-hook"
-# The tools the boundary hook checks: the file writers (path containment on this machine) and Bash (profile).
+# The file writers (path containment on this machine) and Bash (profile): every session and child task.
 BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+# A session launched with a local pick (step 8 of the route picker): every tool, so the hook also checks every other
+# tool of a provider-marked call against the orchestrator profile (plan and delegate only, docs/BOUNDARY-HOOK.md). Only
+# there (review localorch3): the hook is a Python start per call (about 158 ms per Read measured), and in any other
+# session the provider's own check of a marked call stands alone for the tools outside BOUNDARY_HOOK_MATCHER.
+BOUNDARY_HOOK_MATCHER_LOCAL = "*"
 
 
 BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
@@ -218,17 +223,23 @@ def boundary_hook_python(project: str | None = None, candidates=None) -> str:
                        + ", ".join(map(str, candidates)) + ")")
 
 
-def boundary_hook_entry(project: str | None = None, python: str | None = None) -> dict:
+def boundary_hook_entry(project: str | None = None, python: str | None = None, local_pick: bool = False,
+                        watch_prefix: str | None = None) -> dict:
     """The PreToolUse entry running boundary_hook.py: `<absolute python3> -I -S -B <absolute script>` (shell-quoted),
     from / inside the shell guard (guarded_hook_command). No PATH lookup, isolated mode, no site import, fail closed for
     a marked call when the interpreter cannot start (docs/BOUNDARY-HOOK.md "Isolation"). A hook script inside
     the project folder is refused. Timeout 30 s, well past the script's own 5 s provider timeout, so the script always
-    answers (and fails closed) itself."""
+    answers (and fails closed) itself. local_pick: matcher BOUNDARY_HOOK_MATCHER_LOCAL, and watch_prefix (the delegation
+    MCP server's child_tasks.watch_prefix) goes to the hook as --watch-prefix: the only program its watcher may run."""
     if _inside_project(str(BOUNDARY_HOOK_FILE), project):
         raise SessionError(BOUNDARY_HOOK_INSIDE_PROJECT)
     python = python or boundary_hook_python(project)
-    command = guarded_hook_command(python, shlex.quote(str(BOUNDARY_HOOK_FILE)))
-    return {"matcher": BOUNDARY_HOOK_MATCHER, "hooks": [{"type": "command", "command": command, "timeout": 30}]}
+    args = shlex.quote(str(BOUNDARY_HOOK_FILE))
+    if local_pick and watch_prefix:
+        args += " --watch-prefix " + shlex.quote(watch_prefix)
+    command = guarded_hook_command(python, args)
+    return {"matcher": BOUNDARY_HOOK_MATCHER_LOCAL if local_pick else BOUNDARY_HOOK_MATCHER,
+            "hooks": [{"type": "command", "command": command, "timeout": 30}]}
 
 
 def custom_headers(run_id: str | None = None, office_headers=None, local: str | None = None) -> str:
@@ -317,14 +328,17 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
                      run_id: str | None = None, office_headers=None, local: str | None = None,
-                     project: str | None = None, eager_tools: bool = False) -> dict:
+                     project: str | None = None, eager_tools: bool = False, local_pick: bool = False,
+                     watch_prefix: str | None = None) -> dict:
     """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
-    and script must lie outside it."""
+    and script must lie outside it. local_pick / watch_prefix: boundary_hook_entry's (a session launched with a local
+    pick)."""
     # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local,
                                    eager_tools=eager_tools),
                "enabledPlugins": {PLUGIN_ID: False}, "disableAllHooks": False}
-    pre = [boundary_hook_entry(project)]         # always: the header in env promises it (no hook, no edits)
+    # always: the header in env promises it (no hook, no edits)
+    pre = [boundary_hook_entry(project, local_pick=local_pick, watch_prefix=watch_prefix)]
     if gate:
         # Absolute standalone script: hook cwd need not be this checkout; shell-quote paths with spaces.
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
@@ -481,7 +495,15 @@ ROUTE_PROMPT_TRIES = 8             # invalid answers per question before the lau
 PICK_ALIASES = {**routing.SUB_ALIASES, "sol": "gpt-6.1-sol"}
 PIN_PREFIX = routing.SUB_PREFIX
 _PIN_RE = re.compile(r"sub/[a-z0-9][a-z0-9._-]{0,63}")
-LOCAL_PICK_NOTE = "local orchestrator: coming in the next step (plan-and-delegate profile)"
+# Printed at launch for a local pick (E8, step 8): the provider serves it under the orchestrator profile.
+LOCAL_PICK_NOTE = ("local orchestrator: plan and delegate only (it reads, plans and delegates with start_task / "
+                   "route_task; no edits, no shell but the task watcher, no other tool)")
+# The one MCP server a local orchestrator session loads (the delegation tools, effect_boundary.DELEGATION_SERVER), with
+# tool search off so its tools are declared up front: the orchestrator profile has no ToolSearch, and the full
+# connector catalog would not fit a local model's context (TOOL_SEARCH_OFF's comment). Not when the claude args
+# already choose the MCP set (--strict-mcp-config).
+DELEGATION_SERVER = "cortados-route"
+SUBAGENT_MCP_FILE = Path(__file__).resolve().with_name("subagent_mcp.py")
 
 
 class RouteOptionsUnavailable(Exception):
@@ -536,17 +558,42 @@ def resolve_pick_name(name: str, served: list[str] | None) -> str:
     raise SessionError(f"route pick: {name} is not a model the provider serves; name one of: {', '.join(served)}")
 
 
-def canonical_route(text: str, served: list[str] | None = None) -> str:
+def local_ids(view: dict | None) -> list[tuple[str, str]] | None:
+    """(pin id, tag) of every local model a `local` options view lists, or None when it lists none readable."""
+    loc = (view or {}).get("local")
+    if not isinstance(loc, dict):
+        return None
+    got = [(m.get("id"), m.get("tag") or m.get("id")) for m in loc.get("models") or [] if isinstance(m, dict)]
+    got = [(i, t) for i, t in got if isinstance(i, str) and i and isinstance(t, str)]
+    return got or None
+
+
+def resolve_local_name(name: str, local: list[tuple[str, str]] | None) -> str:
+    """One model name of a local pick as its pin id (the alias, else the tag; case-insensitive on either). Offline
+    (`local` None) it goes as typed: the provider checks it against its local pins on the first request."""
+    key = name.strip()
+    if local is None:
+        return key
+    hits = sorted({i for i, t in local if key.casefold() in (i.casefold(), t.casefold())})
+    if len(hits) == 1:
+        return hits[0]
+    raise SessionError(f"route pick: {name} is not a local model of the provider; name one of: "
+                       f"{', '.join(i for i, _t in local)}")
+
+
+def canonical_route(text: str, served: list[str] | None = None, local: list[tuple[str, str]] | None = None) -> str:
     """A --route value (the pick grammar of docs/ORCHESTRATOR-ROUTE-PICKER.md §3.2 without `cortados@`) as the
-    launcher writes it: `any`, a window label (`R3`), `<window>:*`, or `<window>:<ids sorted, joined by +>`. Local picks
-    are refused here (they stay refused by the provider until step 8)."""
+    launcher writes it: `any`, a window label (`R3`), `<window>:*`, `<window>:<ids sorted, joined by +>`, `local` or
+    `local:<pin ids in the order typed, duplicates dropped, joined by +>` (step 8: the provider serves a local pick
+    under the orchestrator profile and takes the first available model in that order, design §4.5; review localorch3:
+    sorting them put the wrong model first. The provider's identity label sorts them itself, routing.Pick.label)."""
     try:
         window, kind, names = routing.parse_pick(text)
     except routing.PickError as exc:
         raise SessionError(f"--route {str(text)[:40]!r}: {exc}") from None
     if kind == "local":
-        raise SessionError(f"--route: {LOCAL_PICK_NOTE}; a local main loop is not available yet (pin one local "
-                           "model with --orchestrator <alias>, or pick cloud models)")
+        ids = list(dict.fromkeys(resolve_local_name(n, local) for n in names))
+        return check_route("local" + (":" + "+".join(ids) if ids else ""), "--route")
     wlabel = core.band_window_label(*window) if window else None
     if kind == "window":
         return wlabel or "any"
@@ -587,6 +634,11 @@ def route_notes(model: str) -> list[str]:
     window, kind, names = routing.parse_pick(label)
     w = core.band_window_label(*window) if window else None
     lines = ["main loop: " + model]
+    if kind == "local":
+        lines.append(LOCAL_PICK_NOTE)
+        lines.append("widen mid-session: " + routing.pick_widen(routing.Pick(None, names, local=True, label=label))
+                     .replace("`", ""))
+        return lines
     if kind == "window":
         lines.append(f"widen mid-session: /model cortados@{w}:* (only the models clearing {w}'s reference) or "
                      "/model cortados (free routing)")
@@ -732,7 +784,9 @@ class RoutePrompt:
                 if value is not None:
                     return value
             elif got == "5":
-                self.local()
+                value = self.local()
+                if value is not None:
+                    return value
             elif got == "6":
                 return "any"
             elif got == "7":
@@ -808,15 +862,68 @@ class RoutePrompt:
                     self.say(str(exc))
         raise SessionError("route prompt: no route picked after several tries; nothing launched")
 
-    def local(self) -> None:
+    def local(self) -> str | None:
+        """A local pick (step 8): the local models with their node's state, numbers toggle, a = any local model (the
+        first available, in config order), Enter accepts the selection, b = back to the menu. Offline, or with no
+        local model listed: names typed joined by +, or a."""
         v = self.view("local")
         loc = (v or {}).get("local") or {}
-        for m in loc.get("models") or []:
-            if isinstance(m, dict):
-                self.say(f"  {m.get('id')} on {m.get('node_label') or m.get('node')}: {m.get('state')}")
+        self.say(LOCAL_PICK_NOTE)
         if loc.get("error"):
             self.say("  " + str(loc["error"]))
-        self.say(LOCAL_PICK_NOTE)
+        models = [m for m in loc.get("models") or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        if not models:
+            if v is not None:
+                self.say("  the provider lists no local model (" + str(loc.get("status") or "no local section") + ")")
+            for _ in range(ROUTE_PROMPT_TRIES):
+                got = self.ask("local models joined by + (a = any local model, b = back): ")
+                if got.casefold() == "a":
+                    return "local"
+                if got.casefold() in ("b", ""):
+                    return None
+                try:
+                    return canonical_route("local:" + got, None, None)
+                except SessionError as exc:
+                    self.say(str(exc))
+            return None
+        # The order models are selected in is the preference order (design §4.5: first available wins): a saved
+        # pick's order first, then each number as it is toggled on.
+        ids = [m["id"] for m in models]
+        order = []
+        if self.saved and self.saved.startswith("local:"):
+            order = [i for i in dict.fromkeys(self.saved.split(":", 1)[1].split("+")) if i in ids]
+        for _ in range(ROUTE_PROMPT_TRIES):
+            self.say("local models (state from the nodes' gates)")
+            for i, m in enumerate(models):
+                self.say(f"  [{'x' if m['id'] in order else ' '}] {i + 1} {m['id']} on "
+                         f"{m.get('node_label') or m.get('node')}: {m.get('state')}")
+            self.say("  a = any local model (the first available)     b = back")
+            self.say("  numbers toggle, Enter accepts")
+            got = self.ask().casefold()
+            if got == "a":
+                return "local"
+            if got == "b":
+                return None
+            if got == "":
+                if not order:
+                    self.say("select at least one model, or a / b")
+                    continue
+                try:                                 # review localorch4 P2: the same limits as the cloud menu
+                    return check_route("local:" + "+".join(order), "route pick")
+                except SessionError as exc:          # too many models, or too long: say so and ask again
+                    self.say(f"{exc}; deselect some models, or a / b")
+                    continue
+            nums = got.replace(",", " ").split()
+            if all(n.isdigit() and 1 <= int(n) <= len(models) for n in nums):
+                for n in nums:
+                    mid = ids[int(n) - 1]
+                    if mid in order:
+                        order.remove(mid)
+                    else:
+                        order.append(mid)
+            else:
+                self.say(f"numbers 1-{len(models)}, a, b, or Enter")
+        return None
 
     def pin(self) -> str | None:
         served = served_ids(self.view("R0"))
@@ -892,7 +999,13 @@ def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetc
                 served = served_ids(fetch("R0"))
             except RouteOptionsUnavailable:
                 served = None                    # offline: aliases and ids as typed; the provider checks them
-        return canonical_route(args.route, served)
+        local = None
+        if kind == "local" and names:
+            try:                                 # the provider's local pins resolve aliases and tags
+                local = local_ids(fetch("local"))
+            except RouteOptionsUnavailable:
+                local = None                     # offline: as typed; the provider checks them
+        return canonical_route(args.route, served, local)
     if (explicit or args.no_route_prompt or args.print_env or args.run_id or args.project_dir or args.eager_tools
             or not (_tty(stdin) and _tty(out))):
         return None
@@ -912,6 +1025,32 @@ def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetc
     if value is not None:
         out.write("→ claude --model " + route_model(value) + "\n")
     return value
+
+
+def is_local_route(route: str | None) -> bool:
+    """Whether a route value is a local pick (`local`, `local:<ids>`)."""
+    return isinstance(route, str) and (route == "local" or route.startswith("local:"))
+
+
+def delegation_mcp_config(provider_url: str, token_file: str, base_env: dict | None = None) -> dict:
+    """The --mcp-config of a local orchestrator session: only DELEGATION_SERVER, this checkout's subagent_mcp.py run
+    by this launcher's interpreter (both absolute), told the provider's URL and the token FILE (never the token), and
+    the watcher settings of base_env (child_tasks.WATCH_ENV_VARS) set explicitly, so the server's watch_command is
+    the one local_watch_prefix hands the boundary hook."""
+    from cortados_router import child_tasks          # deferred: child_tasks imports this module
+    env = {"CORTADOS_PROVIDER_URL": provider_url,
+           "CORTADOS_PROVIDER_TOKEN_FILE": os.path.abspath(os.path.expanduser(token_file))}
+    env.update({k: base_env[k] for k in child_tasks.WATCH_ENV_VARS if (base_env or {}).get(k)})
+    return {"mcpServers": {DELEGATION_SERVER: {
+        "command": os.path.realpath(sys.executable), "args": ["-B", str(SUBAGENT_MCP_FILE)], "env": env}}}
+
+
+def local_watch_prefix(base_env: dict) -> str:
+    """The watcher program of a local orchestrator session (review localorch3 P1): child_tasks.watch_prefix as the
+    delegation MCP server this launcher configures will build it (this interpreter's real path, this checkout's
+    child_tasks.py, base_env's watcher settings). The boundary hook gets it as --watch-prefix."""
+    from cortados_router import child_tasks
+    return child_tasks.watch_prefix({k: base_env.get(k) for k in child_tasks.WATCH_ENV_VARS})
 
 
 def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None,
@@ -943,12 +1082,20 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         if not args.no_gate:
             directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
     office = args.office_header
+    if is_local_route(route) and not mcp_filtered(extra):
+        # A local orchestrator: only the delegation server, its tools declared up front (DELEGATION_SERVER's comment).
+        mcp_path = write_settings(args.settings_dir or SETTINGS_DIR,
+                                  delegation_mcp_config(url, args.token_file, base_env), home)
+        extra = list(extra) + [STRICT_MCP_FLAG, "--mcp-config", mcp_path]
     eager = bool(args.eager_tools or mcp_filtered(extra))      # a bounded MCP catalog only (TOOL_SEARCH_OFF)
     check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local,
                                    eager_tools=eager)), managed_dirs)
     settings_path = write_settings(args.settings_dir or SETTINGS_DIR,
                                    settings_content(url, token, args.delegate_budget, not args.no_gate, args.run_id,
-                                                    office, args.local, args.project_dir, eager_tools=eager),
+                                                    office, args.local, args.project_dir, eager_tools=eager,
+                                                    local_pick=is_local_route(route),
+                                                    watch_prefix=(local_watch_prefix(base_env)
+                                                                  if is_local_route(route) else None)),
                                    home)
     return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local,
                             eager_tools=eager),

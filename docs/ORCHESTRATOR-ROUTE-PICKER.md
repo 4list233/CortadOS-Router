@@ -1,4 +1,4 @@
-# Orchestrator route picker (design; steps 0–6 built)
+# Orchestrator route picker (design; steps 0–6 and 8 built)
 
 Status (2026-11-25): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser, selection, identity; branch
 `orchestrator-route-picker`, review fix rounds 1–2 applied) are built to the owner's §8 answers (§8.1):
@@ -7,7 +7,9 @@ Status (2026-11-25): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (p
 Steps 4–6 (branch `route-picker-launcher`) are built: the options view `provider/route_options.py`
 (`tests/test_route_options.py`), the `route_pick` column, labels and view fields (`tests/test_route_pick_views.py`), and
 the launcher's menu and flags in `session.py` (`tests/test_session_route.py`); what was built where it differs from
-the text below is in §7 "Built on 2026-11-25". Steps 7–9 are not built. Sections below that say
+the text below is in §7 "Built on 2026-11-25". Step 8 (branch `local-orchestrator`, on `route-picker-launcher`) is built:
+the local orchestrator (§5 "Built", `routing.choose_local_pick`, the `orchestrator` profiles in `effect_boundary`, the
+client hook on every marked call; tests in `tests/test_local_orchestrator.py`). Steps 7 and 9 are not built. Sections below that say
 "recommended" or "[ESCALATE]" were written before §8.1; where they differ, §8.1 and §4.3–4.4 hold.
 
 Owner request, 2026-11-24 (condensed): whenever a new Claude Code session starts, let me pick the route of the
@@ -566,6 +568,16 @@ logged as a pin row with the pick. No quota, so no scarcity ranking (the owner a
 which does not exist for local; availability is the only signal). Nothing falls back to the cloud, as with a local pin
 today (`docs/LOCAL-RESOURCES.md:187-189`). §5 covers whether this is wise.
 
+Built in step 8 as `routing.choose_local_pick`: the probe, `local_lane.lists`, `local_lane.busy` and `gate_busy`, the
+model's context and `gate_fit`; a bare `local` tries every local pin in config order; `x-cortados-exclude-model` skips a
+model. None can: refused with each model, its node and why, and the widening line (503 with `pick_refused`; 413 when
+every one is too large). Preference and identity differ (fix round 1, review localorch3 P3): the launcher keeps the
+order typed (`--route local:qwen-35b+qwen-27b`) or selected in the menu, duplicates dropped, so the first choice is
+tried first; the provider's `Pick.models` keeps that order for selection, while the conversation's identity label
+(`Pick.label`, the routes row's `route_pick`) sorts the ids, so `local:a+b` and `local:b+a` are one pick for
+continuation and views and differ only in which model is tried first. The row is a pin row (engine and band `pin`) with `route_pick`, the rule `route pick <label>
+(orchestrator profile): <pin> on node <node>`, `boundary profile: <profile>` and each skipped model's reason.
+
 ### 4.6 Subagents and child tasks
 
 - Subagents send plain `cortados` (`session.py:283-290`; capture check `README.md:354-357`), so a pick does not reach
@@ -630,7 +642,73 @@ allowlist drops every `mcp__*` tool (`effect_boundary.py:8-11`), which removes `
 **Verdict.** Feasible as an opt-in experiment behind the `orchestrator` profile; not fit as a default, and not without
 the profile. **[ESCALATE] E8** (whether to build local picks at all in v1, and with which profile). Recommended: build
 the cloud picker first; ship local picks only behind the `orchestrator` profile and after a shadow comparison of S1's
-bands for the owner's real first prompts against the local model's index.
+bands for the owner's real first prompts against the local model's index. (Decided: E8, §8.1.)
+
+### Built (step 8, 2026-11-25)
+
+The proposal above, with these choices where it was silent (the stricter option each time, per the step's brief):
+
+- **The profile** (`effect_boundary.PROFILE_TOOLS["orchestrator"]`, exact): `Read`, `Glob`, `Grep`, `LS`,
+  `NotebookRead`; `TodoWrite`, `ExitPlanMode`, `AskUserQuestion`; the six `mcp__cortados-route__*` tools (exact names:
+  any other server or spelling is not delegation); `Bash` only as the exact `watch_command` start_task
+  hands back (fix round 1, review localorch3 P1: the earlier shape pattern accepted any program whose path ended in
+  `python3` or `cortados_router/child_tasks.py`). The program part is compared,
+  not matched: `child_tasks.watch_prefix` (the `env CORTADOS_TASKS_DIR=… CORTADOS_EXEC_HOSTS_FILE=…` settings when set,
+  the interpreter's real path, `-B`, the checkout's resolved `child_tasks.py`, shell-quoted), the one source
+  `watch_command` itself is built from; then ` --watch`, task ids in the strict format (at least one) and only
+  `--stall` / `--timeout` / `--interval` with an integer, single spaces, nothing else (no `; echo`, no other flag). The
+  provider compares against its own process's prefix; the client hook against the prefix the launcher computed for the
+  delegation MCP server it configures (same interpreter, checkout and settings), passed to the hook as `--watch-prefix`
+  in the private settings file. When the provider and that server do not run the same interpreter and checkout, both
+  sides refuse the watcher and `task_status` / `wait_task` remain; a session not launched with a local pick (switched
+  to one with `/model`), and the mod, have no prefix, so no watcher. No `BashOutput` / `KillShell` / `KillBash`
+  (review localorch3 P2): their job ids cannot be tied to the watcher reliably (the id exists only after the Bash call
+  ran, on the client), and after a switch to a local pick they would reach the jobs the cloud model started; the
+  watcher's exit wakes the session and `task_status` / `wait_task` read the result. Refused: every file write, every
+  other shell command, Agent / Task, WebFetch / WebSearch and typed server tools, every other MCP tool, Skill / SlashCommand / ToolSearch, and any unknown name (an
+  allowlist: unknown fails closed). §5 named no reads beyond Read/Grep/Glob; `LS` and `NotebookRead` are the same
+  local reads the existing profiles allow.
+- **Both sides.** Provider: the node is offered only the profile's tools, and a reply calling anything else is blocked
+  (a terminal 400 saying the main loop "reads, plans and delegates only"). Client: the launcher's hook now has matcher
+  `*` and checks every provider-marked call against the record's `tools`, the watcher shape and start_task's refused
+  inputs (docs/BOUNDARY-HOOK.md "The local orchestrator"). Unmarked calls of other tools return at once, unasked.
+  Only in a session launched with a local pick (fix round 1: `*` starts the hook on every Read, about 158 ms each in
+  the reviewer's measurement); cloud picks, the default orchestrator and child tasks keep `Write|Edit|MultiEdit|
+  NotebookEdit|Bash`, as does the mod. A session switched to a local pick mid-way has the narrow hook: the provider's
+  check of every marked call stands alone for the other tools, and there is no watcher.
+- **[ESCALATE] E13** (new): §5 item 2 leaves "may a local orchestrator start tasks with outward effects at all" to the
+  owner. Built: `start_task` with `chrome` (the owner's signed-in browser) or `connectors` (mail, chat, drive servers in
+  the child) is refused on both sides; every other start_task (repo, host, permission mode, local) is allowed, and the
+  child keeps its own guards (auto mode's classifier). Lift the refusal, or refuse more (e.g. `host: here`)?
+  Known, accepted scope (the reviewer's note, fix round 1; the owner is told): this refusal is narrow, not a guarantee
+  of no outward effects. The other start_task arguments can authorise work elsewhere: `host`, `cwd`, `repo` and the
+  task text place, clone and fetch; `orchestrator` picks a cloud model; and `allowed_tools` pre-approves tools in the
+  child, so shell and network work there need not pass the child's auto-mode classifier. That is how delegation
+  normally works, and the local orchestrator gets it as any orchestrator does.
+- **[ESCALATE] E14** (new): E5 (the sensitive rule wins) and E8 (plan and delegate only) meet on a sensitive turn of a
+  local pick. The sensitive profile would allow file writes; delegation would send the sensitive text to a cloud
+  model. Built: the stricter intersection, `orchestrator-sensitive`: read and plan only, no delegation, no shell, on the
+  picked local model (not the node's `sensitive.model`), decided per turn (a later turn the flag or a keyword marks is
+  fenced so, whatever the opener was; a detector that cannot answer counts as sensitive). S1's sensitivity signal is not
+  asked: a local pick is never scored. Should a sensitive turn instead move to the node's sensitive model?
+- **No hook, no shell.** A client without the hook header gets the profile less the Bash family (delegation stays: it
+  needs no client-side path check).
+- **Identity.** The route is `pinned` (no reroute, no S1 continuation re-check, pin wording) but carries
+  `routing.PICK_LOCAL_KEY`, so `server._in_window` keeps it in its own label only: a request of another pick or window
+  with the same history forks instead of continuing it (a `sub/` pin stays in every window).
+- **Launcher.** `5 local` lists the local pins with their node's state (numbers toggle, `a` = any local model, `b` =
+  back); `--route local[:…]` resolves aliases and tags against the provider's local list (offline: as typed). It prints
+  the note "local orchestrator: plan and delegate only …" and starts Claude Code with only the `cortados-route` MCP
+  server (`--strict-mcp-config --mcp-config <0600 file>`: this checkout's `subagent_mcp.py`, the provider URL and the
+  token file's path, never the token) and tool search off, so the delegation tools are in the opening request (the
+  profile has no ToolSearch, and the full connector catalog does not fit a 128k local context). A `--strict-mcp-config`
+  the owner passes is kept as is.
+- **Not built:** the banner's model index and context (§5 item 3); the shadow comparison; the routed-subagents mod's
+  matcher stays narrow (its children are never local picks).
+- **Honest limits.** Read is not confined to the project folder (§5 does not ask it), so a local orchestrator can read
+  any file the client can and put it in a delegated task's text; the delegated child then runs with its own tools and
+  guards. Inside the router checkout itself the hook's self-check (`check_self`) denies the watcher, as it denies Bash
+  and writes there for every boundary turn: use `wait_task` there.
 
 ---
 
@@ -673,7 +751,7 @@ starts the provider.
 | 5 | **Logging and views.** `route_pick` column, rules, Tasks labels, Live/Office fields, dashboard. | Tests: column migrates on an old db; labels only from table ids; Live session view shows the pick; Office badge; nothing request-derived. |
 | 6 | **Launcher.** `--route`, `--route last`, `--no-route-prompt`, interactive prompt on a TTY, `route-pick.json`. | Tests: no prompt without a TTY, under `--print-env`, or for child tasks; `--route R3:opus+sol` → `--model cortados@R3:claude-opus-5-5+gpt-6.1-sol`; conflicts with `--orchestrator-band` refused; pick file 0600 under the settings directory rules; provider unreachable → offline menu. |
 | 7 | **`/route` helper** (per step 0's findings): desktop mod command and, if wanted, a launcher-session mini mod. | Mod tests with the existing harness (`hooks/*.test.ts`): command registered at session start; text only; never claims to have switched unless the host API did. |
-| 8 | **Local picks** (only after E8): `orchestrator` boundary profile, local pick selection, banner. | Tests: profile allowlist exact; client hook denies edits/Bash; pick picks the first available local model; node down → 503 with the node state, no cloud fallback. |
+| 8 | **Local picks** (only after E8): `orchestrator` boundary profile, local pick selection, banner. | Tests: profile allowlist exact; client hook denies edits/Bash; pick picks the first available local model; node down → 503 with the node state, no cloud fallback. **Built 2026-11-25** (§5 "Built"): `tests/test_local_orchestrator.py`. |
 | 9 | **Codex header docs** and the README / ROUTER-DESIGN §13 update. | Docs reviewed; README test count refreshed. |
 
 Steps 1–3 are one PR's worth of risk (routing and identity) and should be reviewed adversarially (identity and
@@ -687,6 +765,16 @@ tests (pick change forks, spellings continue one conversation, `R3` keeps its id
 pick refused before lookup, concurrent identical forks open once, failures and replays scoped to their pick), and the
 E3 tests (an index and a frontier shortfall under `R3:gpt-6.1-sol`-style picks escalate, are recorded and carry the
 notice; an exhausted capable selection refuses and does not escalate; escalation leaves the API lane out).
+
+Built on 2026-11-25 (step 8, branch `local-orchestrator`): §5 "Built" and §4.5. `tests/test_local_orchestrator.py`
+holds the step's acceptance tests: the profile allowlist exact; every refused tool class refused by the provider and by
+the client hook (file writes, other shell commands, Agent, web, other MCP tools, skills, unknown names); delegation
+tools and the watcher allowed; start_task's chrome / connectors refused; no hook → no shell; the first available picked
+model taken in the order typed, a down / unlisted / busy / too-large node skipped and named; no node available → a 503
+naming each node and why, never a cloud route (select is never called); the sensitive rule (a cloud pick unchanged; a
+local pick read-and-plan only, per turn); mixed picks still 400; the Tasks labels; the pick's identity; subagents and
+child tasks free-routed; the launcher's menu, `--route local…`, the MCP config and the note. Steps 1–3's test of the
+refusal became the test that local picks are served.
 
 Built on 2026-11-25 (steps 4–6), with these choices where the text above left room:
 
@@ -703,7 +791,8 @@ Built on 2026-11-25 (steps 4–6), with these choices where the text above left 
   ids are shown only when every one is a table id (`routing.table_model_ids`), else `route pick (<n> models)`. The live
   view's tree group carries `pick` and `pick_route`, and the Office tree allowlist adds `pick` (group and sub-session).
 - **Step 6.** In the menu, Enter with no model selected asks again (it never guesses a set); `5 local` shows the local
-  list and the step-8 note, then returns to the menu; `--route local…` is refused by the launcher with the same note.
+  list and the step-8 note, then returns to the menu; `--route local…` is refused by the launcher with the same note
+  (step 8 replaced both: §5 "Built").
   An end of input or eight invalid answers end the launch without starting Claude Code. `--route` asks the provider
   for its list only when a name is not a launcher alias. **[ESCALATE] E12** (new): `sol` is ambiguous on the provider
   (`gpt-5.6-sol`, `gpt-6-sol`, `gpt-6.1-sol`), so the launcher pins it to `gpt-6.1-sol` (the R3 reference Sol named in
@@ -725,11 +814,11 @@ Built on 2026-11-25 (steps 4–6), with these choices where the text above left 
 | E5 | Default. The sensitive rule wins. | `sensitive_local` still runs; the row says `route pick … overridden: sensitive`. |
 | E6 | Refuse mixed local + cloud picks in v1. The picker is about the orchestrator (main loop) only. | 400 at parse time, both directions. |
 | E7 | Default. Subagents and child tasks stay free-routed. | Unchanged: the pick rides on the main loop's model name only (spike, §3.1). |
-| E8 | A local orchestrator is opt-in under a new `orchestrator` boundary profile (plan and delegate only, §5). A PRIORITY, right after this PR; not built here. | `local[:<models>]` parses and validates (names against the local pins; a broken local config is said as such); selection refuses it with "local orchestrator picks are not enabled yet" (400) until step 8. |
+| E8 | A local orchestrator is opt-in under a new `orchestrator` boundary profile (plan and delegate only, §5). A PRIORITY, right after this PR; not built here. | Steps 1–3: `local[:<models>]` parsed and validated, refused (400). Step 8: served (`routing.choose_local_pick`) under the `orchestrator` profile, enforced by the provider and the client hook (§5 "Built"); new questions E13 and E14 there. |
 | E9 | Default. Desktop: read-only `/route` until step 0 shows otherwise. | Step 0's desktop finding: §1.3 "Spike". |
 | E10 | Default. Keep both `R3` and `R3:*`. | `R3` is today's window, label and identity unchanged; `R3:*` is a list. |
 
-New from step 0: **E11** (below).
+New from step 0: **E11** (below). New from step 6: **E12** (§7). New from step 8: **E13** and **E14** (§5 "Built").
 
 Review of d2b45da (gpt-6.1-sol, fix round 1): E11 is acceptable as documented. The launcher's warning for a `haiku`
 pick stays planned for the launcher step (step 6), and is not built here. Leaving the API credit lane out of an E3

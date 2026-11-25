@@ -469,7 +469,7 @@ class WatchTests(ChildTaskBase):
         self.assertEqual(argv[0], "env")                        # the test env points tasks and hosts elsewhere
         self.assertIn(f"CORTADOS_TASKS_DIR={os.environ['CORTADOS_TASKS_DIR']}", argv)
         self.assertIn(f"CORTADOS_EXEC_HOSTS_FILE={self.hosts_file}", argv)
-        self.assertEqual(argv[-5:], [sys.executable, "-B", str(Path(ct.__file__).resolve()), "--watch", out["task_id"]])
+        self.assertEqual(argv[-5:], [os.path.realpath(sys.executable), "-B", str(Path(ct.__file__).resolve()), "--watch", out["task_id"]])
         self.assertTrue(os.path.isabs(argv[-3]))
         self.assertNotIn("tok-test", cmd)
         # the command really runs, as the orchestrator would run it (a subprocess of this module; the fake child)
@@ -483,7 +483,7 @@ class WatchTests(ChildTaskBase):
     def test_watch_command_has_no_env_prefix_when_the_defaults_are_in_force(self):
         with mock.patch.dict(os.environ, {"CORTADOS_TASKS_DIR": "", "CORTADOS_EXEC_HOSTS_FILE": ""}):
             cmd = ct.watch_command("t20261109000000-000000aa")
-        self.assertEqual(shlex.split(cmd), [sys.executable, "-B", str(Path(ct.__file__).resolve()), "--watch",
+        self.assertEqual(shlex.split(cmd), [os.path.realpath(sys.executable), "-B", str(Path(ct.__file__).resolve()), "--watch",
                                             "t20261109000000-000000aa"])
 
     def test_the_cli_usage_mentions_watch(self):

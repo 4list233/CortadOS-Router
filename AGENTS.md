@@ -59,7 +59,7 @@ is the long form.
   `server.py` HTTP endpoint, `Registry` of conversations and the `Wire` seam; `anthropic_wire.py` (Claude Code,
   `/v1/messages`) and `responses_wire.py` (Codex, `/v1/responses`) turn requests into one `ClientTurn`;
   `routing.py` picks the lane through the router's execution policy; `effect_boundary.py` is the effect boundary of
-  automatically local-routed turns (a profile per bind reason: sensitive = no shell, cost = Bash with best-effort outward patterns; tool allowlist; project-folder path rules for file writes; applied by `local_lane.serve`/`complete`); `sensitive_notice.py` is the "warn, then use cloud" notice of a sensitive-marked request the Pro could
+  automatically local-routed turns (a profile per bind reason: sensitive = no shell, cost = Bash with best-effort outward patterns; orchestrator = a `local[:…]` route pick's main loop, plan and delegate only, with orchestrator-sensitive for its sensitive turns (routing.choose_local_pick, docs/ORCHESTRATOR-ROUTE-PICKER.md §5); tool allowlist; project-folder path rules for file writes; applied by `local_lane.serve`/`complete`); `sensitive_notice.py` is the "warn, then use cloud" notice of a sensitive-marked request the Pro could
   not take (#124: a leading text block / output item, fixed categories only, kept in history exactly as delivered, recorded
   as the routes row's `sensitive_cloud`; docs/LOCAL-RESOURCES.md); `bridge.py` drives a headless Claude CLI with
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
