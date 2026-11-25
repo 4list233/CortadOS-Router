@@ -79,7 +79,7 @@ class SessionTests(unittest.TestCase):
                 # cannot be switched off by a user settings file while the boundary header promises the hook.
                 self.assertIs(data["disableAllHooks"], False)
                 pre = data["hooks"]["PreToolUse"]
-                self.assertEqual(pre[0]["matcher"], "Write|Edit|MultiEdit|NotebookEdit|Bash")
+                self.assertEqual(pre[0]["matcher"], "*")
                 # Isolated (docs/BOUNDARY-HOOK.md "Isolation"): inside the shell guard, from /, an absolute
                 # interpreter, python -I -S.
                 full = pre[0]["hooks"][0]["command"]

@@ -49,8 +49,9 @@ R3_VIEW = {"band": "R3", "errors": [], "cloud": {
     "below_band": [{"id": "gpt-6-sol", "general": 73.6}, {"id": "claude-sonnet-5", "general": 52.8},
                    {"id": "claude-haiku-4-5-20251001", "general": 13.3}]}}
 LOCAL_VIEW = {"band": "local", "errors": [], "local": {
-    "status": "ok", "note": route_options.LOCAL_NOTE, "enabled": False,
-    "models": [{"id": "qwen-27b", "node": "pro", "node_label": "Pro", "state": "switch off"}]}}
+    "status": "ok", "note": route_options.LOCAL_NOTE, "enabled": True,
+    "models": [{"id": "qwen-27b", "tag": "qwen3.8-27b-heretic:q4", "node": "pro", "node_label": "Pro",
+                "state": "switch off"}]}}
 
 
 class RouteBase(unittest.TestCase):
@@ -156,9 +157,11 @@ class RouteFlagTests(RouteBase):
                 self.prepare("--route", "R3:opus", *extra)
         self.assertFalse(os.path.exists(self.sdir) and os.listdir(self.sdir), "no settings file for a refused launch")
 
-    def test_local_picks_refused_with_the_note(self):
-        with self.assertRaisesRegex(session.SessionError, "coming in the next step"):
-            self.prepare("--route", "local:qwen-27b")
+    def test_local_picks_launch_with_the_note(self):
+        # Step 8: a local pick is served (the orchestrator profile); tests/test_local_orchestrator.py has the rest.
+        m, _out, args = self.prepare("--route", "local:qwen-27b")
+        self.assertEqual(m, "cortados@local:qwen-27b")
+        self.assertIn(session.LOCAL_PICK_NOTE, args.route_notes)
 
     def test_a_route_too_long_once_resolved_is_a_clean_error(self):
         # review round 1 (P2): 79 typed characters become 130 once the aliases resolve to table ids, past the
@@ -292,11 +295,11 @@ class MenuTests(RouteBase):
         self.assertEqual(session.load_pick(self.home), want)
         self.assertIn("cortados@" + want, ex.call_args[0][1])
 
-    def test_local_is_shown_with_the_note_and_not_picked(self):
-        m, out, _ = self.prepare(answers="5\n6\n")
+    def test_local_is_shown_with_the_note_and_back_returns_to_the_menu(self):
+        m, out, _ = self.prepare(answers="5\nb\n6\n")
         self.assertEqual(m, "cortados")
-        self.assertIn("  qwen-27b on Pro: switch off", out)
-        self.assertIn("local orchestrator: coming in the next step (plan-and-delegate profile)", out)
+        self.assertIn("  [ ] 1 qwen-27b on Pro: switch off", out)
+        self.assertIn(session.LOCAL_PICK_NOTE, out)
 
     def test_offline_menu_when_the_provider_is_unreachable(self):
         self.offline = True

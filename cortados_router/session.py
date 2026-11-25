@@ -156,8 +156,11 @@ LOCAL_MODES = ("sensitive", "prefer")
 # The provider's effect_boundary.HOOK_HEADER (checked by a test): this session's PreToolUse boundary hook is installed,
 # so a sensitive local-routed turn may offer file writes (docs/BOUNDARY-HOOK.md). Without it such a turn is read-only.
 BOUNDARY_HOOK_HEADER = "x-cortados-boundary-hook"
-# The tools the boundary hook checks: the file writers (path containment on this machine) and Bash (profile).
-BOUNDARY_HOOK_MATCHER = "Write|Edit|MultiEdit|NotebookEdit|Bash"
+# Every tool: the hook checks the file writers (path containment on this machine) and Bash (profile) of any marked
+# call, and since step 8 of the route picker every other tool of a provider-marked call too (a local orchestrator's
+# profile: plan and delegate only, docs/BOUNDARY-HOOK.md). An unmarked call of any other tool returns at once, without
+# asking the provider (boundary_hook.decide).
+BOUNDARY_HOOK_MATCHER = "*"
 
 
 BOUNDARY_HOOK_FILE = Path(__file__).resolve().with_name("boundary_hook.py")
@@ -481,7 +484,15 @@ ROUTE_PROMPT_TRIES = 8             # invalid answers per question before the lau
 PICK_ALIASES = {**routing.SUB_ALIASES, "sol": "gpt-6.1-sol"}
 PIN_PREFIX = routing.SUB_PREFIX
 _PIN_RE = re.compile(r"sub/[a-z0-9][a-z0-9._-]{0,63}")
-LOCAL_PICK_NOTE = "local orchestrator: coming in the next step (plan-and-delegate profile)"
+# Printed at launch for a local pick (E8, step 8): the provider serves it under the orchestrator profile.
+LOCAL_PICK_NOTE = ("local orchestrator: plan and delegate only (it reads, plans and delegates with start_task / "
+                   "route_task; no edits, no shell but the task watcher, no other tool)")
+# The one MCP server a local orchestrator session loads (the delegation tools, effect_boundary.DELEGATION_SERVER), with
+# tool search off so its tools are declared up front: the orchestrator profile has no ToolSearch, and the full
+# connector catalog would not fit a local model's context (TOOL_SEARCH_OFF's comment). Not when the claude args
+# already choose the MCP set (--strict-mcp-config).
+DELEGATION_SERVER = "cortados-route"
+SUBAGENT_MCP_FILE = Path(__file__).resolve().with_name("subagent_mcp.py")
 
 
 class RouteOptionsUnavailable(Exception):
@@ -536,17 +547,40 @@ def resolve_pick_name(name: str, served: list[str] | None) -> str:
     raise SessionError(f"route pick: {name} is not a model the provider serves; name one of: {', '.join(served)}")
 
 
-def canonical_route(text: str, served: list[str] | None = None) -> str:
+def local_ids(view: dict | None) -> list[tuple[str, str]] | None:
+    """(pin id, tag) of every local model a `local` options view lists, or None when it lists none readable."""
+    loc = (view or {}).get("local")
+    if not isinstance(loc, dict):
+        return None
+    got = [(m.get("id"), m.get("tag") or m.get("id")) for m in loc.get("models") or [] if isinstance(m, dict)]
+    got = [(i, t) for i, t in got if isinstance(i, str) and i and isinstance(t, str)]
+    return got or None
+
+
+def resolve_local_name(name: str, local: list[tuple[str, str]] | None) -> str:
+    """One model name of a local pick as its pin id (the alias, else the tag; case-insensitive on either). Offline
+    (`local` None) it goes as typed: the provider checks it against its local pins on the first request."""
+    key = name.strip()
+    if local is None:
+        return key
+    hits = sorted({i for i, t in local if key.casefold() in (i.casefold(), t.casefold())})
+    if len(hits) == 1:
+        return hits[0]
+    raise SessionError(f"route pick: {name} is not a local model of the provider; name one of: "
+                       f"{', '.join(i for i, _t in local)}")
+
+
+def canonical_route(text: str, served: list[str] | None = None, local: list[tuple[str, str]] | None = None) -> str:
     """A --route value (the pick grammar of docs/ORCHESTRATOR-ROUTE-PICKER.md §3.2 without `cortados@`) as the
-    launcher writes it: `any`, a window label (`R3`), `<window>:*`, or `<window>:<ids sorted, joined by +>`. Local picks
-    are refused here (they stay refused by the provider until step 8)."""
+    launcher writes it: `any`, a window label (`R3`), `<window>:*`, `<window>:<ids sorted, joined by +>`, `local` or
+    `local:<pin ids sorted, joined by +>` (step 8: the provider serves a local pick under the orchestrator profile)."""
     try:
         window, kind, names = routing.parse_pick(text)
     except routing.PickError as exc:
         raise SessionError(f"--route {str(text)[:40]!r}: {exc}") from None
     if kind == "local":
-        raise SessionError(f"--route: {LOCAL_PICK_NOTE}; a local main loop is not available yet (pin one local "
-                           "model with --orchestrator <alias>, or pick cloud models)")
+        ids = sorted({resolve_local_name(n, local) for n in names})
+        return "local" + (":" + "+".join(ids) if ids else "")
     wlabel = core.band_window_label(*window) if window else None
     if kind == "window":
         return wlabel or "any"
@@ -587,6 +621,11 @@ def route_notes(model: str) -> list[str]:
     window, kind, names = routing.parse_pick(label)
     w = core.band_window_label(*window) if window else None
     lines = ["main loop: " + model]
+    if kind == "local":
+        lines.append(LOCAL_PICK_NOTE)
+        lines.append("widen mid-session: " + routing.pick_widen(routing.Pick(None, names, local=True, label=label))
+                     .replace("`", ""))
+        return lines
     if kind == "window":
         lines.append(f"widen mid-session: /model cortados@{w}:* (only the models clearing {w}'s reference) or "
                      "/model cortados (free routing)")
@@ -732,7 +771,9 @@ class RoutePrompt:
                 if value is not None:
                     return value
             elif got == "5":
-                self.local()
+                value = self.local()
+                if value is not None:
+                    return value
             elif got == "6":
                 return "any"
             elif got == "7":
@@ -808,15 +849,59 @@ class RoutePrompt:
                     self.say(str(exc))
         raise SessionError("route prompt: no route picked after several tries; nothing launched")
 
-    def local(self) -> None:
+    def local(self) -> str | None:
+        """A local pick (step 8): the local models with their node's state, numbers toggle, a = any local model (the
+        first available, in config order), Enter accepts the selection, b = back to the menu. Offline, or with no
+        local model listed: names typed joined by +, or a."""
         v = self.view("local")
         loc = (v or {}).get("local") or {}
-        for m in loc.get("models") or []:
-            if isinstance(m, dict):
-                self.say(f"  {m.get('id')} on {m.get('node_label') or m.get('node')}: {m.get('state')}")
+        self.say(LOCAL_PICK_NOTE)
         if loc.get("error"):
             self.say("  " + str(loc["error"]))
-        self.say(LOCAL_PICK_NOTE)
+        models = [m for m in loc.get("models") or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        if not models:
+            if v is not None:
+                self.say("  the provider lists no local model (" + str(loc.get("status") or "no local section") + ")")
+            for _ in range(ROUTE_PROMPT_TRIES):
+                got = self.ask("local models joined by + (a = any local model, b = back): ")
+                if got.casefold() == "a":
+                    return "local"
+                if got.casefold() in ("b", ""):
+                    return None
+                try:
+                    return canonical_route("local:" + got, None, None)
+                except SessionError as exc:
+                    self.say(str(exc))
+            return None
+        pre = set()
+        if self.saved and self.saved.startswith("local:"):
+            pre = set(self.saved.split(":", 1)[1].split("+"))
+        chosen = [m["id"] in pre for m in models]
+        for _ in range(ROUTE_PROMPT_TRIES):
+            self.say("local models (state from the nodes' gates)")
+            for i, m in enumerate(models):
+                self.say(f"  [{'x' if chosen[i] else ' '}] {i + 1} {m['id']} on {m.get('node_label') or m.get('node')}"
+                         f": {m.get('state')}")
+            self.say("  a = any local model (the first available)     b = back")
+            self.say("  numbers toggle, Enter accepts")
+            got = self.ask().casefold()
+            if got == "a":
+                return "local"
+            if got == "b":
+                return None
+            if got == "":
+                ids = sorted(m["id"] for m, on in zip(models, chosen) if on)
+                if ids:
+                    return "local:" + "+".join(ids)
+                self.say("select at least one model, or a / b")
+                continue
+            nums = got.replace(",", " ").split()
+            if all(n.isdigit() and 1 <= int(n) <= len(models) for n in nums):
+                for n in nums:
+                    chosen[int(n) - 1] = not chosen[int(n) - 1]
+            else:
+                self.say(f"numbers 1-{len(models)}, a, b, or Enter")
+        return None
 
     def pin(self) -> str | None:
         served = served_ids(self.view("R0"))
@@ -892,7 +977,13 @@ def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetc
                 served = served_ids(fetch("R0"))
             except RouteOptionsUnavailable:
                 served = None                    # offline: aliases and ids as typed; the provider checks them
-        return canonical_route(args.route, served)
+        local = None
+        if kind == "local" and names:
+            try:                                 # the provider's local pins resolve aliases and tags
+                local = local_ids(fetch("local"))
+            except RouteOptionsUnavailable:
+                local = None                     # offline: as typed; the provider checks them
+        return canonical_route(args.route, served, local)
     if (explicit or args.no_route_prompt or args.print_env or args.run_id or args.project_dir or args.eager_tools
             or not (_tty(stdin) and _tty(out))):
         return None
@@ -912,6 +1003,20 @@ def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetc
     if value is not None:
         out.write("→ claude --model " + route_model(value) + "\n")
     return value
+
+
+def is_local_route(route: str | None) -> bool:
+    """Whether a route value is a local pick (`local`, `local:<ids>`)."""
+    return isinstance(route, str) and (route == "local" or route.startswith("local:"))
+
+
+def delegation_mcp_config(provider_url: str, token_file: str) -> dict:
+    """The --mcp-config of a local orchestrator session: only DELEGATION_SERVER, this checkout's subagent_mcp.py run
+    by this launcher's interpreter (both absolute), told the provider's URL and the token FILE (never the token)."""
+    return {"mcpServers": {DELEGATION_SERVER: {
+        "command": os.path.realpath(sys.executable), "args": ["-B", str(SUBAGENT_MCP_FILE)],
+        "env": {"CORTADOS_PROVIDER_URL": provider_url,
+                "CORTADOS_PROVIDER_TOKEN_FILE": os.path.abspath(os.path.expanduser(token_file))}}}}
 
 
 def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home: str | None = None,
@@ -943,6 +1048,10 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
         if not args.no_gate:
             directive += f"\nThis session allows {args.delegate_budget} direct work calls per prompt before delegation is required."
     office = args.office_header
+    if is_local_route(route) and not mcp_filtered(extra):
+        # A local orchestrator: only the delegation server, its tools declared up front (DELEGATION_SERVER's comment).
+        mcp_path = write_settings(args.settings_dir or SETTINGS_DIR, delegation_mcp_config(url, args.token_file), home)
+        extra = list(extra) + [STRICT_MCP_FLAG, "--mcp-config", mcp_path]
     eager = bool(args.eager_tools or mcp_filtered(extra))      # a bounded MCP catalog only (TOOL_SEARCH_OFF)
     check_managed(set(launcher_env(url, token, args.delegate_budget, args.run_id, office, args.local,
                                    eager_tools=eager)), managed_dirs)
