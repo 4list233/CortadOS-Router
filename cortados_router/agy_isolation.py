@@ -454,6 +454,16 @@ def scrub_account(text: str) -> str:
     return EMAIL.sub("<account>", text)
 
 
+def banner_tier(text: str) -> str | None:
+    """The tier word ("Pro" / "Ultra") of the start-up banner's account line in `text` (raw or scrubbed), else None.
+
+    The ONE account-line proof (#144 fix round): the tier check below, the probe's boot readiness and the clearing of
+    agy's transient "not signed in" notice all call this. A bare email anywhere else on screen (a "Choose account"
+    picker, a sign-in prompt) is not an account line and never counts."""
+    m = TIER_PATTERN.search(scrub_account(text))
+    return m.group(1) if m else None
+
+
 def check_subscription(banner: str, usage: str = "") -> str:
     """The personal tier agy's start-up banner shows ("AI Pro" / "AI Ultra"), or SubscriptionUnproven. The tier is read
     from `banner` only (the account line `<email> (Google AI Pro)`); both `banner` and `usage` (the /usage answer) are
@@ -465,10 +475,10 @@ def check_subscription(banner: str, usage: str = "") -> str:
     if bad:
         raise SubscriptionUnproven("agy's screen names a non-subscription login or billing "
                                    f"({re.sub(r'[^a-z ]', ' ', bad.group(0).lower()).strip()!r}); refused")
-    m = TIER_PATTERN.search(banner_text)
-    if not m:
+    word = banner_tier(banner)
+    if not word:
         raise SubscriptionUnproven("agy's start-up banner shows no personal Google AI subscription tier; refused")
-    tier = f"AI {m.group(1).title()}"
+    tier = f"AI {word.title()}"
     if not TIER_PATTERN_CONFIRMED:
         raise SubscriptionUnproven(f"tier {tier!r} matched a pattern not confirmed for this agy version; refused")
     return tier

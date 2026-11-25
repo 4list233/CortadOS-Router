@@ -257,6 +257,46 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(cm.exception.kind, "not-logged-in")
         self.assertEqual(self.keys(log), b"")
 
+    # ---- #144 fix round 1: only the banner's account line (`<email> (Google AI Pro)`) counts as signed in. A bare email
+    # elsewhere (an account picker) neither ends the boot read nor clears the notice, and gets ZERO keystrokes.
+    PICKER = "Choose account: test@example.invalid\n  1. test@example.invalid\n  2. Use another account\n"
+
+    def test_account_picker_email_after_the_notice_gets_no_keystroke(self):
+        for screens in ({"boot": SIGNING_IN + self.PICKER},
+                        {"boot": SIGNING_IN, "boot_later": [self.PICKER]}):
+            binary, log = self.fake({**screens, "usage": FIXTURE.read_text()})
+            with self.subTest(screens=screens), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual(cm.exception.kind, "not-logged-in")
+                self.assertEqual(self.keys(log), b"")
+                self.assertEqual(cm.exception.typed, [])
+
+    def test_account_picker_email_without_the_notice_gets_no_keystroke(self):
+        binary, log = self.fake({"boot": "Antigravity CLI 1.5.16\n" + self.PICKER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(iso.SubscriptionUnproven):
+                sc._antigravity()
+        self.assertEqual(self.keys(log), b"")
+
+    def test_bare_email_is_not_boot_ready_or_settled_but_the_banner_is(self):
+        self.assertFalse(sc.AGY_BOOT_READY("Choose account: test@example.invalid"))
+        self.assertTrue(sc.AGY_BOOT_READY(BANNER))
+        self.assertTrue(sc._agy_unsettled(SIGNING_IN + "Choose account: test@example.invalid\n"))
+        self.assertFalse(sc._agy_unsettled(SIGNING_IN + BANNER))
+        self.assertFalse(sc._agy_unsettled(BANNER))
+        self.assertTrue(sc._agy_unsettled(BANNER + "You are not signed in.\n"))    # a notice AFTER the banner is unsettled
+
+    def test_signed_out_screen_is_refused_promptly(self):
+        binary, log = self.fake({"boot": LOGGED_OUT, "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertLess(time.time() - t0, 5)            # refused on sight, not after the 12 s boot window
+        self.assertEqual((cm.exception.kind, self.keys(log)), ("not-logged-in", b""))
+
     @staticmethod
     def short_boot(real):
         return lambda *a, **k: real(*a, **{**k, "boot_s": 3})
