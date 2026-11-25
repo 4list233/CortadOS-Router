@@ -533,25 +533,159 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
         self.assertEqual(workspace.stat().st_mode & 0o777, 0o755)
 
-    def test_leftovers_in_the_folder_are_killed_under_the_lock(self):
-        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+    # ---------------------------------------------------------------- fix round 6: fd-bound folder, no kill by cwd
+    def make_folder(self) -> tuple[Path, Path, Path]:
         root, workspace, lock = sc.agy_probe_paths()
-        seen = []
-        real = sc._reaper.probe_cwd_pids
+        workspace.mkdir(parents=True)
+        os.chmod(root, 0o700); os.chmod(workspace, 0o700)
+        return root, workspace, lock
 
-        def spy(probe_dir, only_dir=None):
-            import fcntl
-            probe = os.open(lock, os.O_RDWR)
-            try:
-                with self.assertRaises(BlockingIOError):       # the probe holds the lock while it looks
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                os.close(probe)
-            seen.append((Path(probe_dir), Path(only_dir) if only_dir else None))
-            return real(probe_dir, only_dir)
-        with self.env(binary), mock.patch.object(sc._reaper, "probe_cwd_pids", spy):
+    def sleeper(self, cwd: Path):
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(cwd))
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        deadline = time.time() + 10          # its identity is readable once ps sees it
+        while sc._reaper.process_identity(proc.pid) is None and time.time() < deadline:
+            time.sleep(0.05)
+        return proc
+
+    def write_record(self, root: Path, rec: dict) -> None:
+        p = root / sc.AGY_PROBE_CHILD_RECORD
+        p.write_text(json.dumps(rec)); os.chmod(p, 0o600)
+
+    def test_process_open_in_the_folder_skips_the_sample_and_is_not_killed(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = self.make_folder()
+        proc = self.sleeper(workspace)       # e.g. the owner's own agy during the one-time trust step
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_folder_busy")
+        self.assertEqual(sc.LANE_STATE_TEXT["probe_folder_busy"], "skipped: a process is open in the probe folder")
+        time.sleep(0.3)
+        self.assertIsNone(proc.poll())       # still running: never killed
+        self.assertEqual(self.keys(log), b"")
+
+    def test_recorded_probe_child_still_alive_is_killed(self):
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)        # the dead sampler's child, outside the folder (its cwd is not the proof)
+        uid, start = sc._reaper.process_identity(proc.pid)
+        self.write_record(root, {"pid": proc.pid, "uid": uid, "start": start})
+        with sc.agy_probe_workspace():
+            pass
+        self.assertEqual(proc.wait(timeout=5), -9)
+        self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_recycled_pid_is_not_killed(self):
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)
+        uid, _ = sc._reaper.process_identity(proc.pid)
+        for rec in ({"pid": proc.pid, "uid": uid, "start": "Thu Jan  1 00:00:00 2026"},       # other start time
+                    {"pid": proc.pid, "uid": uid + 1, "start": sc._reaper.process_identity(proc.pid)[1]}):  # other uid
+            with self.subTest(rec=rec):
+                self.write_record(root, rec)
+                with sc.agy_probe_workspace():
+                    pass
+                time.sleep(0.3)
+                self.assertIsNone(proc.poll())
+                self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_the_probe_records_its_child_and_drops_the_record_after(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, _, _ = sc.agy_probe_paths()
+        seen = []
+        real = sc.agy_probe_workspace.record_child
+
+        def spy(ws, pid):
+            real(ws, pid)
+            seen.append((pid, json.loads((root / sc.AGY_PROBE_CHILD_RECORD).read_text()),
+                         oct((root / sc.AGY_PROBE_CHILD_RECORD).stat().st_mode & 0o777)))
+        with self.env(binary), mock.patch.object(sc.agy_probe_workspace, "record_child", spy):
             sc._antigravity()
-        self.assertIn((root, workspace), seen)
+        [(pid, rec, mode)] = seen
+        self.assertEqual((rec["pid"], rec["uid"], mode), (pid, os.geteuid(), "0o600"))
+        self.assertTrue(rec["start"])
+        self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_the_end_of_probe_cleanup_never_kills_by_cwd(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc._reaper, "probe_cwd_pids",
+                                                 side_effect=AssertionError("no kill by cwd")):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+
+    def test_ancestor_writable_by_others_is_refused(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        for mode in (0o775, 0o757, 0o777):
+            with self.subTest(mode=oct(mode)):
+                shared = self.tmp / f"shared-{mode:o}"
+                (shared / "state").mkdir(parents=True)
+                os.chmod(shared, mode)
+                with self.env(binary), mock.patch.object(sc, "STATE", shared / "state"), \
+                        mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                    with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                        sc._antigravity()
+                self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
+                self.assertIn("writable by others", str(cm.exception))
+
+    def test_ancestor_rule(self):
+        import stat as st_
+        me = os.geteuid()
+
+        def st(uid, mode):
+            return os.stat_result((st_.S_IFDIR | mode, 0, 0, 2, uid, 0, 0, 0, 0, 0))
+        self.assertTrue(sc._ancestor_ok(st(0, 0o755)))
+        self.assertTrue(sc._ancestor_ok(st(me, 0o700)))
+        self.assertTrue(sc._ancestor_ok(st(0, 0o1777)))         # /private/tmp
+        self.assertFalse(sc._ancestor_ok(st(0, 0o777)))         # writable, not sticky
+        self.assertFalse(sc._ancestor_ok(st(me, 0o1777)))       # sticky but not root's
+        self.assertFalse(sc._ancestor_ok(st(me, 0o775)))
+        self.assertFalse(sc._ancestor_ok(st(me + 1, 0o755)))    # another user's
+
+    def test_state_under_the_sticky_root_owned_tmp_is_allowed(self):
+        base = Path(tempfile.mkdtemp(dir="/tmp"))                # /tmp -> private/tmp: root's link, root's sticky dir
+        self.addCleanup(shutil.rmtree, base, True)
+        os.chmod(base, 0o700)
+        with mock.patch.object(sc, "STATE", base / "state"), sc.agy_probe_workspace() as folder:
+            self.assertEqual(folder, base / "state" / "agy-probe" / "workspace")
+
+    def swap_before_fork(self, swap):
+        """Run the probe with `swap()` called just before the fork (in cwd_check, after every folder check and the lock)."""
+        real = iso.check_dotenv
+        calls = []
+
+        def hook(home, workdir):
+            calls.append(workdir)
+            if len(calls) == 2:          # 1: prepare(), before the folder is opened; 2: cwd_check, just before the fork
+                swap()
+            return real(home, workdir)
+        return mock.patch.object(iso, "check_dotenv", hook)
+
+    def test_workspace_replaced_by_a_symlink_after_the_checks_does_not_move_the_child(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, _ = self.make_folder()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+
+        def swap():
+            workspace.rename(root / "workspace-checked")
+            workspace.symlink_to(elsewhere)
+        with self.env(binary), self.swap_before_fork(swap):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(root / "workspace-checked"))
+
+    def test_state_dir_swapped_after_the_lock_has_no_effect(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, _ = self.make_folder()
+        moved = self.tmp / "state-moved"
+
+        def swap():
+            sc.STATE.rename(moved)
+            (sc.STATE / "agy-probe" / "workspace").mkdir(parents=True)
+        with self.env(binary), self.swap_before_fork(swap):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(moved / "agy-probe" / "workspace"))
+        self.assertFalse((moved / "agy-probe" / sc.AGY_PROBE_CHILD_RECORD).exists())   # cleared through the dir fd
+        self.assertFalse((sc.STATE / "agy-probe" / sc.AGY_PROBE_CHILD_RECORD).exists())
 
     def test_slow_start_up_does_not_eat_the_boot_window(self):
         # the boot window starts when the CLI first paints: a 2.5 s start-up under a 3 s window still reads the banner
@@ -563,9 +697,9 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(rec["tier"], "AI Pro")
         self.assertEqual(self.keys(log), b"/usage\r")
 
-    def test_other_clis_trust_answer_read_shares_one_boot_window(self):
-        # claude / codex / cursor still answer their trust prompt (answer_trust, as on main); the read after the answer
-        # gets what is left of the one boot window, not a fresh one
+    def test_other_clis_trust_answer_read_gets_a_fresh_boot_window_as_on_main(self):
+        # claude / codex / cursor still answer their trust prompt (answer_trust, as on main), and the read after the
+        # answer gets a fresh boot_s, as on main (#144 fix round 6 restored main's timing)
         binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST]})
         sc.tui_capture([binary], "/usage", "never", {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, boot_s=3,
                        run_s=0.5, inherit_path=False)
@@ -573,9 +707,9 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(reads[0][1], "b'\\r'")
         enter_at = float(reads[0][0])
         usage_at = next(float(t) for t, d in reads[1:] if "/" in d)
-        # the boot read (trust painted 0.6 s in, then 1.5 s quiet) used ~2.1 s of the 3 s window, so /usage follows the
-        # Enter within ~0.9 s; a fresh window would wait the full 3 s
-        self.assertLess(usage_at - enter_at, 2.0)
+        # nothing is painted after the Enter, so the read after it waits its whole window: a fresh 3 s (a shared window
+        # would have had only ~0.9 s left)
+        self.assertGreaterEqual(usage_at - enter_at, 2.8)
 
     # agy 1.5.16 signed out, drawn to a headless child on the Air (2026-11-25; described, no email): alternate screen,
     # logo, the notice, a "Signing in..." spinner, then a bare CR overwriting it with the login-method picker.

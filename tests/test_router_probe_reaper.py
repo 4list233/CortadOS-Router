@@ -134,3 +134,40 @@ class ProbeReaper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixedFolderHelpers(unittest.TestCase):
+    """#144 fix round 6: the agy probe's shared fixed folder is checked read-only and never swept by cwd."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="probe-reaper-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(self.tmp))
+        self.addCleanup(lambda: (self.proc.poll() is None and self.proc.kill(), self.proc.wait()))
+        deadline = time.time() + 10
+        while reaper.process_identity(self.proc.pid) is None and time.time() < deadline:
+            time.sleep(0.05)
+
+    def test_cwd_pids_in_lists_any_command(self):
+        deadline = time.time() + 10
+        while self.proc.pid not in reaper.cwd_pids_in(self.tmp) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertIn(self.proc.pid, reaper.cwd_pids_in(self.tmp))      # python, not one of PROBE_COMMANDS
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertEqual(reaper.cwd_pids_in(empty), [])
+
+    def test_process_identity(self):
+        uid, start = reaper.process_identity(self.proc.pid)
+        self.assertEqual(uid, os.geteuid())
+        self.assertRegex(start, r"\d{4}$")
+        self.proc.kill(); self.proc.wait()
+        self.assertIsNone(reaper.process_identity(self.proc.pid))
+
+    def test_reap_without_a_probe_dir_kills_no_bystander_by_cwd(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(self.tmp))
+        r, w = os.pipe()
+        os.close(w)
+        reaper.reap(child.pid, r, None)
+        self.assertIsNotNone(child.poll())                # the probe's own child: reaped
+        self.assertIsNone(self.proc.poll())               # a process in the same folder: untouched

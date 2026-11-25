@@ -179,7 +179,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
                 refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = (),
                 refusal_facts: Callable[[str], dict[str, Any]] | None = None,
-                answer_trust: bool = True, workdir: Path | None = None) -> str:
+                answer_trust: bool = True, workdir: Path | None = None, workdir_fd: int | None = None,
+                on_spawn: Callable[[int], None] | None = None, on_reaped: Callable[[int], None] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown (answer_trust), type
     `command`, return the screen text.
 
@@ -191,7 +192,12 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     Its message says truly what had been typed by then. An exec failure raises ProbeExecFailed instead of returning an
     empty screen. inherit_path=False runs argv[0] as given (an absolute path), never searched on PATH.
     `workdir`: run in this existing folder, as is (the agy lane's fixed, locked, trusted probe folder; the caller owns
-    it and its lock). Unset: a fresh per-probe folder under PROBE_DIR, removed afterwards.
+    it and its lock). Unset: a fresh per-probe folder under PROBE_DIR, removed afterwards. `workdir_fd`: the caller's
+    verified open fd of that folder; the child fchdirs into it rather than resolving the path again (#144 fix round 6).
+    With `workdir`, the end-of-probe cleanup kills the CLI and its descendants only, never other processes by cwd: the
+    folder is shared with the owner's own agy (the one-time trust step).
+    `on_spawn(pid)` runs right after the fork (the agy lane records its child's pid and start time); `on_reaped(pid)`
+    after the child was reaped.
     `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
     navigation key, never text) or None when done; at most `page_max` presses.
     `cwd_check(folder)` runs on the probe folder before the fork; raising refuses the start (the agy lane's dotenv
@@ -203,7 +209,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144).
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
     The boot window starts when the CLI first paints (its own start-up is waited for separately, up to boot_s); the read
-    after a trust answer gets what is left of that one window.
+    after a trust answer (answer_trust only) gets a fresh boot_s, as on main (#144 fix round 6 restored it).
     A ProbeRefused carries `facts`: fixed names and numbers only (which check, mid-read or about to act, ready seen,
     seconds since start, trust_prompt_seen), plus `refusal_facts(screen)` when given; never screen text."""
     if workdir is None:
@@ -212,7 +218,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         my_dir.mkdir(exist_ok=True)
         reap_root, own_dir = PROBE_DIR, True
     else:
-        my_dir, reap_root, own_dir = Path(workdir), Path(workdir).parent, False
+        # reap_root None: no cwd sweep at the end (only the CLI's own process tree is killed)
+        my_dir, reap_root, own_dir = Path(workdir), None, False
     if cwd_check is not None:
         try:
             cwd_check(my_dir)
@@ -225,7 +232,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     pid, fd = pty.fork()
     if pid == 0:
         try:
-            os.chdir(my_dir)
+            if workdir_fd is not None:
+                os.fchdir(workdir_fd)            # the verified folder itself, never the path resolved again
+            else:
+                os.chdir(my_dir)
             child_env = {**env, "TERM": "xterm-256color"}
             if inherit_path:
                 os.execvpe(argv[0], argv, child_env)
@@ -238,7 +248,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 pass
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
-    _reaper.track(pid, fd, my_dir, reap_root)
+    _reaper.track(pid, fd, my_dir if reap_root is not None else None, reap_root)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
     buf = b""
     eof = False
@@ -319,15 +329,18 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             elif len(buf) > mark and time.time() - last > quiet_s:
                 return
     mark = 0
-    # One boot window for the read before AND after a trust answer, started when the CLI first paints: its own
+    # The boot window starts when the CLI first paints: its own
     # start-up (a cold binary, an interpreter on a loaded machine) is waited for separately, up to boot_s, so it never
     # eats the window in which its screens are judged (#144 fix round 3: a fake agy that started 3 s late was read as an
     # empty screen). Nothing painted within boot_s: an empty window, as before. Deny-all is unchanged by when it starts.
+    # The read after a trust answer (claude / codex / cursor only) gets a fresh boot_s, as on main (#144 fix round 6).
     boot_end = time.time() + boot_s
 
     def boot_left() -> float:
         return max(0.0, boot_end - time.time())
     try:
+        if on_spawn is not None:
+            on_spawn(pid)
         first_paint, _, _ = select.select([fd], [], [], boot_s)
         boot_end = time.time() + (boot_s if first_paint else 0.0)
         pump(boot_left(), until=ready)
@@ -340,7 +353,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         if answer_trust and trust_seen():
             stage = "trust"
             send(b"\r", "Enter (workspace trust)")
-            pump(boot_left(), until=ready, mark=len(buf))
+            pump(boot_s, until=ready, mark=len(buf))      # a fresh window, as on main (#144 fix round 6)
             startup_chars = len(_plain(buf))
             ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
             refused("trust")
@@ -398,7 +411,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                                trust_prompt_seen=trust_seen())
             if eof and stage in {"boot", "trust"}:
                 diagnostics["boot_failure"] = _boot_failure_kind(_plain(buf))
-        _reaper.reap(pid, fd, reap_root, my_dir)
+        _reaper.reap(pid, fd, reap_root, my_dir if reap_root is not None else None)
+        if on_reaped is not None:
+            on_reaped(pid)
         if own_dir:
             try:
                 os.rmdir(my_dir)
@@ -771,6 +786,8 @@ LANE_STATE_TEXT = {
     "probe_folder_not_clean": "refused: probe folder not empty",
     "probe_folder_unsafe": "refused: probe folder not private",
     "probe_busy": "skipped: another probe holds the probe folder",
+    "probe_folder_busy": "skipped: a process is open in the probe folder",
+    "probe_folder_unchecked": "refused: open processes in the probe folder could not be listed",
 }
 
 
@@ -832,8 +849,14 @@ class ProbeFolderRefused(RuntimeError):
 
 
 class ProbeSkipped(RuntimeError):
-    """Another probe holds the fixed folder's lock: this sample is skipped (not a failure; the last reading stays)."""
+    """This sample is skipped (not a failure; the last reading stays): another probe holds the fixed folder's lock
+    (`probe_busy`), or a process has its cwd in the folder (`probe_folder_busy`, #144 fix round 6)."""
     kind = "probe_busy"
+
+    def __init__(self, message: str, kind: str | None = None):
+        super().__init__(message)
+        if kind:
+            self.kind = kind
 
 
 def agy_probe_paths() -> tuple[Path, Path, Path]:
@@ -842,110 +865,260 @@ def agy_probe_paths() -> tuple[Path, Path, Path]:
     return root, root / "workspace", root / "lock"
 
 
-def _check_no_symlinked_ancestor(path: Path) -> None:
-    """Every component of `path` is a real directory, never a symlink, except one owned by root (macOS's own /var and
-    /tmp links: only root can change them, and root owns the machine anyway). A user-owned link anywhere on the way
-    could point the probe, and the owner's one-time trust, at a different folder."""
+# The probe's own child, recorded inside agy-probe (opened by its dir fd) as {"pid", "uid", "start"} while it runs, so a
+# sampler that died mid-probe leaves a record the next run can act on. The next run kills ONLY a process matching that
+# exact pid AND start time AND uid (#144 fix round 6: killing by cwd would have hit the owner's own agy during the
+# one-time trust step, and a recycled pid is never the probe's).
+AGY_PROBE_CHILD_RECORD = "probe-child"
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+_MAX_SYMLINK_HOPS = 40
+
+
+def _unsafe(message: str) -> ProbeFolderRefused:
+    return ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {message}")
+
+
+def _ancestor_ok(st: os.stat_result) -> bool:
+    """An ancestor of `$CORTADOS_HOME` no one else can rename things in: owned by root or this user and not group/other
+    -writable, unless root owns it and it is sticky (/tmp, /private/tmp: only an entry's owner can rename or remove it).
+    Reason (#144 fix round 6): a shared writable non-sticky parent lets another user replace the state dir."""
+    if st.st_uid not in (0, os.geteuid()):
+        return False
+    if not st.st_mode & 0o022:
+        return True
     import stat as _stat
-    p = Path(os.path.abspath(path))
-    cur = Path(p.anchor)
-    for part in p.parts[1:]:
-        cur = cur / part
-        st = os.lstat(cur)
-        if _stat.S_ISLNK(st.st_mode):
-            if st.st_uid != 0:
-                raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {cur} is a symlink")
-        elif not _stat.S_ISDIR(st.st_mode):
-            raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {cur} is not a directory")
+    return st.st_uid == 0 and bool(st.st_mode & _stat.S_ISVTX)
 
 
-def _check_private_dir(path: Path, mode_mask: int) -> None:
-    """A real directory (lstat: not a symlink) owned by this user with none of `mode_mask`'s permission bits."""
+def _open_state_dir(path: Path) -> int:
+    """Open `path` ($CORTADOS_HOME) as a directory fd, walking from / one component at a time, each opened relative to
+    the verified fd of its parent (O_NOFOLLOW) and fstat-checked on the fd: every ancestor passes _ancestor_ok; a symlink
+    on the way is followed only when root owns it (macOS's /var and /tmp; it sits in a verified directory, so only root
+    can change it); the state dir itself is owned by this user and not group/other-writable. Returns the fd (caller
+    closes); the checks are bound to the fd, not re-resolved by name later."""
     import stat as _stat
-    st = os.lstat(path)
-    if not _stat.S_ISDIR(st.st_mode):
-        raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {path} is not a real directory")
-    if st.st_uid != os.geteuid():
-        raise ProbeFolderRefused("probe_folder_unsafe", f"agy probe folder refused: {path} is not owned by this user")
-    if st.st_mode & mode_mask:
-        raise ProbeFolderRefused("probe_folder_unsafe",
-                                 f"agy probe folder refused: {path} has mode {oct(st.st_mode & 0o777)}")
-
-
-def _make_private_dir(path: Path) -> None:
-    """mkdir 0700 if missing (chmod after: mkdir's mode is masked by the umask); an existing one is checked, never fixed."""
+    comps = [c for c in str(os.path.abspath(path)).split("/") if c]
+    fd = os.open("/", _DIR_FLAGS)
+    where, hops = "/", 0
     try:
-        os.mkdir(path, 0o700)
+        if not _ancestor_ok(os.fstat(fd)):
+            raise _unsafe("/ is writable by others")
+        while comps:
+            name = comps.pop(0)
+            if name == ".":
+                continue
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if _stat.S_ISLNK(st.st_mode):
+                if st.st_uid != 0:
+                    raise _unsafe(f"{os.path.join(where, name)} is a symlink")
+                hops += 1
+                if hops > _MAX_SYMLINK_HOPS:
+                    raise _unsafe(f"too many symlinks under {where}")
+                target = os.readlink(name, dir_fd=fd)
+                if target.startswith("/"):
+                    os.close(fd)
+                    fd, where = os.open("/", _DIR_FLAGS), "/"
+                if not _ancestor_ok(os.fstat(fd)):
+                    raise _unsafe("/ is writable by others")
+                comps = [c for c in target.split("/") if c] + comps
+                continue
+            if not _stat.S_ISDIR(st.st_mode):
+                raise _unsafe(f"{os.path.join(where, name)} is not a directory")
+            nfd = os.open(name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd, where = nfd, os.path.join(where, name)
+            fst = os.fstat(fd)
+            if not _stat.S_ISDIR(fst.st_mode):
+                raise _unsafe(f"{where} is not a directory")
+            if comps and not _ancestor_ok(fst):
+                raise _unsafe(f"{where} is writable by others (an ancestor of the state dir)")
+        fst = os.fstat(fd)
+        if fst.st_uid != os.geteuid():
+            raise _unsafe(f"{path} is not owned by this user")
+        if fst.st_mode & 0o022:
+            raise _unsafe(f"{path} has mode {oct(fst.st_mode & 0o777)}")
+        return fd
+    except ProbeFolderRefused:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
+        raise _unsafe(f"{where}: {type(exc).__name__}") from None
+
+
+def _open_private_child(parent_fd: int, name: str, label: Path) -> int:
+    """Make `name` 0700 under parent_fd if missing (fchmod after: mkdir's mode is masked by the umask), open it with
+    O_NOFOLLOW relative to parent_fd and check owner and mode on the fd (an existing one is checked, never fixed)."""
+    import stat as _stat
+    created = True
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
     except FileExistsError:
-        return
-    os.chmod(path, 0o700)
-
-
-def _kill_leftovers(root: Path, workspace: Path) -> int:
-    """Kill agy helpers still running in the folder (orphans of a sampler that died mid-probe). Called under the lock,
-    so no live probe is in there."""
-    killed = 0
-    for p in _reaper.probe_cwd_pids(root, workspace):
-        if p == os.getpid():
-            continue
-        try:
-            os.kill(p, signal.SIGKILL)
-            killed += 1
-        except OSError:
-            pass
-    return killed
+        created = False
+    except OSError as exc:
+        raise _unsafe(f"{label}: {type(exc).__name__}") from None
+    try:
+        fd = os.open(name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:           # ELOOP: a symlink; ENOTDIR: not a directory
+        raise _unsafe(f"{label} is not a real directory ({type(exc).__name__})") from None
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISDIR(st.st_mode):
+            raise _unsafe(f"{label} is not a real directory")
+        if st.st_uid != os.geteuid():
+            raise _unsafe(f"{label} is not owned by this user")
+        if created:
+            os.fchmod(fd, 0o700)
+            st = os.fstat(fd)
+        if st.st_mode & 0o077:
+            raise _unsafe(f"{label} has mode {oct(st.st_mode & 0o777)}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class agy_probe_workspace:
-    """Context manager: make and check the fixed folder, take its exclusive lock (at most AGY_PROBE_LOCK_WAIT_S, else
-    ProbeSkipped), kill leftovers, require it empty (ProbeFolderRefused `probe_folder_not_clean`), yield the folder;
-    release the lock on exit. Nothing here starts agy."""
+    """Context manager: open and check the fixed folder by fd (_open_state_dir, _open_private_child), take its exclusive
+    lock (opened relative to the agy-probe fd; at most AGY_PROBE_LOCK_WAIT_S, else ProbeSkipped `probe_busy`), kill the
+    previous run's recorded child if it still runs (exact pid + start time + uid only), skip the sample
+    (`probe_folder_busy`) if any process has its cwd in the folder, require it empty (ProbeFolderRefused
+    `probe_folder_not_clean`), yield the folder's path; `workspace_fd` is the verified folder the child fchdirs into.
+    Release the lock and close every fd on exit. Nothing here starts agy."""
 
     def __init__(self, wait_s: float | None = None):
         self.wait_s = AGY_PROBE_LOCK_WAIT_S if wait_s is None else wait_s
-        self.fd: int | None = None
+        self.fd: int | None = None            # the lock
+        self.root_fd: int | None = None       # agy-probe
+        self.workspace_fd: int | None = None  # agy-probe/workspace
+
+    def _close(self) -> None:
+        for attr in ("fd", "workspace_fd", "root_fd"):
+            v = getattr(self, attr)
+            if v is not None:
+                try:
+                    os.close(v)               # closing the lock fd drops the flock
+                except OSError:
+                    pass
+                setattr(self, attr, None)
 
     def __enter__(self) -> Path:
+        import stat as _stat
         root, workspace, lock = agy_probe_paths()
         STATE.mkdir(parents=True, exist_ok=True)
-        _make_private_dir(root)
-        _make_private_dir(workspace)
-        _check_no_symlinked_ancestor(workspace)
-        _check_private_dir(STATE, 0o022)          # others can't rename agy-probe away
-        _check_private_dir(root, 0o077)
-        _check_private_dir(workspace, 0o077)
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
         try:
-            import stat as _stat
-            st = os.fstat(fd)
+            state_fd = _open_state_dir(STATE)
+            try:
+                self.root_fd = _open_private_child(state_fd, root.name, root)
+            finally:
+                os.close(state_fd)
+            self.workspace_fd = _open_private_child(self.root_fd, workspace.name, workspace)
+            try:
+                self.fd = os.open(lock.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                                  0o600, dir_fd=self.root_fd)
+            except OSError as exc:
+                raise _unsafe(f"lock {type(exc).__name__}") from None
+            st = os.fstat(self.fd)
             if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
                 raise ProbeFolderRefused("probe_folder_unsafe", "agy probe lock refused: not a regular file of this user")
             deadline = time.monotonic() + self.wait_s
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
                         raise ProbeSkipped(f"agy probe skipped: another probe held {lock} for {self.wait_s:g} s")
                     time.sleep(0.2)
-            _kill_leftovers(root, workspace)
-            entries = [e for e in os.listdir(workspace) if e not in AGY_WORKSPACE_LEFTOVERS]
+            self._kill_recorded_child()
+            try:
+                busy = _reaper.cwd_pids_in(workspace)
+            except Exception as exc:
+                raise ProbeFolderRefused("probe_folder_unchecked",
+                                         f"agy probe folder: open processes could not be listed ({type(exc).__name__}); "
+                                         "agy was not started") from None
+            if busy:
+                # a count only; never killed: it may be the owner's own agy (the one-time trust step), not the probe's
+                raise ProbeSkipped(f"agy probe skipped: {len(busy)} process(es) open in {workspace}; agy was not started",
+                                   kind="probe_folder_busy")
+            entries = [e for e in os.listdir(self.workspace_fd) if e not in AGY_WORKSPACE_LEFTOVERS]
             if entries:
                 # a count only: names in the folder are not ours to echo into records
                 raise ProbeFolderRefused("probe_folder_not_clean",
                                          f"agy probe folder not empty: {len(entries)} entries in {workspace}; "
                                          "agy was not started")
         except BaseException:
-            os.close(fd)
+            self._close()
             raise
-        self.fd = fd
         return workspace
 
     def __exit__(self, *exc) -> None:
-        if self.fd is not None:
-            os.close(self.fd)                       # closing drops the flock
-            self.fd = None
+        self._close()
+
+    # ------------------------------------------------------------------ the probe child's record (#144 fix round 6)
+    def _read_record(self) -> dict | None:
+        import stat as _stat
+        try:
+            rfd = os.open(AGY_PROBE_CHILD_RECORD, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                          dir_fd=self.root_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _unsafe(f"child record {type(exc).__name__}") from None
+        try:
+            st = os.fstat(rfd)
+            if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+                raise _unsafe("child record is not a regular file of this user")
+            raw = os.read(rfd, 4096)
+        finally:
+            os.close(rfd)
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+            if isinstance(rec, dict) and isinstance(rec.get("pid"), int) and isinstance(rec.get("uid"), int) \
+                    and isinstance(rec.get("start"), str) and rec["pid"] > 1:
+                return rec
+        except ValueError:
+            pass
+        return {}                      # unreadable: names no process; removed below
+
+    def _kill_recorded_child(self) -> None:
+        """Kill the previous run's probe child (and its descendants) only while a process still matches the record's
+        pid, start time and uid; then drop the record. A process that cannot be identified keeps the record."""
+        rec = self._read_record()
+        if rec is None:
+            return
+        if rec:
+            ident = _reaper.process_identity(rec["pid"])         # raises if ps could not run: the record stays
+            if ident is not None and ident == (rec["uid"], rec["start"]) and rec["uid"] == os.geteuid():
+                for p in [*_reaper.descendants(rec["pid"]), rec["pid"]]:
+                    try:
+                        os.kill(p, signal.SIGKILL)
+                    except OSError:
+                        pass
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and _reaper.process_identity(rec["pid"]) == ident:
+                    time.sleep(0.1)
+        self.clear_child()
+
+    def record_child(self, pid: int) -> None:
+        """Called by tui_capture right after the fork: write the child's pid, uid and start time."""
+        ident = _reaper.process_identity(pid)
+        if ident is None:
+            raise RuntimeError("agy probe child could not be identified right after start")
+        data = json.dumps({"pid": pid, "uid": ident[0], "start": ident[1]}).encode()
+        wfd = os.open(AGY_PROBE_CHILD_RECORD, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+                      | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=self.root_fd)
+        try:
+            os.write(wfd, data)
+        finally:
+            os.close(wfd)
+
+    def clear_child(self, pid: int | None = None) -> None:
+        """Drop the record (tui_capture calls it after the child was reaped)."""
+        try:
+            os.unlink(AGY_PROBE_CHILD_RECORD, dir_fd=self.root_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _antigravity() -> dict[str, Any]:
@@ -969,11 +1142,13 @@ def _antigravity() -> dict[str, Any]:
     # A refused screen at any point (boot, after /usage, while paging) raises ProbeRefused from inside the capture,
     # before the probe's next keystroke. Before the banner's account line is proven nothing at all is typed: a trust
     # prompt refuses `workspace_not_trusted` (answer_trust=False), never answered.
-    with agy_probe_workspace() as folder:
+    ws = agy_probe_workspace()
+    with ws as folder:
         text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
                            ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag, page=_agy_next_page,
                            cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
-                           refusal_facts=agy_refusal_facts, answer_trust=False, workdir=folder)
+                           refusal_facts=agy_refusal_facts, answer_trust=False, workdir=folder,
+                           workdir_fd=ws.workspace_fd, on_spawn=ws.record_child, on_reaped=ws.clear_child)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")

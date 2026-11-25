@@ -33,7 +33,7 @@ _active: dict[int, tuple[int, Path | None, Path]] = {}      # child pid -> (pty 
 _active_lock = threading.Lock()
 
 
-def track(pid: int, fd: int, my_dir: Path | None, probe_dir: Path) -> None:
+def track(pid: int, fd: int, my_dir: Path | None, probe_dir: Path | None) -> None:
     """Record a running probe so a process exit mid-probe still reaps it."""
     with _active_lock:
         _active[pid] = (fd, my_dir, probe_dir)
@@ -92,14 +92,52 @@ def probe_cwd_pids(probe_dir: Path, only_dir: Path | None = None) -> list[int]:
     return pids
 
 
+# Absolute paths (macOS's own): the probe's checks never depend on the caller's PATH, which a sampler may have narrowed.
+LSOF = "/usr/sbin/lsof"
+PS = "/bin/ps"
+
+
+def cwd_pids_in(folder: Path) -> list[int]:
+    """Every process (any command) whose cwd is `folder` or inside it, as lsof lists them. Raises when lsof could not run
+    (the caller must not read a failed listing as "nobody there"). Read-only: the agy probe skips its sample on a hit and
+    never kills what it finds (#144 fix round 6). As a non-root user lsof lists the user's own processes; another user
+    cannot enter the 0700 folder anyway."""
+    r = subprocess.run([LSOF, "-a", "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=20)
+    if r.returncode not in (0, 1):            # 1: nothing matched (or some processes not readable); output still valid
+        raise RuntimeError(f"lsof exited {r.returncode}")
+    pids, cur = [], None
+    for line in r.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            cur = int(line[1:])
+        elif line.startswith("n") and cur and _inside(line[1:], folder):
+            pids.append(cur)
+    return sorted(set(pids))
+
+
+def process_identity(pid: int) -> tuple[int, str] | None:
+    """(uid, start time) of a live process from ps, or None when no such process. The start time is ps's `lstart` (to the
+    second): with the pid and uid it tells the probe's own child from an unrelated process that reused its pid. Raises
+    when ps could not run."""
+    r = subprocess.run([PS, "-o", "uid=,lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=10,
+                       env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+    line = r.stdout.strip()
+    if r.returncode != 0 or not line:
+        if r.returncode in (0, 1) and not line:
+            return None
+        raise RuntimeError(f"ps exited {r.returncode}")
+    uid, _, start = line.partition(" ")
+    return int(uid), " ".join(start.split())
+
+
 def _inside(path: str, folder: Path) -> bool:
     """lsof prints resolved paths (/private/var/… for /var/…), so compare against the resolved folder."""
     folder_s = os.path.realpath(folder)
     return path == folder_s or path.startswith(folder_s + os.sep)
 
 
-def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None:
-    """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder. 2026-09-26: the old killpg left 437 orphaned
+def reap(pid: int, fd: int, probe_dir: Path | None, my_dir: Path | None = None) -> None:
+    """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder (not when probe_dir is None:
+    the agy probe's shared fixed folder). 2026-09-26: the old killpg left 437 orphaned
     claude/agy/cursor/codex helpers (load 63, gateway liveness kills). Order matters on macOS: close the PTY master before waiting."""
     untrack(pid)
     tree = descendants(pid)
@@ -126,6 +164,8 @@ def reap(pid: int, fd: int, probe_dir: Path, my_dir: Path | None = None) -> None
         except ChildProcessError:
             break
         time.sleep(0.1)
+    if probe_dir is None:                          # a shared fixed folder (the agy probe): never kill by cwd (#144 round 6)
+        return
     for p in probe_cwd_pids(probe_dir, my_dir):     # this probe's own leftovers only (2026-09-28: a shared folder let concurrent probes kill each other → EIO)
         if p != os.getpid():
             try:
