@@ -161,7 +161,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
                 refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
                 page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
-                cwd_check: Callable[[Path], None] | None = None) -> str:
+                cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -172,7 +172,9 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `page(text)` reads a scrollable answer: called with the answer so far, it returns (key, name) to press next (a
     navigation key, never text) or None when done; at most `page_max` presses.
     `cwd_check(folder)` runs on the per-probe folder after it is made and before the fork; raising refuses the start
-    (the agy lane's dotenv guard, #144 round 3)."""
+    (the agy lane's dotenv guard, #144 round 3).
+    `on_boot(text)` gets the start-up screen (banner, trust prompt) once, just before `command` is typed: what the
+    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144)."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -273,6 +275,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 mark = len(buf)
                 return ""
         mark = len(buf)
+        if on_boot is not None:
+            on_boot(_plain(buf))
         stage = "command"
         send(command.encode(), repr(command))
         pump(3, quiet_s=1.0, mark=mark)
@@ -663,10 +667,11 @@ def _antigravity() -> dict[str, Any]:
     binary, env = iso.prepare(_env_get("CORTADOS_AGY_BIN") or env_file.get("CORTADOS_AGY_BIN"), os.environ, env_file,
                               workdir=PROBE_DIR)
     diag: dict = {}
+    boot: list[str] = []          # the start-up banner, in memory only: the tier is read from it below, never stored
     # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
     # capture, before the probe's next keystroke.
     text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag,
-                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d))
+                       page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=boot.append)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
             raise ProbeExecFailed(f"agy exited at {diag.get('stage')} with no usable output")
@@ -681,8 +686,9 @@ def _antigravity() -> dict[str, Any]:
     if gaps:
         raise ProbePartialReading("agy /usage read only in part: " + "; ".join(gaps))
     # agy stores no auth mode in its settings (#144 round 2): the personal subscription is proven from its own screen,
-    # last, so a screen problem above is reported as itself. PROVISIONAL tier pattern: refuses until confirmed [ESCALATE].
-    tier = iso.check_subscription(text)
+    # last, so a screen problem above is reported as itself. The tier is on the start-up banner (`<email> (Google AI
+    # Pro)`), not in the /usage box; both are checked for a non-subscription login.
+    tier = iso.check_subscription("\n".join(boot), text)
     wins = []
     labels = agy_group_labels(groups)     # unknown groups kept under fixed labels only (#144 round 4)
     for g, ws in groups.items():

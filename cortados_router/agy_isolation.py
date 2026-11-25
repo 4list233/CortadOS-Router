@@ -28,7 +28,7 @@ The rules, each with its reason:
      refused (`forbidden-env`). The launch folder is a fixed parent we own plus an empty per-run folder, so the walk is
      the same on every run.
   4b. SUBSCRIPTION PROOF (`check_subscription`): agy stores no auth mode, so the probe proves the personal Google AI
-     subscription from agy's own screen (tier line; never the account email). PROVISIONAL pattern, refusing [ESCALATE].
+     subscription from agy's own start-up banner (`<email> (Google AI Pro)`; the email is scrubbed, never kept).
   5. ONE LAUNCH PATH (`prepare`): rules 1-4a run, in that order, before every agy process: the quota probe
      (scarcity._antigravity) and `agy models` (`run_models`, the CLI `python3 -B -m cortados_router.agy_isolation models`
      that bin/refresh-inventory.sh calls).
@@ -428,17 +428,20 @@ def check_dotenv(home: str | os.PathLike, workdir: str | os.PathLike) -> None:
 
 
 # --------------------------------------------------------------------------------------------- subscription login proof
-# agy's settings hold no auth mode, so the Google AI subscription login is proven from what agy itself SHOWS: the /usage
-# box ("Models & Quota", an "Account:" line, the tier / plan text) and its banner. Read-only evidence; the account email
-# is matched and dropped (`scrub_account`), never stored, logged or echoed.
+# agy's settings hold no auth mode, so the Google AI subscription login is proven from what agy itself SHOWS. The tier is
+# on the start-up banner, the account line under "Antigravity CLI 1.5.16": `<email> (Google AI Pro)`. The /usage
+# "Models & Quota" box shows only `Account: <email>`, no tier (owner's agy 1.5.16 screens, 2026-11-24; fixture
+# tests/fixtures/agy-banner.txt). Read-only evidence; the account email is matched and dropped (`scrub_account`) before
+# anything is checked, never stored, logged or echoed.
 #
-# [ESCALATE] PROVISIONAL: no captured agy 1.5.16 screen with the tier line exists in this repository (the fixtures are
-# reconstructed). TIER_PATTERN is a guess at its wording, so TIER_PATTERN_CONFIRMED stays False and the lane REFUSES
-# ("subscription-unproven") even when the pattern matches, until the owner's scrubbed /usage paste confirms the line
-# (docs/AGY-LANE.md). Then pin TIER_PATTERN to it and set the flag True.
-TIER_PATTERN_CONFIRMED = False
-# Personal Google AI subscription tiers only. Ultra is a personal tier too (same login, same billing path).
-TIER_PATTERN = re.compile(r"\b(?:Google\s+)?AI\s+(Pro|Ultra)\b", re.I)
+# Confirmed against the owner's agy 1.5.16 banner on 2026-11-24 (#144). The flag stays so a future agy whose banner
+# changes can be put back to refusing in one line.
+TIER_PATTERN_CONFIRMED = True
+# The banner's account line, after the scrub: `<account> (Google AI Pro)`. Personal Google AI subscription tiers only;
+# Ultra is a personal tier too (same login, same billing path). Any other parenthesised text (a free / enterprise tier, no
+# tier at all) does not match and refuses. Horizontal whitespace only (`[ \t]`, never `\s`, which matches newlines): the tier
+# must sit on the account line itself; a tier on a later line, LF or CRLF, is not this account's tier and refuses.
+TIER_PATTERN = re.compile(r"<account>[ \t]*\([ \t]*Google[ \t]+AI[ \t]+(Pro|Ultra)[ \t]*\)", re.I)
 # Any of these on agy's screen means the session bills outside a personal subscription: refused even with a tier shown.
 NON_SUBSCRIPTION = re.compile(
     r"\bapi[\s_-]?key\b|\bvertex\b|\benterprise\b|pay[\s-]*as[\s-]*you[\s-]*go|application default credentials"
@@ -451,22 +454,23 @@ def scrub_account(text: str) -> str:
     return EMAIL.sub("<account>", text)
 
 
-def check_subscription(screen: str) -> str:
-    """The personal tier agy's screen shows ("AI Pro" / "AI Ultra"), or SubscriptionUnproven. Refused when the screen
-    names an API key / Vertex / enterprise / pay-as-you-go / Cloud billing, shows no tier, or while the tier pattern is
-    provisional (TIER_PATTERN_CONFIRMED False). Messages hold fixed words and the tier only, never screen text."""
-    text = scrub_account(screen)
-    bad = NON_SUBSCRIPTION.search(text)
+def check_subscription(banner: str, usage: str = "") -> str:
+    """The personal tier agy's start-up banner shows ("AI Pro" / "AI Ultra"), or SubscriptionUnproven. The tier is read
+    from `banner` only (the account line `<email> (Google AI Pro)`); both `banner` and `usage` (the /usage answer) are
+    checked for a non-subscription login: an API key / Vertex / enterprise / pay-as-you-go / Cloud billing anywhere
+    refuses. Also refused: no tier, an unknown tier, or TIER_PATTERN_CONFIRMED False. Messages hold fixed words and the
+    tier only, never screen text."""
+    banner_text = scrub_account(banner)
+    bad = NON_SUBSCRIPTION.search(banner_text + "\n" + scrub_account(usage))
     if bad:
         raise SubscriptionUnproven("agy's screen names a non-subscription login or billing "
                                    f"({re.sub(r'[^a-z ]', ' ', bad.group(0).lower()).strip()!r}); refused")
-    m = TIER_PATTERN.search(text)
+    m = TIER_PATTERN.search(banner_text)
     if not m:
-        raise SubscriptionUnproven("agy's screen shows no personal Google AI subscription tier; refused")
+        raise SubscriptionUnproven("agy's start-up banner shows no personal Google AI subscription tier; refused")
     tier = f"AI {m.group(1).title()}"
     if not TIER_PATTERN_CONFIRMED:
-        raise SubscriptionUnproven(f"tier line {tier!r} matched a PROVISIONAL pattern, not yet confirmed against a "
-                                   "captured agy 1.5.16 screen; refused until confirmed [ESCALATE]")
+        raise SubscriptionUnproven(f"tier {tier!r} matched a pattern not confirmed for this agy version; refused")
     return tier
 
 
