@@ -258,6 +258,12 @@ def _open_file(name: str, dir_fd: int, flags: int, mode: int = 0o600) -> int:
     return fd
 
 
+def open_store_file(name: str, dir_fd: int, flags: int) -> int:
+    """Public form of _open_file for other append-only stores under $CORTADOS_HOME (provider/transcripts.py): the same
+    checks (no symlink, no FIFO, one hard link, 0600 when created)."""
+    return _open_file(name, dir_fd, flags)
+
+
 def _append_at(dfd: int, name: str, data: str) -> None:
     fd = _open_file(name, dfd, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
     try:

@@ -60,6 +60,8 @@ is the long form.
   `mcp_shim.py` serving the client's tools; `codex_bridge.py` drives `codex app-server` with the client's tools as
   dynamic tools, under the isolation policy of `codex_isolation.py` (command line, config and login checks, aliases).
   `child_env.py` is the environment allowlist every backend CLI the provider starts runs on (#106).
+  `transcripts.py` keeps every Codex-backed conversation as a local, redacted, append-only transcript
+  (`$CORTADOS_HOME/transcripts/codex/<day>/<id>.jsonl`; Codex threads stay ephemeral; README "Transcripts kept").
   `office.py` is the Office view (`GET /v1/cortados/office`; its rooms are `GET /v1/cortados/office/tree`,
   `live.office_tree`: the orchestrator tree allowlisted to Office metadata under `office:read`, #77,
   integrations/office-claw3d/FLOORS-DESIGN.md §8; metadata-only floors per routing session, fed by the

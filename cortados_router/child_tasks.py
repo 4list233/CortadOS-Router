@@ -2663,6 +2663,10 @@ EXPORT_SCHEMA = "cortados.task-run/1"
 EXPORT_ENV = "CORTADOS_TASK_EXPORT"         # a file path; unset: paths.state_dir()/EXPORT_FILE
 EXPORT_FILE = os.path.join("exports", "task-runs.jsonl")
 PARENT_ENV = "CORTADOS_PARENT_TASK_ID"      # set by a launching session that is itself a task (start_task arg wins)
+# JSON string-literal layers the credential-key scrub unwinds (json.dumps of json.dumps of an object is one): real
+# tool output nests JSON text in a string once or twice; four leaves room, and a deeper chain is withheld rather than
+# passed through unscrubbed (transcript review round 2).
+KEYED_STRING_LAYERS = 4
 EXPORT_TEXT_CHARS = 32_000                  # per text field (prompt, a tool input string, a tool result, the result)
 EXPORT_MAX_EVENTS = 2_000                   # per record; later events are counted in events_dropped, not written
 EXPORT_LOCK_WAIT_S = 30                     # an export lock held longer than this is a stuck writer: fail, retry later
@@ -2708,6 +2712,28 @@ SCRUB_PATTERNS = (
 SCRUB_SLACK_CHARS = 4_096                    # scrubbed past the cap, so a secret straddling the cut is still caught
 _TOKEN_CHARS = string.ascii_letters + string.digits + "._~+/=-"   # a secret's characters: stripped at a scrub cut
 SCRUB_KEYS = ("authorization", "proxy-authorization", "x-api-key")   # a dict value under such a key is scrubbed whole
+# Other credential-named keys, compared with case, `-`, `_`, `.` and spaces removed: a value under a key ending in one
+# of these (api_key, apiKey, X-Api-Key, access_token, client_secret, Set-Cookie, ...) or named exactly as in
+# CREDENTIAL_KEY_NAMES is a credential whatever its shape, and every string inside it (a list of cookies, a nested
+# credentials object) is scrubbed whole (transcript review round 1: a nested `x-api-key` kept its opaque value).
+CREDENTIAL_KEY_SUFFIXES = ("apikey", "authorization", "token", "secret", "password", "passwd", "cookie", "privatekey",
+                           "credential", "credentials")
+CREDENTIAL_KEY_NAMES = ("auth", "pass", "pwd")
+_KEY_PUNCT = re.compile(r"[-_. ]")
+
+
+def _credential_key_kind(key):
+    """The scrub kind of a dict key naming a credential: "authorization" (SCRUB_KEYS, the original set),
+    "credential" (CREDENTIAL_KEY_SUFFIXES / _NAMES), else None."""
+    if not isinstance(key, str):
+        return None
+    low = key.lower()
+    if low in SCRUB_KEYS:
+        return "authorization"
+    norm = _KEY_PUNCT.sub("", low)
+    if norm in CREDENTIAL_KEY_NAMES or norm.endswith(CREDENTIAL_KEY_SUFFIXES):
+        return "credential"
+    return None
 _ALREADY_MASKED = re.compile(r"\s*(?:[A-Za-z]+\s+)?(?:\*\*\*|\[scrubbed:[a-z_]+\])\s*")
 
 
@@ -2769,6 +2795,7 @@ class _Cap:
         self.limit = EXPORT_TEXT_CHARS if limit is None else limit
         self.truncated = 0
         self.scrubbed = {}
+        self.withheld = 0                       # values _keyed_json could not walk safely, replaced by WITHHELD
 
     def _mark(self, kind: str) -> str:
         self.scrubbed[kind] = self.scrubbed.get(kind, 0) + 1
@@ -2816,20 +2843,72 @@ class _Cap:
             s = self.scrub_one(kind, rx, s)
         return s
 
-    def _keyed(self, key, v: str):
-        """A value under an Authorization-like key is a credential whatever its shape: scrubbed whole."""
-        if isinstance(key, str) and key.lower() in SCRUB_KEYS and v and not _ALREADY_MASKED.fullmatch(v):
-            return self._mark("authorization")
+    def _keyed(self, kind, v: str):
+        """A string under a credential-named key (`kind` from _credential_key_kind, inherited by everything nested
+        under that key) is a credential whatever its shape: scrubbed whole."""
+        if kind and v and not _ALREADY_MASKED.fullmatch(v):
+            return self._mark(kind)
         return None
 
-    def scrub_tree(self, v, key=None):
+    def _keyed_walk(self, v, kind=None):
+        """`v` (decoded JSON) with every string under a credential-named key scrubbed whole, at any depth, JSON text
+        held in a string included; the same object when nothing changed."""
         if isinstance(v, str):
-            keyed = self._keyed(key, v)
-            return keyed if keyed is not None else self.scrub(v)
+            if kind:
+                keyed = self._keyed(kind, v)
+                return keyed if keyed is not None else v
+            return self._keyed_json(v)
         if isinstance(v, list):
-            return [self.scrub_tree(x) for x in v]
+            out = [self._keyed_walk(x, kind) for x in v]
+            return v if all(a is b for a, b in zip(out, v)) else out
         if isinstance(v, dict):
-            return {self.scrub(str(k)): self.scrub_tree(x, str(k)) for k, x in v.items()}
+            out = {k: self._keyed_walk(x, kind or _credential_key_kind(k)) for k, x in v.items()}
+            return v if all(out[k] is x for k, x in v.items()) else out
+        return v
+
+    def _withhold(self) -> str:
+        """redact.WITHHELD itself (callers test identity), counted."""
+        self.withheld += 1
+        return redact.WITHHELD
+
+    def _keyed_json(self, s: str, layers: int = 0) -> str:
+        """JSON object or array text with credential-keyed values scrubbed (re-encoded only when one was). A JSON
+        string literal (JSON text encoded again, e.g. json.dumps(json.dumps(obj))) is decoded and treated the same way,
+        up to KEYED_STRING_LAYERS layers, and re-encoded when its content changed; past that, a literal still holding
+        JSON-looking text is WITHHELD (fail closed), as is JSON too deep to decode or walk. Other text, or text that does
+        not decode, is unchanged (the shape scrub still runs on it)."""
+        if s.lstrip()[:1] not in ("{", "[", '"'):
+            return s
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return s
+        except RecursionError:
+            return self._withhold()
+        try:
+            if isinstance(obj, str):
+                if layers >= KEYED_STRING_LAYERS:
+                    return self._withhold() if obj.lstrip()[:1] in ("{", "[", '"') else s
+                inner = self._keyed_json(obj, layers + 1)
+                if inner is redact.WITHHELD:
+                    return inner                # the whole chain is withheld, not a quoted marker inside it
+                return s if inner is obj else json.dumps(inner)
+            if not isinstance(obj, (dict, list)):
+                return s
+            walked = self._keyed_walk(obj)
+            return s if walked is obj else json.dumps(walked)
+        except RecursionError:
+            return self._withhold()
+
+    def scrub_tree(self, v, key=None, kind=None):
+        kind = kind or _credential_key_kind(key)
+        if isinstance(v, str):
+            keyed = self._keyed(kind, v)
+            return keyed if keyed is not None else self.scrub(self._keyed_json(v))
+        if isinstance(v, list):
+            return [self.scrub_tree(x, kind=kind) for x in v]
+        if isinstance(v, dict):
+            return {self.scrub(str(k)): self.scrub_tree(x, str(k), kind) for k, x in v.items()}
         return v
 
     def cut(self, s: str, total=None) -> str:
@@ -2845,20 +2924,22 @@ class _Cap:
         anyway, and the slack still catches a secret that straddles the cut. When the prefix was cut and the scrub
         shrank it, its trailing run of token characters goes too: it may be a secret's start, too short for its
         pattern, that the shrink moved in front of the cap (#91 review round 3, P2)."""
+        s = self._keyed_json(s)
         n, end = len(s), self.limit + SCRUB_SLACK_CHARS
         head = self.scrub(s[:end])
         if n > end and len(head) < end:
             head = head.rstrip(_TOKEN_CHARS)
         return self.cut(head, n)
 
-    def tree(self, v, key=None):
+    def tree(self, v, key=None, kind=None):
+        kind = kind or _credential_key_kind(key)
         if isinstance(v, str):
-            keyed = self._keyed(key, v)
+            keyed = self._keyed(kind, v)
             return keyed if keyed is not None else self.text(v)
         if isinstance(v, list):
-            return [self.tree(x) for x in v]
+            return [self.tree(x, kind=kind) for x in v]
         if isinstance(v, dict):
-            return {self.text(str(k)): self.tree(x, str(k)) for k, x in v.items()}
+            return {self.text(str(k)): self.tree(x, str(k), kind) for k, x in v.items()}
         return v
 
 
@@ -3077,7 +3158,8 @@ def build_export_record(d: str, meta: dict, res: dict, red: "Redactor", router_r
             **({"withheld_fields": withheld_fields} if withheld_fields else {}),
             "prompt": prompt, "events": events, "event_counts": counts,
             **({"events_dropped": dropped} if dropped else {}),
-            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra, "truncated": cap.truncated,
+            "redact_unparsed_lines": unparsed, "withheld": unparsed + extra + cap.withheld,
+            "truncated": cap.truncated,
             "scrubbed": dict(sorted(cap.scrubbed.items()))}
 
 
@@ -3259,6 +3341,47 @@ def _current_redactor(red=None) -> "Redactor":
     return Redactor([t for t in toks if len(t) >= MIN_TOKEN_LEN])
 
 
+def provider_redactor(extra=()) -> "Redactor":
+    """Public: the run export's known-credential Redactor for another append-only record kept on this host (the
+    provider's Codex transcripts, provider/transcripts.py): this process's credentials (launch env, the host's token
+    env and file) plus `extra` (e.g. the provider's own owner token). Tokens shorter than MIN_TOKEN_LEN are not
+    provider tokens and are left out, as _current_redactor does."""
+    return _current_redactor(redact.Redactor([t for t in extra if t]))
+
+
+def redact_for_export(red: "Redactor", value, limit=None, *, prose: bool = False):
+    """Public: the run export's redaction of one decoded value, for other records kept for Grounds (#91's rules, one
+    implementation): redact_record (every known credential, structurally; JSON-looking text that does not decode is
+    WITHHELD, fail closed), then _Cap (well-known secret shapes scrubbed, each text capped at `limit`, default
+    EXPORT_TEXT_CHARS). Returns (value, withheld, scrubbed counts by type, truncated count).
+    prose: `value` is a free-form message text, which may well start with `[`, `{` or `"`: redacted structurally when
+    it decodes, else as TEXT (every credential at every ESCAPE_DEPTH escaping), as redact_record treats the result
+    prose, instead of being withheld whole."""
+    cleaned, withheld = redact_known(red, value, prose=prose)
+    out, scrubbed, truncated, cap_withheld = cap_for_export(cleaned, limit)
+    return out, withheld + cap_withheld, scrubbed, truncated
+
+
+def redact_known(red: "Redactor", value, *, prose: bool = False):
+    """Public: redact_for_export's first half, (cleaned, withheld): every known credential removed (see there). A
+    caller that must treat parts of one structure differently (prose texts inside structured data) runs this per part
+    and then cap_for_export ONCE over the whole structure, so the credential-key scrub sees every key at every depth."""
+    if prose and isinstance(value, str):
+        cleaned, withheld = red.deep_count(value)
+        if withheld:
+            cleaned, withheld = _text_result(red, value)
+        return cleaned, withheld
+    return redact_record(red, value)
+
+
+def cap_for_export(value, limit=None):
+    """Public: redact_for_export's second half, for already-redacted values: (value, scrubbed counts, truncated,
+    withheld). withheld counts JSON text the credential-key scrub could not walk safely (too many string-literal
+    layers, too deep), replaced by WITHHELD."""
+    cap = _Cap(limit)
+    return cap.tree(value), dict(cap.scrubbed), cap.truncated, cap.withheld
+
+
 def _runner_router_run(meta: dict, task_id: str) -> dict:
     """The provider's run record, fetched by the runner with its own launch env (the provider forgets it on restart,
     so it is taken while the run is fresh). A login-mode task never went through the provider."""
@@ -3407,9 +3530,13 @@ WITHHELD_EVENT = json.dumps({"type": "cortados_withheld", "reason": redact.WITHH
 
 def _text_result(red: "Redactor", text):
     """The child's final result text, redacted as TEXT (each credential at every ESCAPE_DEPTH escaping): (text, 0),
-    or (WITHHELD, 1) only if text() cannot run on it."""
+    or (WITHHELD, 1) if text() cannot run on it or a credential is left in an encoded spelling (red.encoded_hit:
+    unicode or percent escapes, base64; transcript review round 1)."""
     try:
-        return red.text(text), 0
+        out = red.text(text)
+        if red.encoded_hit(out):
+            return redact.WITHHELD, 1
+        return out, 0
     except Exception:
         return redact.WITHHELD, 1
 

@@ -695,6 +695,27 @@ class TaskExportTests(ChildTaskBase):
         ("jwt", "t=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl;", "t=[scrubbed:jwt];"),
     ]
 
+    def test_encoded_credentials_and_credential_keys_are_caught_in_the_export_too(self):
+        # Transcript review round 1: one redactor for the export and the Codex transcripts.
+        import base64
+        tok = "export-owner-token-0123456789abcdef"
+        red = ct.Redactor([tok])
+        uni = "".join("\\u%04x" % ord(c) for c in tok)
+        pct = "".join("%%%02X" % ord(c) for c in tok)
+        for text in (f"done {uni}", f"see ?t={pct}", "b64 " + base64.b64encode(tok.encode()).decode()):
+            with self.subTest(text=text):
+                self.assertEqual(ct._text_result(red, text), (ct.redact.WITHHELD, 1))
+                self.assertEqual(ct.redact_record(red, {"type": "x", "v": text}), ({"type": "x", "v": ct.redact.WITHHELD}, 1))
+        self.assertEqual(ct._text_result(red, "100% plain"), ("100% plain", 0))
+        cap = ct._Cap()
+        self.assertEqual(cap.tree({"a": [{"b": {"API_KEY": "v1", "Set-Cookie": ["c1", "c2"]}}],
+                                   "t": json.dumps({"client_secret": "v3"}), "token_count": 3, "tokenizer": "bpe"}),
+                         {"a": [{"b": {"API_KEY": "[scrubbed:credential]",
+                                       "Set-Cookie": ["[scrubbed:credential]", "[scrubbed:credential]"]}}],
+                          "t": json.dumps({"client_secret": "[scrubbed:credential]"}), "token_count": 3,
+                          "tokenizer": "bpe"})
+        self.assertEqual(cap.scrubbed, {"credential": 4})
+
     def test_each_scrub_pattern(self):
         for kind, text, want in self.SCRUB_CASES:
             with self.subTest(kind=kind, text=text):
