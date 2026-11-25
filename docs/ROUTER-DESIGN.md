@@ -697,7 +697,7 @@ The 2026-11-23 audit (#143) found every S1-routed call of a 400-call sample goin
 
 Replay of the audit week's 6,530 S1-routed calls on the copied Air state (before → after): Codex 100 % → 57 %, Claude B 0 % → 39 %, Astra 8.7 % → 22.8 %, API 0 % → 3.4 %, Claude A 0 → 0, Fable 0 → 0 (Opus on B is cheaper on the same all-models week; see the handback of #143).
 
-## 13. Band window (owner 2026-11-23: a routed orchestrator, "Opus-equivalent: smart, but not R3")
+## 13. Band window (owner 2026-11-23: a routed orchestrator, "Opus-equivalent: smart, but not R3"; default R3, the Opus 5.5 / Sol 6.1 band, since 2026-11-24)
 
 `core.resolve(band_window=(lo, hi))` clamps the band S1 picks into `[lo, hi]`. It reuses the batch cap's two steps
 rather than adding a third path. Above `hi`, the band is capped and the difficulty counts as `core.band_max_D(hi)`
@@ -705,8 +705,15 @@ rather than adding a third path. Above `hi`, the band is capped and the difficul
 
 - the provider's `x-cortados-band` header (both wires), or an Anthropic-wire model named `cortados@<window>`; the two
   must agree, and an invalid window is a 400;
-- `python3 -m cortados_router.session --orchestrator cortados [--orchestrator-band R2|R1-R2|any]`. The default is
-  R2, and the window rides only on the main loop's `--model` (README "Whole session on the router" says why);
+- `python3 -m cortados_router.session --orchestrator cortados [--orchestrator-band R3|R2-R3|any]`. The default is
+  R3 (owner 2026-11-24; R2 from 2026-11-23, then R4 from 762a5c4 the same day), and the window rides only on the main loop's `--model`
+  (README "Whole session on the router" says why). R3 is the band of Opus 5.5 and Sol 6.1: `tiering.band_references`
+  R3 = claude-opus-5 / gpt-5.6-sol / gpt-6.1-sol, R4 = claude-fable-5-1 / gpt-6-astra. R4 was the wrong default: R4
+  is reached only by escalation, and `required_index` gives it no band floor (`band != "R4"`), so an R4 window
+  required only the D-interpolated index and routed easy turns to Haiku 5.5 (shadow run on throwaway state, code at
+  D 2: R3 requires 66.2 and picks Sonnet 5.5 or Sol 6.1, R4 requires 14.2 and picks Haiku 5.5). Within R3, S1's band
+  is never above the window (R4's `when` is `never`), so D is not capped and `ceiling_work` (planning/research D ≥ 7,
+  code D ≥ 9) and `ceiling_underuse` (D ≥ 8) still send turns to Opus 5.5, Fable or Astra when admissible;
 - `execution_routing.select(constraints={'band_window': (lo, hi)})` for in-process hosts.
 
 Precedence, strongest first. None of the hard rules in section 5 changed.

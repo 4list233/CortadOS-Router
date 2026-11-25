@@ -349,9 +349,19 @@ What runs where:
   provider's own `sub/` alias table (`routing.SUB_ALIASES`): `opus` = `claude-opus-5-5`, `sonnet` = `claude-sonnet-5`,
   `haiku` = `claude-haiku-4-5-20251001`; any other Claude id gets `sub/` prepended. No S1. `--orchestrator cortados` lets S1 route the main loop too.
 - **Routed main loop in a band window:** `--orchestrator cortados` routes the main loop through S1 and scarcity (the
-  cheapest capable model wins) but only inside a band window, by default exactly **R4**, the Opus 5.5 / Sol 6.1 band (`--orchestrator-band R4`;
-  a range such as `R1-R2` or `R2-R3` also works; `any` turns the window off). The window is carried in the main
-  loop's model name, `--model cortados@R4`. Claude Code sends that name only on main-loop requests. Subagents are
+  cheapest capable model wins) but only inside a band window, by default exactly **R3**, the band of Opus 5.5 and
+  Sol 6.1 (`--orchestrator-band R3`; a range such as `R1-R2` or `R2-R3` also works; `any` turns the window off).
+  The band references in `tables/routing-table.json` (`tiering.band_references`) are R3 = Opus 5, Sol 5.6 and Sol 6.1,
+  R4 = Fable 5.1 and Astra; the Air's route log records every Opus 5.5, Sol 5.6 and Sol 6.1 route as `band R3`.
+  (Until 2026-11-24 the default was R4, wrongly described here as the Opus/Sol band. R4 has no index floor of its own
+  in `core.required_index`, so an R4 window let easy turns fall to Haiku 5.5.) A band is a floor, not a model list:
+  every turn needs at least R3's reference index for its use case (general 79.6, code 66.2, planning 76.1), and the
+  cheapest route that clears it wins (Sol 6.1, Opus 5.5, Sol 5.6, or Sonnet 5.5 through Cursor, by quota). R3 can
+  still pick Fable or Astra. The hard rules and the frontier rule (`selection.ceiling_work`: planning and research at
+  D ≥ 7, code at D ≥ 9) apply inside the window. That rule keeps only the ceiling models (Opus 5.5, Fable, Astra)
+  that are available and pass the host's admission check. An underused frontier pool may take any turn at D ≥ 8
+  (`selection.ceiling_underuse`). An R3 window does not lower S1's difficulty, so these rules fire as without a
+  window. The window is carried in the main loop's model name, `--model cortados@R3`. Claude Code sends that name only on main-loop requests. Subagents are
   forced to `cortados` and side calls are pinned to haiku, so neither is windowed. (Checked with Claude Code 2.1.330
   against a capture server, 2026-11-23: the main loop sent `cortados@R1-R2` and its subagent sent `cortados`.) A header
   in `ANTHROPIC_CUSTOM_HEADERS` would have reached subagents too, so the launcher does not send one.
