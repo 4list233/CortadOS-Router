@@ -44,10 +44,12 @@ def reset_time(when: str | None, span: str, left: int, now: float) -> float | No
 
     The screen gives a wall-clock time, with a day and month for a week and nothing else for a 5-hour window, and no
     year. Each calendar reading it could mean (yesterday, today, tomorrow; last year, this year, next year) becomes a
-    timestamp, and the earliest one not more than SLACK_S in the past wins: a reset inside the past hour is the one the
+    timestamp, and the earliest one not more than SLACK_S in the past wins, for any window length (a time alone is
+    the next occurrence of that clock time, within the day): a reset inside the past hour is the one the
     screen was painted before ("11:59 PM" read at 00:00:01, "31 Dec" read on 1 Jan), anything older is the next
     occurrence. Elapsed seconds, never naive date arithmetic, so a DST change neither refuses a reset 45 minutes past
-    nor admits one seven hours ahead (fourth adversarial review, 2026-10-21)."""
+    nor admits one seven hours ahead (fourth adversarial review, 2026-10-21). Refused as ambiguous: that winning date
+    holding the time twice (the hour DST repeats), or the next occurrence falling in the hour DST skips."""
     if when is None:                                                # the group was absent; an empty "(resets )" never gets here
         if left >= 100:
             return None
@@ -66,25 +68,43 @@ def reset_time(when: str | None, span: str, left: int, now: float) -> float | No
         dates = [(today.year + k, month, day) for k in (-1, 0, 1)]
     else:
         dates = [(today + timedelta(days=k)).timetuple()[:3] for k in (-1, 0, 1)]
-    stamps = set()
+    readings, gaps = [], []                                         # (timestamp, date) on the calendar; moments a DST gap swallowed
     for y, mo, d in dates:
+        found, skipped = set(), []
         for fold in (0, 1):                                         # the hour that repeats when DST ends: both readings
             try:
                 ts = datetime(y, mo, d, hour, minute, fold=fold).timestamp()
             except ValueError:                                      # 29 Feb in a year without one
-                continue
+                break
             if datetime.fromtimestamp(ts).timetuple()[:5] != (y, mo, d, hour, minute):   # a time DST skips normalises instead of failing: not on the calendar
+                skipped.append(ts)
                 continue
-            stamps.add(ts)
-    candidates = sorted(ts for ts in stamps if ts - now >= -SLACK_S)
+            found.add(ts)
+        readings += [(ts, (y, mo, d)) for ts in found]
+        if skipped and not found:                                   # the gap's earliest reading: a gap begun before now is past
+            gaps.append((min(skipped), (y, mo, d)))
+    candidates = sorted(r for r in readings if r[0] - now >= -SLACK_S)
+    # A skipped time still ahead of the clock (no slack: a reset just painted is a real time) is the next occurrence of
+    # that wall-clock time, and the screen cannot mean it: refuse rather than pick the day after.
+    ahead_gaps = sorted(g for g in gaps if g[0] > now and (not candidates or g[0] < candidates[0][0]))
+    if ahead_gaps:
+        y, mo, d = ahead_gaps[0][1]
+        raise ValueError(f"reset text {when!r} falls in the hour DST skips on {y:04d}-{mo:02d}-{d:02d}; refusing to guess")
     if not candidates:
         raise ValueError(f"reset text {when!r} has no reading on the calendar")
-    ahead = candidates[0] - now
+    first, date = candidates[0]
+    # The earliest reading is the reset: a time alone is the next occurrence of that clock time (Codex prints a time
+    # alone only when the reset is within the day), a dated time the next year it reads in. Only the hour DST repeats
+    # gives one date two readings; a later date never makes the text ambiguous (2026-11-24: every "11:41 AM" Weekly
+    # sample was refused because today's and tomorrow's 11:41 both sat inside the 7-day window).
+    if any(d == date for ts, d in candidates[1:]):
+        y, mo, d = date
+        raise ValueError(f"reset text {when!r} names two moments: {y:04d}-{mo:02d}-{d:02d} {hour:02d}:{minute:02d} occurs twice "
+                         f"as DST ends; refusing to guess")
+    ahead = first - now
     if ahead > SPAN_S[span] + SLACK_S:                              # a week's reset on the week's last day is still inside
         raise ValueError(f"{span} reset {when!r} is {ahead / 3600:.1f} h away, outside its {SPAN_S[span] / 3600:.0f}-hour window")
-    if len(candidates) > 1 and candidates[1] - now <= SPAN_S[span] + SLACK_S:   # only the repeated hour puts two readings inside one window
-        raise ValueError(f"reset text {when!r} names two moments inside the {span} window (the hour DST repeats); refusing to guess")
-    return candidates[0]
+    return first
 
 
 def parse_status(text: str, now: float | None = None) -> list[dict]:

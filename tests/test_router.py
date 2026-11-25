@@ -339,6 +339,38 @@ class UsageScreens(unittest.TestCase):
             else:
                 os.environ["TZ"] = saved
             time.tzset()
+    def test_codex_time_only_reset_is_the_next_occurrence(self):
+        # 2026-11-24 23:45 on the Air: a Weekly reset under a day away reads "resets 11:41 AM", and every sample was refused
+        # ("names two moments inside the Weekly window") because today's and tomorrow's 11:41 both sat inside 7 days
+        import datetime, os, time
+        if not hasattr(time, "tzset"):
+            self.skipTest("needs time.tzset to pin the zone")
+        head = ">_ OpenAI Codex (v0.166.0)\n"
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Toronto"; time.tzset()
+        try:
+            at = lambda *ymdhm: datetime.datetime(*ymdhm).timestamp()
+            for clock, entry, expect in (((2026, 11, 24, 23, 45), " Weekly limit: [█]\n60%\nleft (resets 11:41 AM)", "2026-11-25 11:41"),   # the live failure
+                                         ((2026, 11, 25, 9, 0), " Weekly limit: [█]\n60%\nleft (resets 11:41 AM)", "2026-11-25 11:41"),     # before it: today
+                                         ((2026, 11, 25, 13, 0), " Weekly limit: [█]\n60%\nleft (resets 11:41 AM)", "2026-11-26 11:41"),    # after it: tomorrow
+                                         ((2026, 11, 25, 12, 0), " 5h limit: [█]\n60%\nleft (resets 3:00 PM)", "2026-11-25 15:00"),          # a 5-hour window
+                                         ((2026, 11, 25, 12, 0), " Weekly limit: [█]\n60%\nleft (resets 11:41 AM on 29 Nov)", "2026-11-29 11:41")):   # dated: unchanged
+                with self.subTest(clock=clock, entry=entry):
+                    w = self.sc.parse_codex_status(head + entry, now=at(*clock))
+                    self.assertEqual(w[0]["resets_at"], expect)
+            # still refused: the next occurrence in the hour DST repeats (2026-11-01 01:30 happens twice), or in the hour it skips
+            with self.assertRaisesRegex(ValueError, "2026-11-01 01:30 occurs twice"):
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 1:30 AM)", now=at(2026, 10, 31, 23, 0))
+            with self.assertRaisesRegex(ValueError, "DST skips on 2026-03-08"):
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 2:30 AM)", now=at(2026, 3, 8, 1, 0))
+            with self.assertRaisesRegex(ValueError, "unreadable reset text"):          # unparsable text still fails closed
+                self.sc.parse_codex_status(head + " Weekly limit: [█]\n60%\nleft (resets 11:41 AM tomorrow)", now=at(2026, 11, 25, 9, 0))
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
     def test_cursor(self):
         w = self.sc.parse_cursor_usage("Usage • Pro Resets Oct 10 Monthly plan Category Current Usage Included 17% used ███ Auto 1% used █ API 33% used ███ On-Demand Disabled")
         self.assertEqual([(x["used_pct"], x["pool"]) for x in w], [(17.0, "info"), (1.0, "cursor-models"), (33.0, "other-models")])
