@@ -112,9 +112,12 @@ request (2026-11-25):
 | `/office-assets/…` | GET, HEAD | the 3D models and backgrounds (same rule) |
 | `/api/health` | GET, HEAD | liveness for deploy-air.sh |
 | `/api/studio` | GET, HEAD | settings as the page boots; sanitized upstream, the gateway token is never in it |
-| `/api/task-store` | GET, HEAD | the Office polls the task board (Studio's own local file, which nothing can write now) |
+| `/api/task-store` | GET, HEAD | the Office polls the task board (Studio's own local file; no route can create or change a record now, though this GET loader may create its own empty directory if absent) |
 | `/api/office/standup/config` | GET, HEAD | read while the Office hydrates |
 | `/api/office/standup/meeting` | GET, HEAD | read while the Office hydrates |
+
+The task-store and standup GET loaders may create their own empty directory if it is absent; they never create or
+change a record.
 | `/api/gateway/ws` (upgrade) | WebSocket | Studio's gateway proxy, still behind the access gate's cookie check |
 
 Everything else is 403: every other method on those paths (`PUT /api/studio` included: settings are pinned), every
@@ -229,7 +232,8 @@ also opens subscriptions, routed-call rows and the work split).
   token that opens two GETs. Studio's own API is held read-only by office mode (A.5): only the Office's GET routes
   and the gateway socket are served, every write route (settings, remote office, runtime, voice, uploads, layout,
   standup, task board) is refused with 403, and the proxy's upstream is pinned to the bridge. Nothing a browser
-  sends on that path can change Studio's state or reach an agent.
+  sends on that path can change Studio's records or reach an agent (the task-store and standup GET loaders may
+  create their own empty directory if absent, but never create or change a record).
 
 **Options.**
 
