@@ -1,4 +1,10 @@
-# Orchestrator route picker (design, not built)
+# Orchestrator route picker (design; steps 0–3 built)
+
+Status (2026-11-24, branch `orchestrator-route-picker`): step 0 (the spike, §3.1 and §1.3) is done; steps 1–3 (parser,
+selection, identity) are built to the owner's §8 answers (§8.1): `routing.route_pick` / `resolve_pick` / `Pick`,
+`routing.choose(route_pick=…)` with `pick_shortfall` (E3), `pick_refusal` (E2) and `pick_notice`, and the server's
+identity on the pick label; tests in `tests/test_route_pick.py`. Steps 4–9 are not built. Sections below that say
+"recommended" or "[ESCALATE]" were written before §8.1; where they differ, §8.1 and §4.3–4.4 hold.
 
 Owner request, 2026-11-24 (condensed): whenever a new Claude Code session starts, let me pick the route of the
 orchestrating (main-loop) session instead of a hard-coded band or model:
@@ -184,6 +190,8 @@ So in the desktop app **the main loop is not routed at all today**, and a picker
 
 - **D-spike (step 0, §7):** check (a) whether desktop Code sessions honour `env.ANTHROPIC_BASE_URL` / a custom model
   from a settings file, and (b) whether the mod host API offers any way to set the session's model. Neither is assumed.
+  **Result (2026-11-24, §3.1 "Spike"): no to both.** Desktop sessions take their provider from the app and ignore a
+  settings-sourced base URL; the mod API can read the session's model but not set it.
 - Until the spike says yes, the desktop gets a **`/route` command** in the mod (registered at `session.start` like
   `/cortados-local`, `register.ts:3043`) that shows the options view and says, in one line, that this session's main
   loop runs on direct Claude and that a routed main loop needs the terminal launcher. It changes nothing.
@@ -262,11 +270,82 @@ Freshness: each section carries `as_of`; readings older than the scarcity cache'
 
 - Claude Code sends the main loop's `--model` string as given; `cortados@R1-R2` survived unchanged on the main loop and
   did not reach subagents (`README.md:354-357`). So the characters `@` and `-`, letters and digits are proven.
-- `:` and `+` are **not yet proven** to survive `--model` and `/model` unchanged. Step 0 (§7) checks them with the same
-  capture-server method; if either is altered or refused, the fallback spelling uses `~` for both separators
-  (`cortados@R3~claude-opus-5-5~gpt-6.1-sol`), checked the same way. Also checked there: that Claude Code does not
-  change behaviour based on substrings of a custom model name (for example treating a name containing `opus` or
-  `haiku` as that model). Unverified today.
+- `:` and `+` survive `--model` unchanged, and `*` too (step 0 below). The `~` fallback spelling is not needed and
+  is not part of the grammar.
+
+#### Spike (step 0, 2026-11-24)
+
+Method: Claude Code 2.1.330 (`claude -p`, and a `--input-format stream-json` session for `/model`) with
+`ANTHROPIC_BASE_URL=http://127.0.0.1:18765`, a throwaway capture server on loopback that answers the Messages API
+itself (a canned text reply, or one `Agent` tool call to make a subagent), a throwaway `CLAUDE_CONFIG_DIR`, a dummy
+token and the launcher's subagent variables (`CLAUDE_CODE_SUBAGENT_MODEL=cortados`, `…_FORCE=1`,
+`ANTHROPIC_SMALL_FAST_MODEL=sub/claude-haiku-4-5`). No real model was called, no subscription spent, `~/.claude` not
+read or written.
+
+Captured `model` of each request (`POST /v1/messages?beta=true`):
+
+```
+--model 'cortados@R3:claude-opus-5-5+gpt-6.1-sol', a prompt that makes the main loop start one subagent:
+  cortados@R3:claude-opus-5-5+gpt-6.1-sol   tools 12   (main loop, turn 1: answers with an Agent tool call)
+  cortados                                  tools 8    (the general-purpose subagent)
+  cortados@R3:claude-opus-5-5+gpt-6.1-sol   tools 12   (main loop, turn 2: the tool result)
+--model 'cortados@R4:*'                   -> cortados@R4:*
+--model 'cortados@local:qwen-27b'         -> cortados@local:qwen-27b
+--model 'cortados@R3~claude-opus-5-5~gpt-6.1-sol' -> unchanged too (the unused fallback)
+```
+
+So `:`, `+` and `*` reach the provider unchanged on every main-loop request, the subagent sends plain `cortados`
+(E7 holds with no extra work), and Claude Code prints `[claude-code:unrecognized_model] {"model":"cortados", …}` for the
+subagent but sends it all the same.
+
+**Claude Code reads family words in a custom model name.** The same prompt under different names (main-loop request):
+
+| `--model` | `max_tokens` | `thinking` | `output_config.effort` | betas beyond the common set |
+|---|---|---|---|---|
+| `cortados@R3` (no family word) | 32000 | adaptive | high | `mid-conversation-tool-changes`, `inline-tools`, `effort` |
+| `cortados@R3:gpt-6.1-sol` | 32000 | adaptive | high | same as above |
+| `cortados@R3:claude-opus-5-5+gpt-6.1-sol` | 128000 | adaptive | **medium** | above + `per-turn-control` |
+| `cortados@R3:claude-fable-5-1` | 64000 | adaptive | high | above + `per-turn-control` |
+| `cortados@R3:claude-sonnet-5` | 64000 | adaptive | high | `effort` only (no `mid-conversation-tool-changes`, `inline-tools`) |
+| `cortados@R3:claude-haiku-4-5` | 32000 | **enabled, budget 31999** | none | none of the three |
+
+What it changes here: the CLI backends (`bridge.py`, `codex_bridge.py`) never read the client's `max_tokens`, effort,
+thinking or betas (a Codex route's effort comes from the route), so a pick's name changes nothing a CLI lane runs. The
+API credit lane relays the body verbatim, so there a pick naming `opus` sends Opus's own `max_tokens` and effort, which
+matches the model that runs. The one visible cost is a `haiku` pick: Claude Code then drives the main loop as a Haiku
+client (no inline tools, no mid-conversation tool changes). Recorded as **[ESCALATE] E11**.
+
+`/model` mid-session (a `--input-format stream-json` session started with `--model cortados@R3`; messages "first turn",
+`/model cortados@R3:claude-opus-5-5+gpt-6.1-sol`, then a prompt that starts a subagent):
+
+```
+cortados@R3                               tools 12  msgs 2   (turn 1)
+                                          -> Claude Code: "Set model to `Opus 5.5` for this session only"
+cortados@R3:claude-opus-5-5+gpt-6.1-sol   tools 0   msgs 1   (a tool-less call right after /model)
+cortados@R3:claude-opus-5-5+gpt-6.1-sol   tools 12  msgs 5   (turn 2: the main loop, whole history)
+cortados                                  tools 8   msgs 2   (its subagent)
+cortados@R3:claude-opus-5-5+gpt-6.1-sol   tools 12  msgs 7, 9 (the main loop's next requests)
+```
+
+So a `/model` change carries the pick unchanged from the next request, and only on the main loop. Two side effects:
+Claude Code names the session's model after the first family word it finds ("Opus 5.5" for this pick; E11), and
+right after `/model` it sends one tool-less request under the new name. The provider routes that as a one-shot
+(`one_shot`, its own throwaway CLI) under the new pick, as it already does for `/model cortados@R3`.
+
+Desktop (read-only: the installed Claude app 7.37095.0 and its bundled CLI 2.1.330 were read, nothing was changed or
+restarted):
+
+- The app starts a Code session's CLI with its own `ANTHROPIC_BASE_URL` (its API host), `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_API_KEY` and `ANTHROPIC_CUSTOM_HEADERS` blanked, and its own OAuth token (`app.asar`, the session env
+  builder). The CLI then refuses settings-sourced provider settings for such a session: "this session's provider
+  routing is managed by the host (CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST or a host-auth-callback marker), so
+  settings-sourced provider/auth configuration does not apply", and "sessions that Claude Desktop starts don't take
+  this variable from this settings source". **A settings `env.ANTHROPIC_BASE_URL` does not route a desktop Code
+  session**, so a custom `cortados@…` model has nothing to reach there.
+- The mod host API has no model setter: `$.session.model` is a getter (`model: () => o("session.model", {})`), and
+  `$.model` offers only `complete`, `classify` and `fork` (side calls on the session's own model).
+- So E9 stands as decided: the desktop gets the read-only `/route` (step 7), which says that a routed main loop needs
+  the terminal launcher.
 - Bounded: at most 8 models and 128 characters after `cortados@`, the same cap as pin names (`routing.py:276`,
   `PIN_NAME_MAX`) and the exclusion header (`server.py:440`, `:445`).
 - Identity-safe: the canonical label (§3.4) is built only from band names and table model ids, never from client text,
@@ -299,9 +378,12 @@ Rules on top of the grammar:
   pick). Ambiguous → 400 with the candidates (`AmbiguousPin`, `routing.py:344-351`); unknown → 400 with the band's
   list; a duplicate after resolution is dropped.
 - A cloud model in a local pick, or a local model in a cloud pick, is a 400 in v1 (mixed picks: **[ESCALATE] E6**).
-- A selected model outside the window's list (e.g. `R4:gpt-5.5`) is allowed: the owner named it. The options view
-  marks it; the route row records `route pick: gpt-5.5 below R4's reference` (**[ESCALATE] E3** asks whether to refuse
-  instead).
+- A selected model outside the window's list (e.g. `R4:gpt-5.5`) is allowed: the owner named it. A turn whose
+  requirement it cannot meet escalates (E3, §4.3), so in practice such a pick runs on its model only for turns the
+  model can carry. (The options view marking it is step 4.)
+- Built as `routing.parse_pick` (grammar), `routing.resolve_pick` (names → served ids or local pin ids, `PickError`
+  for a 400) and `routing.route_pick` (the three sources together). The model-name and header sources are capped at
+  128 printable characters; the label can be longer (friendly names expand to ids) and is never cut.
 - An invalid pick is refused with a 400 on every request, continuations included, before any conversation lookup,
   as an invalid window is today (`server.py:3662-3672`).
 
@@ -357,12 +439,13 @@ as an exclusion that empties the pool is today (`routing.py:808-813`).
 
 | rule | with a pick |
 |---|---|
-| Outward / blast radius 3 floors the band (`core.py:1140-1142`, `:1171-1173`) | Still floors the band, so the required index is the floored band's. The pick still limits the models. If no selected model reaches that index, resolve takes the strongest selected one and records it (`core.py:1347`, `:1565`). **[ESCALATE] E3**. |
+| Outward / blast radius 3 floors the band (`core.py:1140-1142`, `:1171-1173`) | Still floors the band, so the required index is the floored band's. The pick still limits the models. If no selected model reaches that index, the conversation **escalates** (E3, §4.3). |
 | Degraded scorer never defaults to Claude (`routing.py:212-226`) | Unchanged and not overridable. A Claude-only pick while S1 is degraded has no candidate: refused (503) with a message naming the pick and the rule. A pick with a Codex member runs on it. The launcher warns at pick time when a pick is Claude-only. |
-| Sensitive → local (`routing.py:876-881`, `sensitive_local`) | Runs after select as today and **wins over the pick** (it exists so that sensitive work stays on the owner's machine); recorded as `route pick … overridden: sensitive`. **[ESCALATE] E5**. |
-| Cost moves to local (`auto_local`, `index_local`: `routing.py:882`, `:1452`, `:1631`) | **Skipped** for a cloud pick: they move work off the selected models for cost, which is exactly what a pick forbids. Recorded as `route pick: local cost route not taken`. |
-| API credit lane (`routing.py:1025`, `core.py:971-985`) | A selected Claude model includes its API-lane pair when the lane would be offered anyway; its own refusals (degraded, outward, blast radius > 1, stop line) still apply. **[ESCALATE] E4** (whether "every lane" should include paid credit). |
-| Frontier rule (`core.py:1442-1465`) | Applies within the set. A pick with no frontier model gets "no frontier model available … the index rule alone applies" (`core.py:1464`), the existing graceful path. |
+| Sensitive → local (`routing.py:876-881`, `sensitive_local`) | Runs after select as today and **wins over the pick** (E5: it exists so that sensitive work stays on the owner's machine); recorded as `route pick … overridden: sensitive`. |
+| Cost moves to local (`auto_local`, `index_local`: `routing.py:882`, `:1452`, `:1631`) | **Skipped** for a cloud pick, escalated or not: they move work off the selected models for cost, which is exactly what a pick forbids. Recorded on every pick's row as `route pick: local cost routes not taken`. |
+| API credit lane (`routing.py:1025`, `core.py:971-985`) | A selected Claude model includes its API-lane pair when the lane would be offered anyway (E4); its own refusals (degraded, outward, blast radius > 1, stop line) still apply. Not offered to an escalation (§4.3). |
+| Frontier rule (`core.py:1442-1465`) | Applies within the set. A turn the rule covers under a pick with no frontier model **escalates** (E3, §4.3, category `frontier`). |
+| Switching margin memory (`routing.remember_route`) | A pick's route (restricted or escalated) is not remembered: the margin holds a client's free choices against cost noise, and the client name is shared by the main loop and its subagents. |
 | Underused-frontier rule (`core.py:1536-1563`) | Only spare frontier pools inside the set. |
 | Context fit (`core.py:1276-1293`) | Hard, per route. All selected routes too small → 413 (`server.py:3146-3149`). |
 | 5-hour and weekly windows | A spent window makes the route `ok=False` (`core.py:835-847`); a hot 5-hour window raises the cost (`core.py:1373-1396`). The client floor (`x-cortados-min-left-pct`) applies through `hold_ok` and `floor.reserve` (`routing.py:822-826`, `:888-905`). |
@@ -372,10 +455,47 @@ as an exclusion that empties the pool is today (`routing.py:808-813`).
 ### 4.3 When the selection cannot meet the requirement
 
 S1 may score a turn above what the selected models clear (e.g. `R3:gpt-6.1-sol` and a code turn at D 9, where the
-frontier rule wants Opus 5.5 / Fable / Astra). Today's behaviour for an unrestricted request is "strongest available
-taken" (`core.py:1347`, `:1565`). With a pick that becomes "strongest **selected** model taken". Recommended: keep it
-(the owner chose the set), record `route pick: no selected model reaches 87.4; strongest selected taken`, and surface
-that rule in the Tasks view. **[ESCALATE] E3**.
+frontier rule wants Opus 5.5 / Fable / Astra).
+
+**Decided (E3, owner 2026-11-24): escalate.** Built as follows (`routing.choose`, `routing.pick_shortfall`):
+
+1. The pick's select runs first, on the selected models' pairs only. Its result, or on a refusal the last
+   `core.resolve` answer (`execution_routing.select` now returns it as `last_route`), gives the turn's band, D and
+   required index. Nothing in `core.resolve` changed.
+2. **Shortfall, judged on capability alone**, from `model-scores.generated.json`, never from availability:
+   - `index`: the required index is above every selected model's index for the turn's use case;
+   - `frontier`: `selection.ceiling_work` requires a frontier model for this use case and D (`require_frontier`,
+     `core.ceiling_work_applies`) and no selected model is a ceiling model.
+   No required index (a degraded scorer, unscored candidates) or no selected model in the scores: no shortfall. An
+   escalation must rest on a number.
+3. On a shortfall the conversation is routed again, under the same route id (one routes row), with every served pair
+   in the allowlist: same window, same S1 answer, same hard rules, the client's exclusions still applied. This is the
+   route normal routing would choose without the model set. The **API credit lane is left out of an escalation**:
+   its relay passes the vendor's bytes through unchanged, so the notice could not lead its reply. A selected Claude
+   model still runs on the lane normally (E4).
+4. Recorded: the rule `route pick escalated: no selected model reaches <index> (<use case>; the strongest selected
+   has <n>)` or `… reaches the frontier requirement (<use case> at D=<D> needs a frontier model)`, on the routes row;
+   the Tasks view labels it `route pick escalated`. The route carries `pick_escalated` (label, reason category,
+   required index).
+5. Told: the conversation's **opening reply** leads with its own text block, `⚠ CortadOS: route pick <label>
+   escalated: <reason>, so this conversation runs on <model>.` Fixed words, the pick label (band names and table ids
+   only) and the routed model's id; kept in history exactly as delivered, like `sensitive_notice`. Continuations are
+   not told again: the conversation keeps its route (`server.py:3115`).
+6. When: only at conversation open or fork, like every route choice. The conversation's identity stays the pick the
+   client asked for, so its continuations keep matching it.
+
+**How E3 meets E2.** The two are distinct paths, decided in this order:
+
+| the turn's requirement | the selected routes now | outcome |
+|---|---|---|
+| some selected model reaches it | at least one usable | runs on the selected models (scarcity picks among them) |
+| some selected model reaches it | none usable (spent, floor, too large, dependency) | **E2: refused** (§4.4); nothing else runs |
+| no selected model reaches it | any | **E3: escalated**, even when the selected routes are also spent: they could not have served the turn anyway |
+| escalated, and normal routing finds nothing either | | that routing's own refusal, as for a request with no pick |
+
+Escalation never answers "the selected models are busy"; only "the selected models are not strong enough for this
+turn". A capable selected model that is merely weaker than the best selected one is used as the router's existing
+"strongest available" rule says (`core.py:1347`): it is inside the pick.
 
 ### 4.4 When every selected model is unavailable or exhausted
 
@@ -393,7 +513,15 @@ Resolve then has no usable candidate and execution is refused (`core.py:1570-157
 - **C. Ask.** The provider cannot ask mid-request; in practice this is A with the widening instructions, plus the
   launcher/`/route` showing live state before the pick.
 
-**[ESCALATE] E2**, recommended A.
+**Decided (E2, owner 2026-11-24): A.** Built as `routing.pick_refusal`: each selected route (every account and lane
+the pick allowed, after exclusions) is named with its reason, from the same primitives routing uses (credentials,
+`core.candidate_health`, the lane ceiling, the client floor `floor.check`, else the reason `core.resolve` gave). Status:
+413 when every route is too large; 429 when every route is spent, under the client's floor, or too large; 503
+otherwise (a binary or key missing, a reading from another login, S1 degraded with a Claude-only pick, unreadable
+state). The text gives the earliest reset of a spent route and the widening line (`` `/model cortados@R3:*` (any
+capable R3 model) or `/model cortados@R3` (the band window) ``; for `R3:*` only the window; for `any:<models>`
+`` `/model cortados` ``), and says nothing ran on a model outside the pick. An exclusion that empties the set is a 400
+before routing.
 
 This applies when a conversation opens or forks. A conversation already running keeps its route
 (`server.py:3115`); what happens when its own route's pool is spent mid-conversation is unchanged by this design.
@@ -519,11 +647,39 @@ starts the provider.
 | 9 | **Codex header docs** and the README / ROUTER-DESIGN §13 update. | Docs reviewed; README test count refreshed. |
 
 Steps 1–3 are one PR's worth of risk (routing and identity) and should be reviewed adversarially (identity and
-concurrency); 4–6 are a second PR; 7–8 follow decisions.
+concurrency); 4–6 are a second PR; 7–8 follow decisions. Step 8 (local orchestrator, E8) is the priority after this
+PR.
+
+Built on 2026-11-24 (steps 0–3): the spike (§3.1, §1.3); `tests/test_route_pick.py` holds step 1's table-driven parser
+tests, step 2's selection tests (accounts and lanes, scarcity across accounts, E2 refusals with their statuses,
+degraded Claude-only and mixed picks, the outward floor, `R4:*`, exclusions, local picks refused), step 3's identity
+tests (pick change forks, spellings continue one conversation, `R3` keeps its identity, a pin in every pick, an invalid
+pick refused before lookup, concurrent identical forks open once, failures and replays scoped to their pick), and the
+E3 tests (an index and a frontier shortfall under `R3:gpt-6.1-sol`-style picks escalate, are recorded and carry the
+notice; an exhausted capable selection refuses and does not escalate; escalation leaves the API lane out).
 
 ---
 
 ## 8. [ESCALATE] questions for the owner
+
+### 8.1 The owner's answers (Forest, 2026-11-24)
+
+| # | decision | built in steps 1–3 as |
+|---|---|---|
+| E1 | Default. The prompt shows on every TTY launch; the first-time Enter is today's behaviour until a pick is saved. | Launcher step 6 (not in this PR). |
+| E2 | Default (A). Refuse clearly: name each selected route and why it was skipped, the earliest reset, and the widening `/model` line. 429 for quota, 413 for fit, 503 only for a failed dependency. Never silently use a model the owner did not pick in this case. | `routing.pick_refusal` (§4.4). |
+| E3 | **Changed from the recommendation.** When a turn's required index (an outward floor, the frontier rule, a high D) exceeds every selected model, the route **escalates** to the model the router would choose without the pick (the cheapest capable by normal routing, within the hard rules), at conversation open or fork. Recorded (`route pick escalated: …` rule on the routes row, Tasks label) and told to the client in a short notice, as `sensitive_notice` does. Escalation is about capability; exhaustion of capable selected models still refuses per E2. | `routing.pick_shortfall` + the escalation in `routing.choose`, `routing.pick_notice`, `Handler._pick_escalation_notice` (§4.3). |
+| E4 | Default. A selected Claude model may run on the API credit lane. | The lane's pairs of a selected model stay in the allowlist (§4.1); not in an escalation (§4.3). |
+| E5 | Default. The sensitive rule wins. | `sensitive_local` still runs; the row says `route pick … overridden: sensitive`. |
+| E6 | Refuse mixed local + cloud picks in v1. The picker is about the orchestrator (main loop) only. | 400 at parse time, both directions. |
+| E7 | Default. Subagents and child tasks stay free-routed. | Unchanged: the pick rides on the main loop's model name only (spike, §3.1). |
+| E8 | A local orchestrator is opt-in under a new `orchestrator` boundary profile (plan and delegate only, §5). A PRIORITY, right after this PR; not built here. | `local[:<models>]` parses and validates (names against the local pins; a broken local config is said as such); selection refuses it with "local orchestrator picks are not enabled yet" (400) until step 8. |
+| E9 | Default. Desktop: read-only `/route` until step 0 shows otherwise. | Step 0's desktop finding: §1.3 "Spike". |
+| E10 | Default. Keep both `R3` and `R3:*`. | `R3` is today's window, label and identity unchanged; `R3:*` is a list. |
+
+New from step 0: **E11** (below).
+
+### 8.2 The questions as asked
 
 | # | question | options | recommended default |
 |---|---|---|---|
@@ -537,3 +693,4 @@ concurrency); 4–6 are a second PR; 7–8 follow decisions.
 | E8 | Build local picks at all, and under which guard? | not in v1; opt-in with the `orchestrator` profile (plan and delegate only); opt-in as a plain pin (full tools) | Opt-in with the `orchestrator` profile, after the cloud picker ships; never as a plain full-tool pin. |
 | E9 | Desktop app: how much to build before step 0 shows whether a desktop session can run on the provider at all? | nothing; a read-only `/route` that shows options and explains; full picker | Read-only `/route` only; the full picker waits for step 0. |
 | E10 | The `R3` window (no model list) stays as an option beside `R3:*`? | keep both; make `R3` mean `R3:*` | Keep both: `R3` is today's floor semantics and existing sessions' identity; the picker's band screen offers `*` by default and `band only` as one key. |
+| E11 | (step 0) Claude Code reads model family words in the main loop's custom model name (§3.1 "Spike"): a pick naming a `haiku` id makes Claude Code send the main loop's requests as a Haiku client would (fewer betas: no `effort`, `inline-tools`, `mid-conversation-tool-changes`); one naming `opus` adds an Opus-only beta (`per-turn-control`). Accept, or have the launcher spell picks so no family word appears? | accept (the provider serves the request it gets; Haiku is below the face floor and an unlikely orchestrator pick); the launcher warns when a pick names `haiku`; an opaque spelling (a pick id the provider maps back) | Accept, and the launcher warns for a `haiku` pick (step 6). An opaque spelling would make the label unreadable in `/model` and the views for a cosmetic gain. |
