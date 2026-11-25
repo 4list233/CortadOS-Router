@@ -161,7 +161,8 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 nudge: tuple[str, str, bytes, int, float] | None = None, diagnostics: dict | None = None,
                 refuse: tuple[tuple[str, str], ...] = (), inherit_path: bool = True,
                 page: Callable[[str], tuple[bytes, str] | None] | None = None, page_max: int = 40,
-                cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None) -> str:
+                cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
+                refuse_unsettled: tuple[tuple[str, str], ...] = ()) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown, type `command`, return the screen text.
 
     Deny-all: Enter is only ever sent for that trust prompt. `refuse` is ((kind, regex), ...): the screen is checked on
@@ -174,7 +175,10 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `cwd_check(folder)` runs on the per-probe folder after it is made and before the fork; raising refuses the start
     (the agy lane's dotenv guard, #144 round 3).
     `on_boot(text)` gets the start-up screen (banner, trust prompt) once, just before `command` is typed: what the
-    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144)."""
+    returned text (the answer only) does not hold (the agy lane reads its subscription tier there, #144).
+    `refuse_unsettled` is ((kind, regex), ...) like `refuse`, but checked only when the probe is about to act (at the end
+    of the boot / trust stage and before every write), never mid-read: for a transient screen that may still resolve
+    while the CLI paints (agy's "not signed in" notice while it signs in from the keyring, #144)."""
     PROBE_DIR.mkdir(parents=True, exist_ok=True)
     my_dir = PROBE_DIR / f"p{os.getpid()}-{int(time.time() * 1000) % 100000}"     # per-probe folder: the reaper kills by cwd and must never hit another probe
     my_dir.mkdir(exist_ok=True)
@@ -208,13 +212,18 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     stage, startup_chars, ready_seen = "boot", 0, False
     typed: list[str] = []          # what the probe sent, by name, for a truthful refusal message
 
-    def refused(where: str) -> None:
+    def refused(where: str, acting: bool = True) -> None:
         if EXEC_FAILED_MARK in buf:
             raise ProbeExecFailed(f"{Path(argv[0]).name} could not be started: "
                                   + buf.split(EXEC_FAILED_MARK, 1)[1].split(b"\n", 1)[0].decode("ascii", "replace")[:60])
         if refuse:
             shown = _plain(buf)
             for kind, pattern in refuse:
+                if re.search(pattern, shown, re.I):
+                    raise ProbeRefused(kind, where, typed)
+        if acting and refuse_unsettled:
+            shown = _plain(buf)
+            for kind, pattern in refuse_unsettled:
                 if re.search(pattern, shown, re.I):
                     raise ProbeRefused(kind, where, typed)
 
@@ -241,7 +250,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                     return
                 buf += d
                 last = time.time()
-                refused(stage)                               # stop the moment a refused screen is painted, mid-pump
+                refused(stage, acting=False)                 # stop the moment a refused screen is painted, mid-pump
                 if b"\x1b[>c" in d or b"\x1b[>0c" in d:      # terminal identity queries some TUIs block on
                     os.write(fd, b"\x1b[>0;276;0c")
                 if b"\x1b[c" in d:
@@ -599,11 +608,27 @@ def _claude(prev: dict[str, Any] | None = None, config_dir: str | None = None) -
 # wording: the first-run prompts are from Google's getting-started page ("Color scheme", "Rendering mode: Alt-Screen or
 # Inline"); the sign-in screen is the documented flow (a browser sign-in, or over SSH an authorization URL and a code to
 # paste back). Pin both to captured screens once the owner sends them.
+#
+# agy 1.5.16 SIGNED IN still paints, while it loads and refreshes its keyring token, a transient start-up notice
+# (captured on the Air 2026-11-25 under the probe's env, email-free):
+#     Welcome to the Antigravity CLI. You are currently not signed in.
+#     ⣷ Signing in...
+# then the banner with the account line `<email> (Google AI Pro)`. Refusing on that notice mid-read closed agy ~0.4 s
+# before its token refresh finished, so a signed-in agy always read "not logged in" (#144). The notice is therefore not
+# refused while agy says it is signing in or nothing follows it yet; AGY_UNSETTLED refuses it when the probe is about to
+# act (end of boot, before any keystroke) and no account line has appeared after it. Deny-all holds: nothing is typed
+# past an unresolved "not signed in".
+AGY_ACCOUNT = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+_AGY_NOT_SIGNED_IN = r"not (?:signed|logged) in"
 AGY_REFUSE = (
     ("not-logged-in", r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
-                      r"|not (?:signed|logged) in|please (?:sign|log) in|login required"),
+                      r"|" + _AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
+                      r"|please (?:sign|log) in|login required"),
     ("first-run-pending", r"color scheme|colou?r theme|rendering mode|alt-screen"),
 )
+AGY_UNSETTLED = (("not-logged-in", _AGY_NOT_SIGNED_IN + r"(?![\s\S]*" + AGY_ACCOUNT + ")"),)
+# The boot read stops once the account line (signed in) or the trust prompt is painted, else after boot_s.
+AGY_BOOT_READY = r"(?i)" + AGY_ACCOUNT + r"|trust (?:this|the contents)"
 AGY_DONE = r"Limit Remaining[\s\S]*Limit Remaining"     # the answer is on screen; complete only by agy_usage_gaps
 # The quota groups agy 1.5.16 shows on Google AI Pro (owner's screen, 2026-11-24): GEMINI MODELS and CLAUDE AND GPT
 # MODELS. A reading without either is partial.
@@ -670,7 +695,8 @@ def _antigravity() -> dict[str, Any]:
     boot: list[str] = []          # the start-up banner, in memory only: the tier is read from it below, never stored
     # A refused screen at any point (boot, after trust, after /usage, while paging) raises ProbeRefused from inside the
     # capture, before the probe's next keystroke.
-    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, inherit_path=False, diagnostics=diag,
+    text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
+                       ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag,
                        page=_agy_next_page, cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=boot.append)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:

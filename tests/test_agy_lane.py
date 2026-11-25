@@ -44,7 +44,7 @@ def pager_view(lines: list[str], top: int) -> str:
 # A fake agy: dumps the NAMES of its environment, records every byte typed into it, prints its boot screen, and answers
 # "/usage<Enter>" with the usage screen (MODE "usage") or a trust prompt's Enter with the screen after it.
 FAKE = r'''#!{py}
-import os, tty
+import os, time, tty
 LOG = {log!r}
 SCREENS = {screens!a}    # ASCII escapes: Python 3.9's tokenizer can misread a long line of multibyte text
 with open(LOG + ".env", "w") as f:
@@ -62,6 +62,9 @@ def view(top):
             + "\n(%d\u2013%d of %d lines)  \u2191/\u2193 scroll \u00b7 pgdown page \u00b7 ctrl+end Bottom\n" % (top + 1, min(top + H, len(L)), len(L)))
 top = 0
 out(SCREENS["boot"])
+for step in SCREENS.get("boot_later", []):    # painted later, as agy does while it signs in
+    time.sleep(0.6)
+    out(step)
 got = b""
 while True:
     try:
@@ -94,6 +97,9 @@ BANNER_FIXTURE = ROOT / "tests" / "fixtures" / "agy-banner.txt"
 BANNER = (BANNER_FIXTURE.read_text()
           + "Resume with -c (or command below): agy --conversation=00000000-0000-0000-0000-000000000000\n> ")
 LOGGED_OUT = "Antigravity CLI 1.5.16\nSign in with Google to continue.\nOpen https://accounts.google.com/o/oauth2/auth?x=1 in your browser\n"
+# agy 1.5.16's transient start-up notice while it signs in from the keyring (captured on the Air 2026-11-25 under the
+# probe's env; the spinner glyph is agy's): shown BEFORE the banner even when signed in (#144).
+SIGNING_IN = "Welcome to the Antigravity CLI. You are currently not signed in.\n\n \u28f7 Signing in...\n"
 FIRST_RUN = "Welcome to Antigravity CLI\nColor scheme: Dark / Solarized Dark / Solarized Light / Terminal default\n"
 TRUST = "Do you trust the contents of this folder?\nTrust this workspace [Y/n]\n"
 
@@ -212,6 +218,48 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(self.keys(log), b"")
         rec = sc._failed_record("antigravity", None, cm.exception)
         self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("not-logged-in", "not logged in"))
+
+    # ---- #144 on the Air: a signed-in agy paints "not signed in / Signing in..." before its banner
+    def test_transient_signing_in_notice_then_banner_is_read(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [BANNER], "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"/usage\r")
+
+    def test_notice_painted_before_its_spinner_is_not_refused_mid_read(self):
+        notice, spinner = SIGNING_IN.split("\n\n", 1)
+        binary, log = self.fake({"boot": notice + "\n", "boot_later": [spinner, BANNER], "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+
+    def test_signing_in_that_never_finishes_is_refused_and_nothing_is_typed(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "not-logged-in")
+        self.assertEqual(self.keys(log), b"")
+
+    def test_signing_in_that_ends_on_a_sign_in_screen_is_refused_and_nothing_is_typed(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [LOGGED_OUT]})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "not-logged-in")
+        self.assertEqual(self.keys(log), b"")
+
+    def test_plain_not_signed_in_screen_is_still_refused(self):
+        binary, log = self.fake({"boot": "Antigravity CLI 1.5.16\nYou are not signed in. Run agy and choose a sign-in method.\n"})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "not-logged-in")
+        self.assertEqual(self.keys(log), b"")
+
+    @staticmethod
+    def short_boot(real):
+        return lambda *a, **k: real(*a, **{**k, "boot_s": 3})
 
     def test_first_run_prompt_is_refused_and_nothing_is_typed(self):
         binary, log = self.fake({"boot": FIRST_RUN})
