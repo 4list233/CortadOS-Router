@@ -1,0 +1,22 @@
+diff --git a/server/gateway-proxy.js b/server/gateway-proxy.js
+index 388bba0..06c9409 100644
+--- a/server/gateway-proxy.js
++++ b/server/gateway-proxy.js
+@@ -227,7 +227,16 @@ function createGatewayProxy(options) {
+       closeBoth(1011, "connect failed");
+     };
+ 
+-    const forwardConnectFrame = (frame) => {
++    const forwardConnectFrame = (browserFrame) => {
++      // CortadOS (#77 proxy-auth): the upstream is always the CortadOS office bridge, which accepts
++      // only this server's configured token. Over HTTPS the browser adds a signed device block, which
++      // the stock code took as the browser's own auth (no token injected; the bridge refused with
++      // 1008). So drop the device block and any browser credential, including a token typed into
++      // the page, and always send the configured token.
++      const params = isObject(browserFrame.params) ? { ...browserFrame.params } : {};
++      delete params.device;
++      delete params.auth;
++      const frame = { ...browserFrame, params };
+       const browserHasAuth =
+         hasNonEmptyToken(frame.params) ||
+         hasNonEmptyPassword(frame.params) ||

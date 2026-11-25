@@ -9,15 +9,23 @@
 // its upstream (`studio.gateway_url_blocked`, no UPSTREAM_ALLOWLIST in production). Only a real
 // connect through the proxy sees that.
 //
+// It sends two connects, one per gateway socket, under one deadline: first one with no credential,
+// then one shaped like the browser's over HTTPS (Claw3D's GatewayBrowserClient in a secure context:
+// a complete Ed25519-signed `device` block, signed over the bridge's challenge nonce, and no token).
+// Reason: on 2026-11-25 the Office over HTTPS showed "Gateway closed (1012): upstream closed" while
+// this check passed. The stock proxy took the browser's device block as the browser's own auth and
+// did not inject its token, so the bridge refused; the check's tokenless, deviceless connect never
+// took that path. claw3d/proxy-auth.patch makes the proxy always send its token; this connect proves it.
+//
 //   sudo cat <studio-access-token> | node gateway-check.mjs --port 3000 [--timeout-ms 5000]
 //
 // The access token comes on stdin only (never argv, never printed); it is sent as the
 // `studio_access` cookie, which is what Claw3D's access gate compares. Prints one line: `ok`, or a
 // fixed reason (an error code from the proxy is printed only as a short [A-Za-z0-9._-] word).
-// Exit 0 only on the bridge's hello; any error, refusal, close or the deadline is exit 1.
+// Exit 0 only on the bridge's hello to both connects; any error, refusal, close or the deadline is exit 1.
 // Node stdlib only; a minimal RFC 6455 client (text frames, masked, no extensions).
 import net from 'node:net';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { isMainModule } from './adapter.mjs';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -62,11 +70,39 @@ export function readServerFrames(buf) {
   }
 }
 
-/** Resolves to 'ok' or a fixed reason; never rejects, never includes the token. */
-export function probe({ host = '127.0.0.1', port, token, timeoutMs = 5000 }) {
+/**
+ * The params of the connect Claw3D 51337f7's browser client sends over HTTPS with no token typed in
+ * (src/lib/gateway/openclaw/GatewayBrowserClient.ts 509-585): a fresh Ed25519 identity, the device
+ * id the SHA-256 hex of the raw public key, the v2 payload signed over the challenge nonce. The key
+ * is thrown away: the bridge checks no signature; the point is the shape the proxy decides on.
+ */
+export function browserConnectParams(nonce) {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const raw = Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url');
+  const id = createHash('sha256').update(raw).digest('hex');
+  const client = { id: 'openclaw-control-ui', version: 'dev', platform: 'web', mode: 'webchat' };
+  const role = 'operator';
+  const scopes = ['operator.read', 'operator.admin', 'operator.approvals', 'operator.pairing'];
+  const signedAt = Date.now();
+  const payload = ['v2', id, client.id, client.mode, role, scopes.join(','), String(signedAt), '', nonce].join('|');
+  const signature = sign(null, Buffer.from(payload, 'utf8'), privateKey).toString('base64url');
+  return { minProtocol: 3, maxProtocol: 4, client, role, scopes,
+    device: { id, publicKey: raw.toString('base64url'), signature, signedAt, nonce },
+    caps: [], userAgent: 'cortados-deploy-health', locale: 'en' };
+}
+
+const NONCE_RE = /^[A-Za-z0-9._~-]{1,256}$/;
+
+/**
+ * One connect through Studio's proxy. Resolves to 'ok' or a fixed reason; never rejects, never
+ * includes the token. shape 'plain' sends at once with no credential; 'browser' waits for the
+ * upstream's connect.challenge and sends browserConnectParams(nonce).
+ */
+export function probe({ host = '127.0.0.1', port, token, timeoutMs = 5000, shape = 'plain' }) {
   return new Promise(resolve => {
     if (!TOKEN_RE.test(token ?? '')) { resolve('no usable access token on stdin'); return; }
-    let settled = false, upgraded = false, buf = Buffer.alloc(0);
+    if (shape !== 'plain' && shape !== 'browser') { resolve('unknown connect shape'); return; }
+    let settled = false, upgraded = false, sent = false, buf = Buffer.alloc(0);
     const key = randomBytes(16).toString('base64');
     const accept = createHash('sha1').update(key + WS_GUID).digest('base64');
     const socket = net.connect({ host, port });
@@ -77,6 +113,10 @@ export function probe({ host = '127.0.0.1', port, token, timeoutMs = 5000 }) {
       try { if (upgraded && !socket.destroyed) socket.write(clientFrame(8, Buffer.from([0x03, 0xe8]))); } catch { /* closing anyway */ }
       socket.end(); socket.destroy();
       resolve(verdict);
+    };
+    const sendConnect = params => {
+      sent = true;
+      socket.write(clientFrame(1, JSON.stringify({ type: 'req', id: CONNECT_ID, method: 'connect', params })));
     };
     const timer = setTimeout(() => finish(`no answer within ${timeoutMs} ms`), timeoutMs);
     socket.on('error', () => finish('cannot reach Studio'));
@@ -100,8 +140,7 @@ export function probe({ host = '127.0.0.1', port, token, timeoutMs = 5000 }) {
         upgraded = true;
         buf = buf.subarray(end + 4);
         // No auth in params: Studio's proxy injects its configured gateway token, as for a browser.
-        socket.write(clientFrame(1, JSON.stringify({ type: 'req', id: CONNECT_ID, method: 'connect',
-          params: { minProtocol: 3, maxProtocol: 3, client: { id: 'cortados-deploy-health', mode: 'probe' } } })));
+        if (shape === 'plain') sendConnect({ minProtocol: 3, maxProtocol: 3, client: { id: 'cortados-deploy-health', mode: 'probe' } });
       }
       let parsed;
       try { parsed = readServerFrames(buf); } catch { return finish('unreadable gateway frame'); }
@@ -111,12 +150,32 @@ export function probe({ host = '127.0.0.1', port, token, timeoutMs = 5000 }) {
         if (opcode !== 1) continue;                    // ping/pong: not needed for a few seconds
         let frame;
         try { frame = JSON.parse(payload.toString('utf8')); } catch { return finish('non-JSON gateway frame'); }
+        if (shape === 'browser' && !sent && frame?.type === 'event' && frame.event === 'connect.challenge') {
+          const nonce = frame.payload?.nonce;
+          if (typeof nonce !== 'string' || !NONCE_RE.test(nonce)) return finish('connect.challenge without a usable nonce');
+          sendConnect(browserConnectParams(nonce));
+          continue;
+        }
         if (frame?.type !== 'res' || frame.id !== CONNECT_ID) continue;   // connect.challenge, presence...
         if (frame.ok === true && frame.payload?.type === 'hello-ok') return finish('ok');
         return finish(`connect refused: ${safeWord(frame.error?.code)}`);
       }
     });
   });
+}
+
+/**
+ * deploy-air.sh's verdict: the plain connect, then the browser-shaped one, both within timeoutMs in
+ * total. 'ok' only if both get the bridge's hello; a failure of the second names it.
+ */
+export async function check({ host = '127.0.0.1', port, token, timeoutMs = 5000 }) {
+  const deadline = Date.now() + timeoutMs;
+  const plain = await probe({ host, port, token, timeoutMs });
+  if (plain !== 'ok') return plain;
+  const left = deadline - Date.now();
+  if (left <= 0) return `no answer within ${timeoutMs} ms`;
+  const browser = await probe({ host, port, token, timeoutMs: left, shape: 'browser' });
+  return browser === 'ok' ? 'ok' : `browser-shaped connect (signed device, no token): ${browser}`;
 }
 
 async function main(argv) {
@@ -132,7 +191,7 @@ async function main(argv) {
   const chunks = [];
   for await (const c of process.stdin) { chunks.push(c); if (chunks.reduce((n, x) => n + x.length, 0) > 8192) break; }
   const token = Buffer.concat(chunks).toString('utf8').trim();
-  const verdict = await probe({ port, token, timeoutMs });
+  const verdict = await check({ port, token, timeoutMs });
   console.log(verdict);
   return verdict === 'ok' ? 0 : 1;
 }

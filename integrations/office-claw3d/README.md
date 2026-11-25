@@ -15,7 +15,8 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `claw3d/avatar-profile-hint.patch` | 6-line Claw3D change so the 3D figures wear the family suits |
 | `claw3d/studio-login.cjs`, `claw3d/studio-login.patch` | login form for Studio's access cookie (`/cortados-login`) and its 3-line wiring |
 | `claw3d/system-fonts.patch` | drops `next/font/google` for system font stacks, so the build never fetches from Google Fonts (its `&skey=` font URLs broke the Turbopack build, 2026-11-24) |
-| `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a `connect` through Studio's own proxy must get the bridge's hello |
+| `claw3d/proxy-auth.patch` | Studio's gateway proxy always sends its configured token to the bridge and drops the browser's device block and credentials (over HTTPS the stock proxy sent no token and the Office closed with 1012, 2026-11-25) |
+| `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a plain `connect` and a browser-shaped one (signed device block, no token) through Studio's own proxy must each get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
 | `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
