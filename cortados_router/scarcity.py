@@ -249,7 +249,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 pass
         finally:
             os._exit(127)    # exec failed (e.g. missing binary): never let the forked copy run the sampler's code
-    _reaper.track(pid, fd, my_dir if reap_root is not None else None, reap_root)
+    reap_claim = _reaper.track(pid, fd, my_dir if reap_root is not None else None, reap_root)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", _PTY_ROWS, _PTY_COLS, 0, 0))
     buf = b""
     eof = False
@@ -412,7 +412,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                                trust_prompt_seen=trust_seen())
             if eof and stage in {"boot", "trust"}:
                 diagnostics["boot_failure"] = _boot_failure_kind(_plain(buf))
-        _reaper.reap(pid, fd, reap_root, my_dir if reap_root is not None else None)
+        _reaper.reap(pid, fd, reap_root, my_dir if reap_root is not None else None, claim=reap_claim)  # one claim shared with the exit-time reaper (#144 round 8)
         if on_reaped is not None:
             on_reaped(pid)
         if own_dir:
@@ -814,15 +814,25 @@ def current_skip(v: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 def lane_state(v: dict[str, Any] | None) -> str | None:
-    """The human state of a cached lane record when its cause is known (LANE_STATE_TEXT), else None."""
+    """The human state of a cached lane record when its cause is known (LANE_STATE_TEXT), else None. A current skip
+    leads (#144 fix round 8): the skip handler keeps the record's older state/error (the retained reading's context),
+    but the skip is the latest event, since a reading or a failure drops `last_skip`. The older cause follows as
+    "previous", by its fixed code, never its text (so the views' text rule passes it; a view may cut it at its length
+    limit, and still publishes the older error_kind as `error`)."""
     if not isinstance(v, dict):
         return None
     if v.get("state") in LANE_STATE_TEXT:
-        return LANE_STATE_TEXT[v["state"]]
-    if v.get("error"):
-        return LANE_STATE_TEXT.get(v.get("error_kind"))
+        older, code = LANE_STATE_TEXT[v["state"]], v["state"]
+    elif v.get("error"):
+        code = v.get("error_kind") if v.get("error_kind") in LANE_STATE_TEXT else "failed"
+        older = LANE_STATE_TEXT.get(v.get("error_kind"))
+    else:
+        older, code = None, None
     sk = current_skip(v)
-    return LANE_STATE_TEXT[sk["reason"]] if sk else None
+    if sk:
+        # code with "-" for "_": the usage view's text rule allows no underscore
+        return LANE_STATE_TEXT[sk["reason"]] + (f" (previous: {code.replace('_', '-')})" if code else "")
+    return older
 
 
 def _agy_pool_of_group(title: str) -> str | None:

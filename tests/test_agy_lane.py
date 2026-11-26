@@ -520,6 +520,54 @@ class ProbeHonesty(AgyBase):
         # a skip reason outside the fixed codes is never published as text
         self.assertIsNone(sc.current_skip({"last_skip": {"reason": "anything else", "since": 1.0}}))
 
+    def _skip_after(self, old, kind="probe_folder_busy"):
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
+
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped", kind=kind)
+        with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()):
+            sc._sample_locked(force=True, only=["antigravity"])
+        return json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+
+    def test_a_skip_after_a_failure_shows_the_skip_with_the_failure_as_previous(self):
+        # #144 fix round 8: workspace_not_trusted, then the owner trusts the folder and leaves agy open in it: the
+        # following probe_folder_busy skips used to keep showing the old refusal.
+        with redirect_stderr(io.StringIO()):
+            failed = sc._failed_record("antigravity", None, sc.ProbeRefused("workspace_not_trusted", "trust"))
+        lane = self._skip_after(failed)
+        self.assertEqual(lane["error_kind"], "workspace_not_trusted")   # the older failure is kept, as context
+        state = sc.lane_state(lane)
+        self.assertEqual(state, "skipped: a process is open in the probe folder (previous: workspace-not-trusted)")
+        entry = usage._one_lane("antigravity", lane, time.time(), sc.reading_freshness)
+        published = usage._publish({"lanes": [entry]}, [])["lanes"][0]
+        self.assertTrue(published["state"].startswith("skipped: a process is open in the probe folder"), published)
+        self.assertEqual((published["skip"]["reason"], published["error"]), ("probe_folder_busy", "workspace_not_trusted"))
+        # an unclassified failure is named only as "failed", never by its text
+        lane = self._skip_after({"tried_at": 1.0, "fetched_at": None, "error": "RuntimeError: vendor screen text",
+                                 "error_kind": "vendor-screen-text"}, kind="probe_busy")
+        self.assertEqual(sc.lane_state(lane), "skipped: another probe holds the probe folder (previous: failed)")
+
+    def test_a_skip_after_not_configured_shows_the_skip(self):
+        rec = {"state": "not-configured", "note": "x", "windows": [], "pools": {}, "scarcity": None, "refusing": False,
+               "fetched_at": None, "tried_at": 1.0, "error": None, "error_kind": None}
+        lane = self._skip_after(rec, kind="probe_leftover_running")
+        self.assertEqual(sc.lane_state(lane),
+                         "skipped: a previous probe's agy is still running (previous: not-configured)")
+        self.assertEqual(sc.lane_state(rec), "not configured")          # without a skip: unchanged
+
+    def test_live_view_carries_the_skip(self):
+        lane = self._skip_after({"windows": [], "tried_at": 1.0, "fetched_at": time.time(), "error": None})
+        now = time.time()
+        entry = usage._one_lane("antigravity", lane, now, sc.reading_freshness)
+        u = usage._publish({"lanes": [entry]}, [])
+        out = live.subscriptions_section(u, now)["lanes"][0]
+        self.assertEqual(out["skip"], {"reason": "probe_folder_busy", "since": lane["last_skip"]["since"]})
+        self.assertEqual(out["state"], "skipped: a process is open in the probe folder")
+        self.assertIsNone(live.subscriptions_section({"lanes": [{**entry, "skip": None}]}, now)["lanes"][0]["skip"])
+        self.assertIsNone(live.subscriptions_section({"lanes": [{**entry, "skip": "x"}]}, now)["lanes"][0]["skip"])
+
     def test_a_later_failure_or_reading_ends_the_skip(self):
         lane = {"windows": [], "fetched_at": 5.0, "tried_at": 5.0, "error": None,
                 "last_skip": {"reason": "probe_busy", "at": 9.0, "since": 6.0}}

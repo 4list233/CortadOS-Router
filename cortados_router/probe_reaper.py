@@ -29,14 +29,32 @@ STALE_PROBE_AGE_S = 600
 # Executable names the vendor CLIs and their helpers run under; lsof matches these as name prefixes.
 PROBE_COMMANDS = ("claude", "agy", "cursor-agent", "codex", "node")
 
-_active: dict[int, tuple[int, Path | None, Path]] = {}      # child pid -> (pty fd, probe folder, probe root)
+class Child:
+    """One tracked probe child and the single claim on its cleanup (#144 fix round 8). The normal end of a probe and the
+    exit-time reaper can run reap() on the same child at once; reap() holds `lock` for its whole run and sets `reaped`
+    when done, so exactly one path signals, closes the PTY fd and waits, and the other then does nothing. Signals are
+    sent only under the lock while `reaped` is unset, i.e. while the child is still our unreaped child: an unreaped
+    (even zombie) child keeps its pid and pgid, so neither can have been reused. A second close of the fd could close
+    an unrelated file that reused the number; the claim prevents that too."""
+    __slots__ = ("pid", "fd", "my_dir", "probe_dir", "lock", "reaped")
+
+    def __init__(self, pid: int, fd: int, my_dir: Path | None, probe_dir: Path | None):
+        self.pid, self.fd, self.my_dir, self.probe_dir = pid, fd, my_dir, probe_dir
+        self.lock = threading.Lock()
+        self.reaped = False
+
+
+_active: dict[int, Child] = {}      # child pid -> its claim, while its probe runs
 _active_lock = threading.Lock()
 
 
-def track(pid: int, fd: int, my_dir: Path | None, probe_dir: Path | None) -> None:
-    """Record a running probe so a process exit mid-probe still reaps it."""
+def track(pid: int, fd: int, my_dir: Path | None, probe_dir: Path | None) -> Child:
+    """Record a running probe so a process exit mid-probe still reaps it. Returns the claim; the probe passes it to
+    reap() so both cleanup paths share it even after the entry left _active."""
+    child = Child(pid, fd, my_dir, probe_dir)
     with _active_lock:
-        _active[pid] = (fd, my_dir, probe_dir)
+        _active[pid] = child
+    return child
 
 
 def untrack(pid: int) -> None:
@@ -45,12 +63,12 @@ def untrack(pid: int) -> None:
 
 
 def _reap_active() -> None:
-    """atexit: reap every probe whose thread did not finish before the interpreter began shutting down."""
+    """atexit: reap every probe whose thread did not finish before the interpreter began shutting down. Entries stay
+    in _active until their reap finishes, so a probe thread finishing at the same time finds the same claim."""
     with _active_lock:
-        pending = list(_active.items())
-        _active.clear()
-    for pid, (fd, my_dir, probe_dir) in pending:
-        reap(pid, fd, probe_dir, my_dir)
+        pending = list(_active.values())
+    for child in pending:
+        reap(child.pid, child.fd, child.probe_dir, child.my_dir, claim=child)
 
 
 atexit.register(_reap_active)
@@ -135,15 +153,35 @@ def _inside(path: str, folder: Path) -> bool:
     return path == folder_s or path.startswith(folder_s + os.sep)
 
 
-def reap(pid: int, fd: int, probe_dir: Path | None, my_dir: Path | None = None) -> None:
+def reap(pid: int, fd: int, probe_dir: Path | None, my_dir: Path | None = None, claim: Child | None = None) -> None:
     """Kill the probe CLI and EVERY descendant, then anything left with cwd in the probe folder. 2026-09-26: the old killpg
     left 437 orphaned claude/agy/cursor/codex helpers (load 63, gateway liveness kills). Order matters on macOS: close the
     PTY master before waiting.
     probe_dir None (the agy probe's shared fixed folder, #144 fix rounds 6-7): only the spawned child and its own process
     group (pty.fork made it a session leader, so its pgid is its pid) are signalled, while the child is still unreaped,
     so neither id can have been reused. No descendant scan (a scanned pid can be reused before the kill) and no kill by
-    cwd. A helper that left the group and stays in the folder makes the next sample skip `probe_folder_busy`."""
-    untrack(pid)
+    cwd. A helper that left the group and stays in the folder makes the next sample skip `probe_folder_busy`.
+    claim: the Child that track() returned; without it the tracked entry for pid is used, or a fresh one for an
+    untracked child. Whichever caller takes the claim first does the whole cleanup; a later one returns at once."""
+    if claim is None:
+        with _active_lock:
+            claim = _active.get(pid)
+        if claim is None or claim.fd != fd:
+            claim = Child(pid, fd, my_dir, probe_dir)
+    with claim.lock:
+        if claim.reaped:
+            return
+        try:
+            _reap_claimed(pid, fd, probe_dir, my_dir)
+        finally:
+            claim.reaped = True
+            with _active_lock:
+                if _active.get(pid) is claim:
+                    del _active[pid]
+
+
+def _reap_claimed(pid: int, fd: int, probe_dir: Path | None, my_dir: Path | None) -> None:
+    """reap()'s work, run only by the holder of the child's claim."""
     tree = descendants(pid) if probe_dir is not None else []
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for p in [pid, *tree]:
@@ -183,7 +221,7 @@ def sweep_stale(probe_dir: Path, max_age_s: float = STALE_PROBE_AGE_S, now: floa
     Called under the scarcity sampler's cross-process lock, so no other sampler is starting probes meanwhile."""
     now = time.time() if now is None else now
     with _active_lock:
-        mine = {d for _, d, _ in _active.values() if d is not None}
+        mine = {c.my_dir for c in _active.values() if c.my_dir is not None}
     stale = []
     for folder in probe_dir.glob("p*"):
         try:
