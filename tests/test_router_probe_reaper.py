@@ -134,3 +134,105 @@ class ProbeReaper(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixedFolderHelpers(unittest.TestCase):
+    """#144 fix round 6: the agy probe's shared fixed folder is checked read-only and never swept by cwd."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="probe-reaper-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(self.tmp))
+        self.addCleanup(lambda: (self.proc.poll() is None and self.proc.kill(), self.proc.wait()))
+        deadline = time.time() + 10
+        while reaper.process_identity(self.proc.pid) is None and time.time() < deadline:
+            time.sleep(0.05)
+
+    def test_cwd_pids_in_lists_any_command(self):
+        deadline = time.time() + 10
+        while self.proc.pid not in reaper.cwd_pids_in(self.tmp) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertIn(self.proc.pid, reaper.cwd_pids_in(self.tmp))      # python, not one of PROBE_COMMANDS
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertEqual(reaper.cwd_pids_in(empty), [])
+
+    def test_process_identity(self):
+        uid, start = reaper.process_identity(self.proc.pid)
+        self.assertEqual(uid, os.geteuid())
+        self.assertRegex(start, r"\d{4}$")
+        self.proc.kill(); self.proc.wait()
+        self.assertIsNone(reaper.process_identity(self.proc.pid))
+
+    def test_reap_without_a_probe_dir_kills_no_bystander_by_cwd(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(self.tmp))
+        r, w = os.pipe()
+        os.close(w)
+        reaper.reap(child.pid, r, None)
+        self.assertIsNotNone(child.poll())                # the probe's own child: reaped
+        self.assertIsNone(self.proc.poll())               # a process in the same folder: untouched
+
+
+class OneCleanupClaim(unittest.TestCase):
+    """#144 fix round 8: a probe's normal reap and the exit-time reaper share one claim per child, so no signal (and no
+    second fd close) reaches a pid or pgid after the child was reaped: a reaped pid may already belong to someone else."""
+
+    PID, FD = 424242, 4242
+
+    def _run(self, normal_first):
+        from unittest import mock
+        import threading
+        events, lock = [], threading.Lock()
+        real_sleep = time.sleep
+        reaped = {"done": False}
+        started = threading.Event()
+        other = []
+
+        def log(*e):
+            with lock:
+                events.append(e)
+
+        def waitpid(pid, flags):
+            if reaped["done"]:
+                raise ChildProcessError()
+            reaped["done"] = True
+            log("reaped", pid)
+            return pid, 0
+
+        def shutdown():
+            started.set()
+            reaper._reap_active()
+
+        def sleep(s):
+            # the first path is mid-reap (between SIGTERM and SIGKILL): the other path runs now, as in the reproduction
+            if not other:
+                t = threading.Thread(target=shutdown if normal_first else lambda: (started.set(), reaper.reap(
+                    self.PID, self.FD, None, None, claim=claim)))
+                other.append(t); t.start(); started.wait(5); real_sleep(0.2)
+
+        with mock.patch.object(reaper.os, "kill", lambda p, s: log("kill", p, s)), \
+                mock.patch.object(reaper.os, "killpg", lambda p, s: log("killpg", p, s)), \
+                mock.patch.object(reaper.os, "close", lambda fd: log("close", fd)), \
+                mock.patch.object(reaper.os, "waitpid", waitpid), \
+                mock.patch.object(reaper.time, "sleep", sleep):
+            claim = reaper.track(self.PID, self.FD, None, None)
+            if normal_first:
+                reaper.reap(self.PID, self.FD, None, None, claim=claim)
+            else:
+                reaper._reap_active()
+            for t in other:
+                t.join(10)
+        self.assertNotIn(self.PID, reaper._active)
+        kinds = [e[0] for e in events]
+        self.assertEqual(kinds.count("reaped"), 1, events)
+        after = kinds[kinds.index("reaped"):]
+        self.assertFalse({"kill", "killpg", "close"} & set(after),
+                         f"probe_reaper: nothing may be signalled or closed after the child was reaped: {events}")
+        self.assertEqual(kinds.count("kill") + kinds.count("killpg"), 4, events)   # SIGTERM + SIGKILL, child + group, once
+        self.assertEqual(kinds.count("close"), 1, events)
+
+    def test_shutdown_during_normal_reap_signals_nothing_after_reap(self):
+        self._run(normal_first=True)
+
+    def test_normal_reap_during_shutdown_signals_nothing_after_reap(self):
+        self._run(normal_first=False)

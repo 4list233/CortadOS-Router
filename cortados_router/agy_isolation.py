@@ -172,8 +172,9 @@ def resolve_binary(configured: str | None) -> str:
 _DISPLAY_ONLY = "display only: changes how the screen is drawn, never what agy runs or how it bills"
 # ~/.gemini/antigravity-cli/settings.json. MISSING = agy's first run is pending (FirstRunPending, not "unsafe").
 AGY_SETTINGS_SCHEMA: dict[str, Any] = {
-    # the folders the owner answered "trust" for; trust only skips agy's own prompt for that folder (the probe runs in a
-    # fresh per-run folder, so it never relies on this list), it grants no tool and changes no billing
+    # the folders the owner answered "trust" for; trust only skips agy's own prompt for that folder, it grants no tool and
+    # changes no billing. The /usage probe's fixed folder is trusted here by the owner once, by hand (docs/AGY-LANE.md);
+    # the router reads this file, never writes it
     "trustedWorkspaces": [str],
 }
 # ~/.gemini/config/config.json. Missing is fine: no plugin is configured.
@@ -489,8 +490,8 @@ def prepare(configured: str | None, environ: Mapping[str, str], env_file: Mappin
             workdir: str | os.PathLike) -> tuple[str, dict[str, str]]:
     """Every agy process the router starts goes through here first (the /usage probe and `agy models`): the configured
     absolute binary, the allowlisted env (Google-family names in the env file: ForbiddenEnv), the settings guard, the
-    dotenv guard for `workdir` (the fixed parent the per-run folder is made in). The caller checks the per-run folder
-    itself again with check_dotenv just before the start. Returns (binary, env); raises an AgyLaneError before
+    dotenv guard for `workdir` (the /usage probe's fixed folder, or the fixed parent `agy models`' per-run folder is made
+    in). The caller checks the folder it starts agy in again with check_dotenv just before the start. Returns (binary, env); raises an AgyLaneError before
     anything is started."""
     binary = resolve_binary(configured)
     env = child_env(environ, env_file)

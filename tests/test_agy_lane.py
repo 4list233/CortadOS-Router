@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -49,6 +50,8 @@ LOG = {log!r}
 SCREENS = {screens!a}    # ASCII escapes: Python 3.9's tokenizer can misread a long line of multibyte text
 with open(LOG + ".env", "w") as f:
     f.write("\n".join(sorted(os.environ)))
+with open(LOG + ".cwd", "w") as f:
+    f.write(os.path.realpath(os.getcwd()))
 try:
     tty.setraw(0)
 except Exception:
@@ -61,10 +64,14 @@ def view(top):
     return ("\x1b[2J\x1b[H" + "\n".join(L[top:top + H])
             + "\n(%d\u2013%d of %d lines)  \u2191/\u2193 scroll \u00b7 pgdown page \u00b7 ctrl+end Bottom\n" % (top + 1, min(top + H, len(L)), len(L)))
 top = 0
+time.sleep(SCREENS.get("start_delay", 0))    # a slow start-up: nothing painted yet
 out(SCREENS["boot"])
 for step in SCREENS.get("boot_later", []):    # painted later, as agy does while it signs in
     time.sleep(0.6)
-    out(step)
+    if step.startswith("RAW:"):              # bytes as given: a bare LF stays a bare LF
+        os.write(1, step[4:].encode())
+    else:
+        out(step)
 got = b""
 while True:
     try:
@@ -76,6 +83,8 @@ while True:
     got += d
     with open(LOG + ".keys", "wb") as f:
         f.write(got)
+    with open(LOG + ".times", "a") as f:
+        f.write("%f %r\n" % (time.time(), d))
     if "after_trust" in SCREENS and got == b"\r":
         out(SCREENS["after_trust"])
     if "usage" in SCREENS and got.endswith(b"/usage\r"):
@@ -276,9 +285,21 @@ class ProbeHonesty(AgyBase):
     def test_account_picker_email_without_the_notice_gets_no_keystroke(self):
         binary, log = self.fake({"boot": "Antigravity CLI 1.5.16\n" + self.PICKER, "usage": FIXTURE.read_text()})
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
-            with self.assertRaises(iso.SubscriptionUnproven):
+            with self.assertRaises(sc.ProbeRefused) as cm:      # the picker is a sign-in screen: refused mid-read
                 sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed), ("not-logged-in", []))
+        self.assertIn("account-picker", cm.exception.facts["rules"])
         self.assertEqual(self.keys(log), b"")
+
+    def test_account_picker_and_consent_screens_match_a_refusal_rule(self):
+        for screen in (self.PICKER, "Choose an account\n", "Select your account\n",
+                       "Antigravity CLI wants to access your Google Account\n", "Grant access to continue\n"):
+            with self.subTest(screen=screen):
+                self.assertTrue(any(re.search(p, screen, re.I) for _, p in sc.AGY_REFUSE))
+        for benign in (BANNER, FIXTURE.read_text()):
+            self.assertFalse(any(re.search(p, benign, re.I) for _, p in sc.AGY_REFUSE))
+        # the trust prompt matches the workspace_not_trusted rule and no other (#144 fix round 5)
+        self.assertEqual([k for k, p in sc.AGY_REFUSE if re.search(p, TRUST, re.I)], ["workspace_not_trusted"])
 
     def test_bare_email_is_not_boot_ready_or_settled_but_the_banner_is(self):
         self.assertFalse(sc.AGY_BOOT_READY("Choose account: test@example.invalid"))
@@ -295,7 +316,10 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(sc.AGY_REFUSE[0][1],
                          r"accounts\.google\.com|sign in with google|authori[sz]ation (?:url|code)|paste (?:the|your) (?:authori[sz]ation )?code"
                          r"|" + sc._AGY_NOT_SIGNED_IN + r"(?![.\s]*\S?\s*signing in)(?![.\s]*$)"
-                         r"|please (?:sign|log) in|login required")
+                         r"|please (?:sign|log) in|login required"
+                         r"|choose (?:an? |your )?account|select (?:an? |your )?account|use another account"
+                         r"|wants to access your google account|(?:grant|allow) (?:access|permission)|\bconsent\b"
+                         r"|select (?:a |your )?log\s?in method|google oauth|use a google cloud project")
 
     def test_notice_repainted_after_the_banner_is_refused_with_facts_and_nothing_typed(self):
         repaint = "\x1b[2J\x1b[HWelcome to the Antigravity CLI. You are currently not signed in.\n> \n"
@@ -353,13 +377,496 @@ class ProbeHonesty(AgyBase):
         self.assertEqual(cm.exception.kind, "first-run-pending")
         self.assertEqual(self.keys(log), b"")
 
-    def test_only_the_trust_prompt_is_answered(self):
-        binary, log = self.fake({"boot": TRUST, "after_trust": LOGGED_OUT})
+    # ---- #144 fix round 5: agy runs in ONE fixed folder the owner trusts once by hand. Before the banner's account line
+    # is proven the probe types NOTHING: a trust prompt means the folder is not trusted and refuses
+    # `workspace_not_trusted` with zero keystrokes. Rounds 1-4's "is the prompt still on screen" geometry is gone.
+    def test_trust_prompt_before_the_account_line_gets_no_keystroke(self):
+        for screens in ({"boot": TRUST}, {"boot": SIGNING_IN, "boot_later": [TRUST]},
+                        {"boot": "\x1b[12;30H" + TRUST}):
+            binary, log = self.fake({**screens, "after_trust": BANNER, "usage": FIXTURE.read_text()})
+            with self.subTest(screens=screens), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("workspace_not_trusted", [], b""))
+                self.assertIs(cm.exception.facts["trust_prompt_seen"], True)
+                self.assertIn("nothing was typed", str(cm.exception))
+                rec = sc._failed_record("antigravity", None, cm.exception)
+                self.assertEqual(rec["error_kind"], "workspace_not_trusted")
+                self.assertIn("not trusted", sc.lane_state(rec))
+                self.assertIs(rec["refusal"]["trust_prompt_seen"], True)
+                self.assertNotIn("Trust", json.dumps(rec["refusal"]))
+
+    def test_trust_prompt_after_the_banner_is_refused_too(self):
+        binary, log = self.fake({"boot": BANNER, "boot_later": [TRUST], "usage": FIXTURE.read_text()})
         with self.env(binary):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
-        self.assertEqual(cm.exception.kind, "not-logged-in")
-        self.assertEqual(self.keys(log), b"\r")       # one Enter for the trust prompt; /usage never typed
+        self.assertEqual((cm.exception.kind, self.keys(log)), ("workspace_not_trusted", b""))
+
+    def test_review_reproductions_get_no_keystroke(self):
+        # round-4 review: a DECSTBM scroll region then CUP and newlines, and a bare LF in raw mode, hid the prompt yet
+        # passed the geometry check. With no keystroke before the account line, both are refused, nothing typed.
+        for later in ([TRUST, "RAW:\x1b[1;2r\x1b[2;1H" + "\n" * 5 + "Loading\n"],
+                      ["RAW:Trust this workspace [Y/n]\n\n\n"],
+                      ["RAW:\x1b[1;2r\x1b[60;1H\n\n" + "Do you trust the contents of this folder?\r\n", BANNER]):
+            binary, log = self.fake({"boot": SIGNING_IN, "boot_later": later, "after_trust": BANNER,
+                                     "usage": FIXTURE.read_text()})
+            with self.subTest(later=later), self.env(binary), \
+                    mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+                with self.assertRaises(sc.ProbeRefused) as cm:
+                    sc._antigravity()
+                self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("workspace_not_trusted", [], b""))
+
+    def test_trust_prompt_with_a_sign_in_screen_gets_no_keystroke(self):
+        binary, log = self.fake({"boot": LOGGED_OUT + TRUST, "after_trust": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, self.keys(log), cm.exception.typed), ("not-logged-in", b"", []))
+
+    def test_unsettled_without_a_trust_prompt_records_none(self):
+        binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertIs(cm.exception.facts["trust_prompt_seen"], False)
+        self.assertNotIn("trust_rejected", cm.exception.facts)
+
+    def test_normal_path_runs_in_the_fixed_folder(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [BANNER], "usage": FIXTURE.read_text()})
+        with self.env(binary):
+            rec = sc._antigravity()
+        root, workspace, lock = sc.agy_probe_paths()
+        self.assertEqual((root, workspace, lock), (sc.STATE / "agy-probe", sc.STATE / "agy-probe" / "workspace",
+                                                    sc.STATE / "agy-probe" / "lock"))
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"/usage\r")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(workspace))
+        self.assertEqual((workspace.stat().st_mode & 0o777, root.stat().st_mode & 0o777), (0o700, 0o700))
+        self.assertEqual(list(workspace.iterdir()), [])          # kept, empty, for the next run
+        self.assertFalse(sc.PROBE_DIR.exists() and any(sc.PROBE_DIR.iterdir()))
+        with self.env(binary):                                   # the same folder again: the lock was released
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+
+    def test_lock_held_skips_the_sample_and_starts_no_agy(self):
+        import fcntl
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, lock = sc.agy_probe_paths()
+        root.mkdir(mode=0o700); os.chmod(root, 0o700)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        t0 = time.time()
+        with self.env(binary), mock.patch.object(sc, "AGY_PROBE_LOCK_WAIT_S", 0.5), \
+                mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
+                sc._antigravity()
+        self.assertLess(time.time() - t0, 5)
+        self.assertEqual(cm.exception.kind, "probe_busy")
+        self.assertEqual(self.keys(log), b"")
+
+    def test_skipped_sample_keeps_the_last_reading_out_of_the_history(self):
+        old = {"windows": [{"window": "week (gemini)", "pool": "gemini", "used_pct": 1.0}], "tried_at": 1.0,
+               "fetched_at": 1.0, "error": None}
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
+
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped: another probe held the lock")
+        with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()) as err:
+            sc._sample_locked(force=True, only=["antigravity"])
+        lane = json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+        self.assertEqual((lane["windows"], lane["fetched_at"], lane["last_skip"]["reason"]),
+                         (old["windows"], 1.0, "probe_busy"))
+        self.assertFalse(lane.get("error"))
+        self.assertIn("skipped (probe_busy)", err.getvalue())
+        hist = sc.HISTORY.read_text().splitlines() if sc.HISTORY.exists() else []
+        self.assertTrue(all("antigravity" not in json.loads(h)["lanes"] for h in hist))
+
+    def test_skip_is_published_with_its_since_time_and_goes_stale(self):
+        old = {"windows": [{"window": "week (gemini)", "pool": "gemini", "used_pct": 1.0}], "tried_at": 1.0,
+               "fetched_at": time.time(), "error": None}
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
+
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped: 1 process(es) open", kind="probe_folder_busy")
+        sinces = []
+        for _ in range(2):
+            with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                    mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                    mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()):
+                sc._sample_locked(force=True, only=["antigravity"])
+            lane = json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+            sinces.append(lane["last_skip"]["since"])
+        self.assertEqual(sinces[0], sinces[1])                       # since the first skip of the run, not the latest
+        self.assertEqual(lane["fetched_at"], old["fetched_at"])      # the retained reading is not a new sample
+        self.assertEqual(sc.lane_state(lane), "skipped: a process is open in the probe folder")
+        self.assertEqual(sc.current_skip(lane), {"reason": "probe_folder_busy", "since": sinces[0]})
+        now = sinces[0] + 1
+        self.assertEqual(sc.reading_freshness("antigravity", lane, now=now), (True, False))
+        entry = usage._one_lane("antigravity", lane, now, sc.reading_freshness)
+        self.assertEqual((entry["state"], entry["skip"], entry["stale"]),
+                         ("skipped: a process is open in the probe folder",
+                          {"reason": "probe_folder_busy", "since": sinces[0]}, False))
+        # past SKIP_STALE_INTERVALS sample intervals the retained reading is stale, with the skip as its state
+        later = sinces[0] + sc.SKIP_STALE_INTERVALS * sc.MIN_INTERVAL["antigravity"] + 1
+        self.assertEqual(sc.reading_freshness("antigravity", lane, now=later), (False, False))
+        entry = usage._one_lane("antigravity", lane, later, sc.reading_freshness)
+        self.assertEqual((entry["stale"], entry["skip"]["reason"], entry["error"]), (True, "probe_folder_busy", None))
+        published = usage._publish({"lanes": [entry]}, [])
+        self.assertEqual(published["lanes"][0]["skip"], {"reason": "probe_folder_busy", "since": sinces[0]})
+        # a skip reason outside the fixed codes is never published as text
+        self.assertIsNone(sc.current_skip({"last_skip": {"reason": "anything else", "since": 1.0}}))
+
+    def _skip_after(self, old, kind="probe_folder_busy"):
+        sc.CACHE.write_text(json.dumps({"fetched_at": 0, "lanes": {"antigravity": old}}))
+
+        def busy():
+            raise sc.ProbeSkipped("agy probe skipped", kind=kind)
+        with mock.patch.dict(sc.SAMPLERS, {"antigravity": busy}), \
+                mock.patch.object(sc._reaper, "sweep_stale", return_value=None), \
+                mock.patch.object(sc, "_learn_unit_costs", lambda: None), redirect_stderr(io.StringIO()):
+            sc._sample_locked(force=True, only=["antigravity"])
+        return json.loads(sc.CACHE.read_text())["lanes"]["antigravity"]
+
+    def test_a_skip_after_a_failure_shows_the_skip_with_the_failure_as_previous(self):
+        # #144 fix round 8: workspace_not_trusted, then the owner trusts the folder and leaves agy open in it: the
+        # following probe_folder_busy skips used to keep showing the old refusal.
+        with redirect_stderr(io.StringIO()):
+            failed = sc._failed_record("antigravity", None, sc.ProbeRefused("workspace_not_trusted", "trust"))
+        lane = self._skip_after(failed)
+        self.assertEqual(lane["error_kind"], "workspace_not_trusted")   # the older failure is kept, as context
+        state = sc.lane_state(lane)
+        self.assertEqual(state, "skipped: a process is open in the probe folder (previous: workspace-not-trusted)")
+        entry = usage._one_lane("antigravity", lane, time.time(), sc.reading_freshness)
+        published = usage._publish({"lanes": [entry]}, [])["lanes"][0]
+        self.assertTrue(published["state"].startswith("skipped: a process is open in the probe folder"), published)
+        self.assertEqual((published["skip"]["reason"], published["error"]), ("probe_folder_busy", "workspace_not_trusted"))
+        # an unclassified failure is named only as "failed", never by its text
+        lane = self._skip_after({"tried_at": 1.0, "fetched_at": None, "error": "RuntimeError: vendor screen text",
+                                 "error_kind": "vendor-screen-text"}, kind="probe_busy")
+        self.assertEqual(sc.lane_state(lane), "skipped: another probe holds the probe folder (previous: failed)")
+
+    def test_a_skip_after_not_configured_shows_the_skip(self):
+        rec = {"state": "not-configured", "note": "x", "windows": [], "pools": {}, "scarcity": None, "refusing": False,
+               "fetched_at": None, "tried_at": 1.0, "error": None, "error_kind": None}
+        lane = self._skip_after(rec, kind="probe_leftover_running")
+        self.assertEqual(sc.lane_state(lane),
+                         "skipped: a previous probe's agy is still running (previous: not-configured)")
+        self.assertEqual(sc.lane_state(rec), "not configured")          # without a skip: unchanged
+
+    def test_live_view_carries_the_skip(self):
+        lane = self._skip_after({"windows": [], "tried_at": 1.0, "fetched_at": time.time(), "error": None})
+        now = time.time()
+        entry = usage._one_lane("antigravity", lane, now, sc.reading_freshness)
+        u = usage._publish({"lanes": [entry]}, [])
+        out = live.subscriptions_section(u, now)["lanes"][0]
+        self.assertEqual(out["skip"], {"reason": "probe_folder_busy", "since": lane["last_skip"]["since"]})
+        self.assertEqual(out["state"], "skipped: a process is open in the probe folder")
+        self.assertIsNone(live.subscriptions_section({"lanes": [{**entry, "skip": None}]}, now)["lanes"][0]["skip"])
+        self.assertIsNone(live.subscriptions_section({"lanes": [{**entry, "skip": "x"}]}, now)["lanes"][0]["skip"])
+
+    def test_a_later_failure_or_reading_ends_the_skip(self):
+        lane = {"windows": [], "fetched_at": 5.0, "tried_at": 5.0, "error": None,
+                "last_skip": {"reason": "probe_busy", "at": 9.0, "since": 6.0}}
+        rec = sc._failed_record("antigravity", lane, RuntimeError("boom"))
+        self.assertNotIn("last_skip", rec)
+        self.assertIsNone(sc.current_skip(rec))
+
+    def test_usage_view_skip_codes_match_scarcity(self):
+        allowed = usage._LANE.fields["skip"].fields["reason"]
+        self.assertEqual([k for k in sc.SKIP_KINDS if allowed(k) == k], list(sc.SKIP_KINDS))
+        self.assertIsNone(allowed("other"))
+        self.assertTrue(all(k in sc.LANE_STATE_TEXT for k in sc.SKIP_KINDS))
+
+    def test_non_empty_folder_is_refused_before_agy_starts(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = sc.agy_probe_paths()
+        workspace.mkdir(parents=True, mode=0o700); os.chmod(workspace.parent, 0o700); os.chmod(workspace, 0o700)
+        for leftover in ("notes.txt", ".agents"):
+            (workspace / leftover).mkdir() if leftover.startswith(".") else (workspace / leftover).write_text("x")
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                sc._antigravity()
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual((rec["error_kind"], sc.lane_state(rec)), ("probe_folder_not_clean", "refused: probe folder not empty"))
+        self.assertIn("2 entries", str(cm.exception))
+        self.assertNotIn("notes", str(cm.exception))             # a count only, never the names
+        self.assertEqual(sc.AGY_WORKSPACE_LEFTOVERS, frozenset())
+
+    def test_folder_with_a_symlinked_ancestor_is_refused(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        real = self.tmp / "elsewhere"
+        real.mkdir(mode=0o700)
+        for link_at in ("state", "agy-probe", "workspace"):
+            with self.subTest(link_at=link_at):
+                state = self.tmp / f"s-{link_at}"
+                if link_at == "state":
+                    state.symlink_to(real)
+                else:
+                    state.mkdir()
+                    if link_at == "agy-probe":
+                        (state / "agy-probe").symlink_to(real)
+                    else:
+                        (state / "agy-probe").mkdir(mode=0o700)
+                        (state / "agy-probe" / "workspace").symlink_to(real)
+                with self.env(binary), mock.patch.object(sc, "STATE", state), \
+                        mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                    with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                        sc._antigravity()
+                self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
+
+    def test_folder_open_to_others_is_refused_and_not_fixed(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = sc.agy_probe_paths()
+        workspace.mkdir(parents=True)
+        os.chmod(workspace.parent, 0o700); os.chmod(workspace, 0o755)
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
+        self.assertEqual(workspace.stat().st_mode & 0o777, 0o755)
+
+    # ---------------------------------------------------------------- fix round 6: fd-bound folder, no kill by cwd
+    def make_folder(self) -> tuple[Path, Path, Path]:
+        root, workspace, lock = sc.agy_probe_paths()
+        workspace.mkdir(parents=True)
+        os.chmod(root, 0o700); os.chmod(workspace, 0o700)
+        return root, workspace, lock
+
+    def sleeper(self, cwd: Path):
+        import subprocess
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], cwd=str(cwd))
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait()))
+        deadline = time.time() + 10          # its identity is readable once ps sees it
+        while sc._reaper.process_identity(proc.pid) is None and time.time() < deadline:
+            time.sleep(0.05)
+        return proc
+
+    def write_record(self, root: Path, rec: dict) -> None:
+        p = root / sc.AGY_PROBE_CHILD_RECORD
+        p.write_text(json.dumps(rec)); os.chmod(p, 0o600)
+
+    def test_process_open_in_the_folder_skips_the_sample_and_is_not_killed(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        _, workspace, _ = self.make_folder()
+        proc = self.sleeper(workspace)       # e.g. the owner's own agy during the one-time trust step
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_folder_busy")
+        self.assertEqual(sc.LANE_STATE_TEXT["probe_folder_busy"], "skipped: a process is open in the probe folder")
+        time.sleep(0.3)
+        self.assertIsNone(proc.poll())       # still running: never killed
+        self.assertEqual(self.keys(log), b"")
+
+    def test_recorded_probe_child_still_alive_skips_and_kills_nothing(self):
+        # #144 fix round 7: the next run never kills by a recorded pid (it can be reused between check and kill)
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)        # the dead sampler's child, outside the folder (its cwd is not the proof)
+        uid, start = sc._reaper.process_identity(proc.pid)
+        self.write_record(root, {"pid": proc.pid, "uid": uid, "start": start})
+        with self.env(binary), mock.patch.object(sc.os, "kill", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc.os, "killpg", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc._reaper.os, "kill", side_effect=AssertionError("must not kill")), \
+                mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises(sc.ProbeSkipped) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "probe_leftover_running")
+        self.assertIn("probe_leftover_running", sc.SKIP_KINDS)
+        time.sleep(0.3)
+        self.assertIsNone(proc.poll())                                   # still running
+        self.assertTrue((root / sc.AGY_PROBE_CHILD_RECORD).exists())     # kept: the next run checks again
+        self.assertEqual(self.keys(log), b"")
+
+    def test_record_not_matching_a_live_process_is_dropped_and_the_sample_runs(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)
+        uid, start = sc._reaper.process_identity(proc.pid)
+        proc.kill(); proc.wait()
+        self.write_record(root, {"pid": proc.pid, "uid": uid, "start": start})      # gone
+        with self.env(binary):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+        self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_end_of_probe_cleanup_signals_only_the_spawned_group(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        spawned, kills, groups = [], [], []
+        real_kill, real_killpg = os.kill, os.killpg
+
+        def kill(p, sig):
+            kills.append(p); return real_kill(p, sig)
+
+        def killpg(p, sig):
+            groups.append(p); return real_killpg(p, sig)
+        with self.env(binary), mock.patch.object(sc.agy_probe_workspace, "record_child",
+                                                 lambda ws, pid: spawned.append(pid)), \
+                mock.patch.object(sc._reaper, "descendants", side_effect=AssertionError("no descendant scan")), \
+                mock.patch.object(sc._reaper.os, "kill", kill), mock.patch.object(sc._reaper.os, "killpg", killpg):
+            sc._antigravity()
+        [pid] = spawned
+        self.assertEqual(set(kills), {pid})
+        self.assertEqual(set(groups), {pid})          # pty.fork: the child leads its own group
+
+    def test_recycled_pid_is_not_killed(self):
+        root, _, _ = self.make_folder()
+        proc = self.sleeper(self.tmp)
+        uid, _ = sc._reaper.process_identity(proc.pid)
+        for rec in ({"pid": proc.pid, "uid": uid, "start": "Thu Jan  1 00:00:00 2026"},       # other start time
+                    {"pid": proc.pid, "uid": uid + 1, "start": sc._reaper.process_identity(proc.pid)[1]}):  # other uid
+            with self.subTest(rec=rec):
+                self.write_record(root, rec)
+                with sc.agy_probe_workspace():
+                    pass
+                time.sleep(0.3)
+                self.assertIsNone(proc.poll())
+                self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_the_probe_records_its_child_and_drops_the_record_after(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, _, _ = sc.agy_probe_paths()
+        seen = []
+        real = sc.agy_probe_workspace.record_child
+
+        def spy(ws, pid):
+            real(ws, pid)
+            seen.append((pid, json.loads((root / sc.AGY_PROBE_CHILD_RECORD).read_text()),
+                         oct((root / sc.AGY_PROBE_CHILD_RECORD).stat().st_mode & 0o777)))
+        with self.env(binary), mock.patch.object(sc.agy_probe_workspace, "record_child", spy):
+            sc._antigravity()
+        [(pid, rec, mode)] = seen
+        self.assertEqual((rec["pid"], rec["uid"], mode), (pid, os.geteuid(), "0o600"))
+        self.assertTrue(rec["start"])
+        self.assertFalse((root / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_the_end_of_probe_cleanup_never_kills_by_cwd(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc._reaper, "probe_cwd_pids",
+                                                 side_effect=AssertionError("no kill by cwd")):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+
+    def test_ancestor_writable_by_others_is_refused(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        for mode in (0o775, 0o757, 0o777):
+            with self.subTest(mode=oct(mode)):
+                shared = self.tmp / f"shared-{mode:o}"
+                (shared / "state").mkdir(parents=True)
+                os.chmod(shared, mode)
+                with self.env(binary), mock.patch.object(sc, "STATE", shared / "state"), \
+                        mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+                    with self.assertRaises(sc.ProbeFolderRefused) as cm:
+                        sc._antigravity()
+                self.assertEqual(cm.exception.kind, "probe_folder_unsafe")
+                self.assertIn("writable by others", str(cm.exception))
+
+    def test_ancestor_rule(self):
+        import stat as st_
+        me = os.geteuid()
+
+        def st(uid, mode):
+            return os.stat_result((st_.S_IFDIR | mode, 0, 0, 2, uid, 0, 0, 0, 0, 0))
+        self.assertTrue(sc._ancestor_ok(st(0, 0o755)))
+        self.assertTrue(sc._ancestor_ok(st(me, 0o700)))
+        self.assertTrue(sc._ancestor_ok(st(0, 0o1777)))         # /private/tmp
+        self.assertFalse(sc._ancestor_ok(st(0, 0o777)))         # writable, not sticky
+        self.assertFalse(sc._ancestor_ok(st(me, 0o1777)))       # sticky but not root's
+        self.assertFalse(sc._ancestor_ok(st(me, 0o775)))
+        self.assertFalse(sc._ancestor_ok(st(me + 1, 0o755)))    # another user's
+
+    def test_state_under_the_sticky_root_owned_tmp_is_allowed(self):
+        base = Path(tempfile.mkdtemp(dir="/tmp"))                # /tmp -> private/tmp: root's link, root's sticky dir
+        self.addCleanup(shutil.rmtree, base, True)
+        os.chmod(base, 0o700)
+        with mock.patch.object(sc, "STATE", base / "state"), sc.agy_probe_workspace() as folder:
+            self.assertEqual(folder, base / "state" / "agy-probe" / "workspace")
+
+    def swap_before_fork(self, swap):
+        """Run the probe with `swap()` called just before the fork (in cwd_check, after every folder check and the lock)."""
+        real = iso.check_dotenv
+        calls = []
+
+        def hook(home, workdir):
+            calls.append(workdir)
+            if len(calls) == 2:          # 1: prepare(), before the folder is opened; 2: cwd_check, just before the fork
+                swap()
+            return real(home, workdir)
+        return mock.patch.object(iso, "check_dotenv", hook)
+
+    def test_workspace_replaced_by_a_symlink_after_the_checks_does_not_move_the_child(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, _ = self.make_folder()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+
+        def swap():
+            workspace.rename(root / "workspace-checked")
+            workspace.symlink_to(elsewhere)
+        with self.env(binary), self.swap_before_fork(swap):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(root / "workspace-checked"))
+
+    def test_state_dir_swapped_after_the_lock_has_no_effect(self):
+        binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
+        root, workspace, _ = self.make_folder()
+        moved = self.tmp / "state-moved"
+
+        def swap():
+            sc.STATE.rename(moved)
+            (sc.STATE / "agy-probe" / "workspace").mkdir(parents=True)
+        with self.env(binary), self.swap_before_fork(swap):
+            self.assertEqual(sc._antigravity()["tier"], "AI Pro")
+        self.assertEqual(Path(str(log) + ".cwd").read_text(), os.path.realpath(moved / "agy-probe" / "workspace"))
+        self.assertFalse((moved / "agy-probe" / sc.AGY_PROBE_CHILD_RECORD).exists())   # cleared through the dir fd
+        self.assertFalse((sc.STATE / "agy-probe" / sc.AGY_PROBE_CHILD_RECORD).exists())
+
+    def test_slow_start_up_does_not_eat_the_boot_window(self):
+        # the boot window starts when the CLI first paints: a 2.5 s start-up under a 3 s window still reads the banner
+        # painted 0.6 s after the notice
+        binary, log = self.fake({"start_delay": 2.5, "boot": SIGNING_IN, "boot_later": [BANNER],
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            rec = sc._antigravity()
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"/usage\r")
+
+    def test_other_clis_trust_answer_read_gets_a_fresh_boot_window_as_on_main(self):
+        # claude / codex / cursor still answer their trust prompt (answer_trust, as on main), and the read after the
+        # answer gets a fresh boot_s, as on main (#144 fix round 6 restored main's timing)
+        binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [TRUST]})
+        sc.tui_capture([binary], "/usage", "never", {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}, boot_s=3,
+                       run_s=0.5, inherit_path=False)
+        reads = [line.split(" ", 1) for line in Path(str(log) + ".times").read_text().splitlines()]
+        self.assertEqual(reads[0][1], "b'\\r'")
+        enter_at = float(reads[0][0])
+        usage_at = next(float(t) for t, d in reads[1:] if "/" in d)
+        # nothing is painted after the Enter, so the read after it waits its whole window: a fresh 3 s (a shared window
+        # would have had only ~0.9 s left)
+        self.assertGreaterEqual(usage_at - enter_at, 2.8)
+
+    # agy 1.5.16 signed out, drawn to a headless child on the Air (2026-11-25; described, no email): alternate screen,
+    # logo, the notice, a "Signing in..." spinner, then a bare CR overwriting it with the login-method picker.
+    LOGIN_METHOD = ("\x1b[?1049h\x1b[H\x1b[2J  ▄▀▀▄ ANTIGRAVITY\n\n" + SIGNING_IN.rstrip("\n"),
+                    "\r\x1b[2KSelect login method:\n\n\x1b[36m> 1. Google OAuth\x1b[0m\n  2. Use a Google Cloud project\n\n"
+                    "↑/↓ Navigate · enter Select\n")
+
+    def test_login_method_picker_is_refused_mid_read_and_nothing_is_typed(self):
+        boot, picker = self.LOGIN_METHOD
+        binary, log = self.fake({"boot": boot, "boot_later": [picker], "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertLess(time.time() - t0, 6)             # refused on sight, not at the end of the 12 s boot window
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        self.assertEqual((cm.exception.facts["check"], cm.exception.facts["acting"]), ("refuse", False))
+        self.assertIn("login-method-picker", cm.exception.facts["rules"])
+        for screen in ("Select login method:", "> 1. Google OAuth", "2. Use a Google Cloud project"):
+            with self.subTest(screen=screen):
+                self.assertTrue(re.search(sc.AGY_REFUSE[0][1], screen, re.I))
 
     def test_usage_screen_is_read_through_the_isolated_env(self):
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
@@ -421,7 +928,7 @@ class ProbeHonesty(AgyBase):
     def test_dotenv_with_a_banned_prefix_refuses_the_probe_before_any_start(self):
         binary, log = self.fake({"boot": BANNER})
         for name in ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "AGY_ADC_AUTH", "CLOUDSDK_CONFIG"):
-            for where in (self.home / ".gemini" / ".env", self.home / ".env", sc.PROBE_DIR / ".env"):
+            for where in (self.home / ".gemini" / ".env", self.home / ".env", sc.agy_probe_paths()[0] / ".env"):
                 with self.subTest(name=name, where=where.name):
                     where.parent.mkdir(parents=True, exist_ok=True)
                     where.write_text(f"{name}=secret-value-42\n")
@@ -439,14 +946,19 @@ class ProbeHonesty(AgyBase):
         real = iso.check_dotenv
 
         def plant_then_check(home, workdir):
-            if Path(workdir).name.startswith("p"):              # the per-probe folder (PROBE_DIR is "usage-probe")
+            if Path(workdir).name == "workspace" and Path(workdir).is_dir():   # the fixed folder, just before the fork
                 Path(workdir, ".env").write_text("GEMINI_API_KEY=k\n")
             return real(home, workdir)
         with self.env(binary), mock.patch.object(iso, "check_dotenv", plant_then_check), \
                 mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
             with self.assertRaises(iso.ForbiddenEnv):
                 sc._antigravity()
-        self.assertEqual([p.name for p in sc.PROBE_DIR.iterdir()], [])   # the refused folder is removed
+        # the owner's trusted folder is never emptied by code: the planted file stays, and the next probe refuses it
+        _, workspace, _ = sc.agy_probe_paths()
+        self.assertEqual([p.name for p in workspace.iterdir()], [".env"])
+        with self.env(binary), mock.patch.object(sc.pty, "fork", side_effect=AssertionError("must not fork")):
+            with self.assertRaises((iso.ForbiddenEnv, sc.ProbeFolderRefused)):
+                sc._antigravity()
 
     def test_unparsable_dotenv_refuses_the_probe(self):
         binary, _ = self.fake({"boot": BANNER})
@@ -462,7 +974,7 @@ class ProbeHonesty(AgyBase):
         p = self.home / ".gemini" / ".env"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("EDITOR=vim\n")
-        iso.check_dotenv(self.home, sc.PROBE_DIR)
+        iso.check_dotenv(self.home, sc.agy_probe_paths()[1])
         binary, log = self.fake({"boot": BANNER, "usage": FIXTURE.read_text()})
         with self.env(binary):
             rec = sc._antigravity()

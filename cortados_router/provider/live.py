@@ -1740,6 +1740,13 @@ def api_credit_section(st: dict[str, Any] | None, now: float, errors: list | Non
                     expiring_soon=bool(st.get("expiring_soon")), prefer_within_days=st.get("prefer_within_days"))
 
 
+def _lane_skip(sk: Any) -> dict[str, Any] | None:
+    """The usage view's `skip` ({reason, since}, already allowlisted there) carried as is; anything else is None."""
+    if not isinstance(sk, dict) or not isinstance(sk.get("reason"), str) or not _num(sk.get("since")):
+        return None
+    return {"reason": sk["reason"], "since": sk["since"]}
+
+
 def subscriptions_section(u: dict[str, Any], now: float,
                           enabled: Callable[[Any], bool] | None = None) -> dict[str, Any]:
     """`enabled` (lane -> bool, e.g. lane_enabled) keeps disabled lanes out of `lowest`; they are still listed. One
@@ -1760,6 +1767,8 @@ def subscriptions_section(u: dict[str, Any], now: float,
         lanes.append({"lane": l.get("lane"), "label": l.get("label"), "account": l.get("account"),
                       "left_pct": l.get("left_pct"), "stale": bool(l.get("stale")), "error": l.get("error"),
                       "state": l.get("state"),
+                      # a skipped sample (#144 fix round 8): the usage view's checked {reason, since}, as published there
+                      "skip": _lane_skip(l.get("skip")),
                       "sample_age_s": l.get("sample_age_s"), "shared_with": l.get("shared_with") or [],
                       "pools": l.get("pools") or {}, "windows": wins})
     lowest = None
