@@ -201,8 +201,10 @@ a start from a child without `delegate`, `delegate` from anywhere but depth 0 an
 compatibility, fix round 4) needs its `capabilities`, checked before anything is sent and cached per host for 10 min in
 the requester's tasks root (`host-capabilities.json`, dropped on any protocol error); the requester holds
 `<stub>/start.lock` while its start RPC is in flight and passive reconciliation skips a held one ("start in progress"),
-while cancel_task and the cascade always send the cancel to the host by id at once; `<stub>/cancel_pending` keeps a
-cancel until the host acknowledges it, and status/wait/list and the daily pass forward it (fix round 5); a
+while cancel_task and the cascade always send the cancel to the host by id at once; `<stub>/cancel_pending` (written before
+`cancelled`) keeps a cancel until the host acknowledges it by exact id (`cancel_acked`), and status/wait/list and the daily
+pass forward it, list_tasks in one `cancel_many` per host under a 20 s listing deadline (fix rounds 5 and 6); a capability
+drop writes `host-capabilities.invalid.<hash>` first, never skipped by a busy lock (fix round 6); a
 host's structured start refusal (`failure.refused`) settles the stub `start_failed` at once. Tests never use the real
 tasks root: `tests/__init__.py` sets a throwaway `CORTADOS_TASKS_DIR` and guards `tasks_dir()` against the real home. `--remote` starts carry
 `depth`/`delegate`; the host keeps the deeper depth. Tests: `tests/test_nested_tasks.py` (fake claude playing the

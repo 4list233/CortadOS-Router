@@ -2,6 +2,7 @@
 depth 2 workers. A FAKE claude binary plays the sub-orchestrator and the workers: it starts tasks exactly as the
 cortados-route server inside a child does (subagent_mcp.call_child_tool in a process under the child's runner), so the
 depth check sees a real process tree. No real claude, no ssh (a subprocess transport), no launchctl, throwaway state."""
+import fcntl
 import json
 import os
 import subprocess
@@ -1382,6 +1383,232 @@ class LifecycleFixRound5Tests(NestedBase):
             a.join(30)
             b.join(30)
         self.assertFalse(ct._cached_capabilities(root, air))    # the invalidation sticks
+
+
+class LifecycleFixRound6Tests(NestedBase):
+    """Fix round 6 (review r6 on ecd28ed): CANCEL_PENDING written before `cancelled` and a `cancelled` marker without
+    an acknowledgement still owed; pending cancels batched per host under a listing deadline; a capability
+    invalidation never skipped by a busy lock; only an acknowledgement naming the exact id settles a cancel."""
+
+    stub_ids = LifecycleFixRound4Tests.stub_ids
+
+    def air_state(self, tid):
+        return ct._remote("air", "status", {"task_id": tid})["state"]
+
+    def start_with_crashed_cancel(self, markers):
+        """The host launches the worker; before the start's reply arrives a cancel process wrote only `markers` (it
+        crashed between its writes, sending nothing). Returns (task id, the start's error text)."""
+        self._air()
+        real = ct.exec_hosts.TRANSPORT
+
+        def t(argv, stdin, timeout):
+            req = json.loads(stdin)
+            out = real(argv, stdin, timeout)
+            if req["op"] == "start":
+                d = os.path.join(ct.tasks_dir(), req["args"]["task_id"])
+                for name in markers:
+                    open(os.path.join(d, name), "w").close()
+            return out
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", t):
+            with self.assertRaises(ct.TaskError) as cm:
+                ct.start("x", None, host="air")
+        [tid] = self.stub_ids()
+        return tid, str(cm.exception)
+
+    def assert_cancel_delivered(self, tid, err):
+        d = os.path.join(ct.tasks_dir(), tid)
+        self.assertIn(f"task {tid} was cancelled while its start ran", err)
+        self.assertNotIn("reached the host while the start ran", err)       # not assumed delivered
+        self.assertFalse(ct._cancel_pending(d))
+        self.assertEqual(_load(os.path.join(d, ct.CANCEL_ACKED))["task_id"], tid)
+        self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    # --- P2 (1): the marker order ------------------------------------------------------------------------------------
+    def test_p2_cancel_pending_is_written_before_cancelled(self):
+        d = os.path.join(self.tmp, "stub")
+        os.mkdir(d)
+        order = []
+        real_open = open
+
+        def spy(path, *a, **kw):
+            order.append(os.path.basename(path))
+            return real_open(path, *a, **kw)
+        real_os_open = os.open
+
+        def spy_os(path, *a, **kw):
+            order.append(os.path.basename(path))
+            return real_os_open(path, *a, **kw)
+        with mock.patch("builtins.open", spy), mock.patch.object(ct.os, "open", spy_os):
+            ct._mark_cancel_pending(d)
+        names = [n for n in order if n in (ct.CANCEL_PENDING, "cancelled")]
+        self.assertEqual(names, [ct.CANCEL_PENDING, "cancelled"])
+
+    def test_p2_a_cancelled_marker_alone_still_sends_the_cancel(self):
+        # the reviewer's reproduction: `cancelled` written, the crash came before CANCEL_PENDING
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, err = self.start_with_crashed_cancel(["cancelled"])
+            self.assert_cancel_delivered(tid, err)
+
+    def test_p2_a_cancel_pending_marker_alone_still_sends_the_cancel(self):
+        # the new order's crash point: CANCEL_PENDING written, `cancelled` not yet
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, err = self.start_with_crashed_cancel([ct.CANCEL_PENDING])
+            self.assert_cancel_delivered(tid, err)
+
+    def test_p2_a_cancelled_marker_without_an_ack_is_forwarded_by_status(self):
+        self._air()
+        root = ct._private_root()
+        tid = ct._new_id()
+        ct._write_stub(root, tid, "air")
+        d = os.path.join(root, tid)
+        open(os.path.join(d, "cancelled"), "w").close()
+        self.assertTrue(ct._cancel_pending(d))                  # owed: no acknowledgement recorded
+        ct.status(tid)                                          # the Air has no such id: absent settles it
+        self.assertFalse(ct._cancel_pending(d))
+
+    # --- P2 (2): batched pending cancels under a deadline ------------------------------------------------------------
+    def pending_stubs(self, n, pending=True):
+        root = ct._private_root()
+        out = []
+        for _ in range(n):
+            tid = ct._new_id()
+            ct._write_stub(root, tid, "air")
+            if pending:
+                ct._mark_cancel_pending(os.path.join(root, tid))
+            out.append(tid)
+        return out
+
+    def test_p2_three_pending_cancels_on_a_hung_host_are_one_rpc_inside_the_deadline(self):
+        self._air()
+        pend = self.pending_stubs(3)
+        plain = self.pending_stubs(1, pending=False)             # a confirmed stub of the same host: not asked again
+        ops = []
+
+        def hung(argv, stdin, timeout):
+            ops.append((json.loads(stdin)["op"], timeout))
+            time.sleep(min(timeout, 5))
+            raise subprocess.TimeoutExpired(argv, timeout)
+        start = time.monotonic()
+        with mock.patch.object(ct, "LIST_HOSTS_DEADLINE_S", 1.5), \
+                mock.patch.object(ct.exec_hosts, "TRANSPORT", hung):
+            rows = ct.list_recent()
+        took = time.monotonic() - start
+        self.assertEqual([o for o, _ in ops], ["cancel_many"])     # one round trip; the list is not sent
+        self.assertLessEqual(ops[0][1], 1.5)
+        self.assertLess(took, 4)
+        by = {r["task_id"]: r for r in rows}
+        for tid in pend:
+            self.assertEqual(by[tid]["state"], ct.CANCEL_PENDING)
+            self.assertIn("did not answer", by[tid]["error"])
+            self.assertTrue(ct._cancel_pending(os.path.join(ct.tasks_dir(), tid)))   # kept, sent again later
+        self.assertEqual(by[plain[0]]["state"], "unknown")
+        self.assertTrue(by[plain[0]]["error"])
+
+    def test_p2_a_spent_deadline_leaves_rows_pending_without_a_call(self):
+        self._air()
+        pend = self.pending_stubs(2)
+        ops = []
+        with mock.patch.object(ct, "LIST_HOSTS_DEADLINE_S", 0), \
+                mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: ops.append(1)):
+            rows = ct.list_recent()
+        self.assertEqual(ops, [])
+        for r in rows:
+            self.assertEqual(r["state"], ct.CANCEL_PENDING)
+            self.assertIn("ran out", r["error"])
+        for tid in pend:
+            self.assertTrue(ct._cancel_pending(os.path.join(ct.tasks_dir(), tid)))
+
+    def test_p2_pending_cancels_on_a_reachable_host_are_forwarded_in_one_rpc(self):
+        self._air()
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            running = ct.start("x", None, host="air")["task_id"]
+        gone = self.pending_stubs(2)                            # the Air has no such ids (pruned there)
+        ct._mark_cancel_pending(os.path.join(ct.tasks_dir(), running))
+        real, ops = ct.exec_hosts.TRANSPORT, []
+
+        def t(argv, stdin, timeout):
+            ops.append(json.loads(stdin)["op"])
+            return real(argv, stdin, timeout)
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", t):
+            rows = ct.list_recent()
+        self.assertEqual(ops, ["cancel_many"])
+        by = {r["task_id"]: r for r in rows}
+        for tid in gone + [running]:
+            self.assertTrue(by[tid].get("cancel_forwarded"), by[tid])
+            self.assertFalse(ct._cancel_pending(os.path.join(ct.tasks_dir(), tid)))
+        self.assertEqual(by[running]["state"], "cancelling")
+        self.assertEqual(self.wait_done(running)["state"], "cancelled")
+
+    # --- P2 (3): invalidation is never skipped ------------------------------------------------------------------------
+    def test_p2_an_invalidation_with_the_lock_held_still_invalidates(self):
+        self._air()
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        os.makedirs(root, exist_ok=True)
+        before = time.time()
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), before)
+        self.assertTrue(ct._cached_capabilities(root, air))
+        fd = os.open(os.path.join(root, ct.CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)                      # another writer holds the lock throughout
+            with mock.patch.object(ct, "CAPABILITY_LOCK_WAIT_S", 0.2):
+                ct._forget_capabilities(air)
+            self.assertFalse(ct._cached_capabilities(root, air))
+        finally:
+            os.close(fd)
+        # a handshake asked BEFORE the invalidation does not clear it; one asked after it does
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), before)
+        self.assertFalse(ct._cached_capabilities(root, air))
+        time.sleep(0.01)
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), time.time())
+        self.assertTrue(ct._cached_capabilities(root, air))
+        self.assertFalse(os.path.exists(ct._invalid_path(root, air)))
+
+    def test_p2_a_protocol_error_invalidates_and_the_next_start_handshakes(self):
+        self._air()
+        ct.start("x", None, host="air")
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        self.assertTrue(ct._cached_capabilities(root, air))
+        bad = lambda a, s, t: (0, json.dumps({"v": "old", "ok": True, "result": {}}).encode(), b"")
+        fd = os.open(os.path.join(root, ct.CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with mock.patch.object(ct, "CAPABILITY_LOCK_WAIT_S", 0.2), \
+                    mock.patch.object(ct.exec_hosts, "TRANSPORT", bad):
+                with self.assertRaises(ct.TaskError):
+                    ct._remote("air", "list", {"limit": 1})
+        finally:
+            os.close(fd)
+        self.assertFalse(ct._cached_capabilities(root, air))
+
+    # --- P3 (4): an acknowledgement names the exact id ---------------------------------------------------------------
+    def test_p3_an_ack_without_the_task_id_keeps_the_marker(self):
+        tid = ct._new_id()
+        self.assertFalse(ct._cancel_acked(tid, {"cancelled": True}))
+        self.assertFalse(ct._cancel_acked(tid, {"task_id": ct._new_id(), "cancelled": True}))
+        self.assertTrue(ct._cancel_acked(tid, {"task_id": tid, "cancelled": True}))
+        self._air()
+        [stub] = self.pending_stubs(1)
+        d = os.path.join(ct.tasks_dir(), stub)
+        anon = lambda a, s, t: (0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                                               "result": {"cancelled": True, "state": "cancelled"}}).encode(), b"")
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", anon):
+            ct.cancel(stub)
+        self.assertTrue(ct._cancel_pending(d))
+        self.assertFalse(os.path.exists(os.path.join(d, ct.CANCEL_ACKED)))
+
+    def test_p3_an_unconfirmed_stub_is_not_settled_by_an_answer_without_its_id(self):
+        self._air()
+        root = ct._private_root()
+        tid, fd = ct._new_stub(root, "air", {}, None)
+        os.close(fd)
+        anon = lambda a, s, t: (0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                                               "result": {"tombstone": True, "cancelled": True}}).encode(), b"")
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", anon):
+            ct.cancel(tid)
+        stub = _load(os.path.join(root, tid, ct.REMOTE_STUB))
+        self.assertTrue(stub.get(ct.START_UNCONFIRMED))
+        self.assertNotIn(ct.START_FAILED, stub)
+        self.assertTrue(ct._cancel_pending(os.path.join(root, tid)))
 
 
 if __name__ == "__main__":

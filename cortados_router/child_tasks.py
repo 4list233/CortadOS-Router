@@ -313,6 +313,8 @@ CHILDREN_LOCK = "children.lock"             # held while a child is started, and
 CHILDREN_LOCK_WAIT_S = 120                  # longer than one remote start's ssh call; a stuck holder is reported, not waited on
 CHILDREN_SHOWN = 500                        # children SHOWN per parent in task_status (presentation only): cancel and
                                             # the end-of-run report always enumerate every child (review r1, P2)
+LIST_HOSTS_DEADLINE_S = 20                  # all host calls of one list_tasks together (review r6, P2)
+LIST_MIN_CALL_S = 1                         # less left than this: the host is not asked (its rows say why)
 CHILDREN_LIST_BATCH = 200                   # ids per remote `list` call (the host's list_recent caps one call at 200)
 # A sub-orchestrator leaves a worker running past its own end only by naming it on a line of its final message that
 # is EXACTLY `HANDOFF: <task id>` (optional trailing whitespace), outside fenced code and not quoted (review r2, P2: a
@@ -327,7 +329,10 @@ OUTCOME_INCOMPLETE = "incomplete"
 # of them on the target host, checked BEFORE anything is sent: an older host would ignore depth/delegate or the
 # requested id, or launch after the requester settled the id start_failed (review r4, P1). start_refusal: the host's
 # start handler marks a refusal that launched nothing (`failure.refused`), so the requester settles it at once.
-REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "status_tombstone", "start_refusal")
+# cancel_many (review r6, P2): one request cancels several ids, each answered by id (list_tasks forwards a host's
+# pending cancels in one round trip).
+REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "status_tombstone", "start_refusal",
+                       "cancel_many")
 # The requester's cache of hosts that confirmed REMOTE_CAPABILITIES, in its tasks root: one handshake per host per
 # CAPABILITY_CACHE_S, so a plain start does not pay a second ssh round trip each time. Only a confirmation is cached
 # (a refused host is asked again next time: an updated checkout is picked up at once); an entry is keyed by the host's
@@ -337,9 +342,14 @@ CAPABILITY_CACHE_S = 600
 # Its sibling lock file: every read-modify-write of the cache (a recorded confirmation and an invalidation alike) runs
 # under an exclusive flock on it, so a writer that read the cache before an invalidation cannot write the dropped host
 # back (review r5, P3). Waited for at most CAPABILITY_LOCK_WAIT_S: the cache is best effort, a busy lock only costs a
-# handshake (a recorded confirmation is skipped; an invalidation is never skipped silently: it is logged).
+# handshake (a recorded confirmation is skipped; an invalidation never depends on it: CAPABILITY_INVALID below).
 CAPABILITY_LOCK = "host-capabilities.lock"
 CAPABILITY_LOCK_WAIT_S = 5
+# Per host, beside the cache: `<CAPABILITY_INVALID>.<hash of the host's name>` ({"at": time}), written (atomic
+# rename, no lock) on every protocol error before the locked drop is tried, so an invalidation is never skipped
+# (review r6, P2). _cached_capabilities checks it first; only a handshake SENT after it, recorded under the lock,
+# removes it.
+CAPABILITY_INVALID = "host-capabilities.invalid"
 # In a start_unconfirmed stub's dir: held (flock, exclusive) by the requester from before the stub is published until
 # its start RPC has returned and the stub is settled. Reconciliation (status, wait, cancel, the cascade, the daily pass)
 # probes it without blocking and leaves an in-flight start alone (review r4, P2: a daily pass once tombstoned a start
@@ -353,6 +363,9 @@ START_UNCONFIRMED = "start_unconfirmed"     # a remote stub's flag: the start wa
 # status / wait / list and the daily pass forward it to the host by id whenever the host answers; a stub carrying it is
 # never pruned by age. A file of its own, not a field of remote.json, so no concurrent rewrite of the stub can drop it.
 CANCEL_PENDING = "cancel_pending"
+# Its counterpart (review r6): the host's acknowledgement of a cancel for this exact id ({"task_id": ...}), written
+# before CANCEL_PENDING is removed. A `cancelled` marker in a remote stub without it is a cancel still owed.
+CANCEL_ACKED = "cancel_acked"
 # A remote stub's terminal flag (its reason, a string): the host itself answered that it has no task under this id, or
 # only the cancelled placeholder (tombstone) of one. Never running, never "failed" on the host; kept for the report.
 # The one rule (review r3, P1): an intent is never deleted because its start failed; it stays start_unconfirmed until
@@ -1161,9 +1174,40 @@ def _capability_key(host) -> dict:
     return {"ssh": host.ssh, "router": host.router}
 
 
+def _invalid_path(root: str, host) -> str:
+    """CAPABILITY_INVALID's file for `host`: keyed by a hash of the host's name (a name is configuration, not a safe
+    file name)."""
+    key = hashlib.sha256(str(host.name).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return os.path.join(root, f"{CAPABILITY_INVALID}.{key}")
+
+
+def _invalidated_at(root: str, host):
+    """When `host`'s capabilities were last invalidated (a float), or None when they are not invalidated. A file that
+    exists but cannot be read is invalid all the same (its mtime, else +inf: fail closed)."""
+    path = _invalid_path(root, host)
+    try:
+        with open(path, encoding="utf-8") as f:
+            at = json.loads(f.read(256)).get("at")
+        if isinstance(at, (int, float)):
+            return float(at)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError, RecursionError):
+        pass
+    try:
+        return os.stat(path).st_mtime
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return float("inf")
+
+
 def _cached_capabilities(root: str, host) -> bool:
-    """True when `host` confirmed REMOTE_CAPABILITIES less than CAPABILITY_CACHE_S ago under its current entry. An
-    unreadable cache is no cache (the handshake is asked again)."""
+    """True when `host` confirmed REMOTE_CAPABILITIES less than CAPABILITY_CACHE_S ago under its current entry and has
+    not been invalidated since (CAPABILITY_INVALID, checked FIRST: review r6, P2). An unreadable cache is no cache
+    (the handshake is asked again)."""
+    if _invalidated_at(root, host) is not None:
+        return False
     try:
         rec = (_read_json(os.path.join(root, CAPABILITY_CACHE), REMOTE_STUB_MAX_BYTES) or {}).get(host.name)
     except (TaskError, AttributeError):
@@ -1175,10 +1219,18 @@ def _cached_capabilities(root: str, host) -> bool:
             and all(c in have for c in REMOTE_CAPABILITIES))
 
 
-def _update_capabilities(root: str, host, have) -> None:
-    """Record (`have` a list) or drop (None) `host`'s cache entry, the whole read-modify-write under CAPABILITY_LOCK
-    (review r5, P3: unserialized writers could resurrect a dropped entry). Best effort: a failed write only costs a
-    handshake."""
+def _update_capabilities(root: str, host, have, asked_at=None) -> None:
+    """Record (`have` a list; `asked_at` the time.time() the handshake was SENT) or drop (None) `host`'s cache entry,
+    the whole read-modify-write under CAPABILITY_LOCK (review r5, P3: unserialized writers could resurrect a dropped
+    entry). A drop first writes CAPABILITY_INVALID (no lock: review r6, P2, a busy lock once skipped the drop and
+    left a stale confirmation usable), so it can never be skipped; a confirmation removes that file only when its
+    handshake was sent after the invalidation. Best effort otherwise: a skipped confirmation only costs a handshake."""
+    if have is None:
+        try:
+            _write_json(_invalid_path(root, host), {"at": time.time()})
+        except OSError as exc:
+            # The file could not be written: the drop below, under the lock, is the only invalidation left.
+            log_event("capability_invalidate_failed", host=host.name, error=type(exc).__name__)
     path = os.path.join(root, CAPABILITY_CACHE)
     try:
         fd = os.open(os.path.join(root, CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
@@ -1191,6 +1243,18 @@ def _update_capabilities(root: str, host, have) -> None:
         except TimeoutError:
             log_event("capability_cache_failed", host=host.name, error="lock_timeout", drop=have is None)
             return
+        if have is not None:
+            inv = _invalidated_at(root, host)
+            if inv is not None:
+                if asked_at is None or not asked_at > inv:
+                    return                      # invalidated after (or while) this handshake was asked: not recorded
+                try:
+                    os.unlink(_invalid_path(root, host))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=False)
+                    return
         _update_capabilities_locked(path, host, have)
     finally:
         os.close(fd)
@@ -1308,7 +1372,9 @@ NEVER_STARTED_TOMBSTONE = "cancelled before its start reached the execution host
 def _settle_stub(root: str, task_id: str, answer) -> None:
     """The host answered for this unconfirmed id with a record: its cancelled placeholder (tombstone) is start_failed,
     anything else confirms the start."""
-    if isinstance(answer, dict) and answer.get("tombstone") is True:
+    if not (isinstance(answer, dict) and answer.get("task_id") == task_id):
+        return                                  # review r6, P3: only an answer naming this exact id settles it
+    if answer.get("tombstone") is True:
         _fail_stub(root, task_id, NEVER_STARTED_TOMBSTONE)
     else:
         _confirm_stub(root, task_id)
@@ -1327,29 +1393,70 @@ def _start_in_flight(d: str) -> bool:
 
 
 def _cancel_pending(d: str) -> bool:
-    return os.path.exists(os.path.join(d, CANCEL_PENDING))
+    """A cancel of this remote stub is owed to its host: CANCEL_PENDING is there, or the `cancelled` marker is there
+    without the host's acknowledgement for this exact id (CANCEL_ACKED). Review r6, P2: CANCEL_PENDING is written
+    first, but a `cancelled` marker without either (a crash of an older writer, or a lost unlink) still owes the
+    cancel; only a recorded acknowledgement settles it."""
+    if os.path.exists(os.path.join(d, CANCEL_PENDING)):
+        return True
+    return os.path.exists(os.path.join(d, "cancelled")) and not _cancel_ack_recorded(d)
+
+
+def _cancel_ack_recorded(d: str) -> bool:
+    """The host's acknowledgement of a cancel for THIS id (the dir's own name) is recorded in CANCEL_ACKED."""
+    try:
+        rec = _read_json(os.path.join(d, CANCEL_ACKED), REMOTE_STUB_MAX_BYTES)
+    except TaskError:
+        return False
+    return isinstance(rec, dict) and rec.get("task_id") == os.path.basename(os.path.normpath(d))
+
+
+def _fsync_path(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _mark_cancel_pending(d: str) -> None:
-    """Before a remote stub's cancel is sent: the `cancelled` marker (the in-flight start's post-RPC re-check reads it)
-    and CANCEL_PENDING (cleared only by the host's acknowledgement, _cancel_acked)."""
-    for name in ("cancelled", CANCEL_PENDING):
-        open(os.path.join(d, name), "w").close()
+    """Before a remote stub's cancel is sent. CANCEL_PENDING FIRST, fsynced with its dir (review r6, P2: written
+    second, a crash between the two left `cancelled` alone and the start's post-RPC check took the cancel as
+    delivered), then the `cancelled` marker the in-flight start's post-RPC re-check reads. A crash between them leaves
+    CANCEL_PENDING, which is always forwarded."""
+    path = os.path.join(d, CANCEL_PENDING)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_path(d)
+    open(os.path.join(d, "cancelled"), "w").close()
 
 
 def _cancel_acked(task_id: str, out) -> bool:
     """The host's cancel answer settles the cancel for this id: it cancelled it (or is cancelling it), the task had
-    already ended, or the id is its cancelled placeholder (tombstone). A refusal (e.g. the recorded pid is not the
-    task's runner) is not an acknowledgement: the cancel stays pending and is sent again."""
-    return (isinstance(out, dict) and out.get("task_id") in (None, task_id)
+    already ended, or the id is its cancelled placeholder (tombstone). The answer must name this exact id (review r6,
+    P3: a bare `{"cancelled": true}` once cleared the marker). A refusal (e.g. the recorded pid is not the task's
+    runner) is not an acknowledgement: the cancel stays pending and is sent again."""
+    return (isinstance(out, dict) and isinstance(task_id, str) and out.get("task_id") == task_id
             and (out.get("cancelled") is True or out.get("tombstone") is True or out.get("state") in TERMINAL_STATES))
 
 
 def _clear_cancel_pending(d: str, task_id: str) -> None:
+    """The host settled the cancel of `task_id`: CANCEL_ACKED (naming the id) is written BEFORE CANCEL_PENDING goes,
+    so the `cancelled` marker left behind never reads as owed again, and a crash between leaves the cancel owed."""
+    if not _cancel_pending(d):
+        return
+    try:
+        _write_json(os.path.join(d, CANCEL_ACKED), {"task_id": task_id, "at": time.time()})
+    except OSError as exc:
+        log_event("cancel_ack_record_failed", task_id=task_id, error=type(exc).__name__)
+        return                                  # stays owed: sent again, never silently dropped
     try:
         os.unlink(os.path.join(d, CANCEL_PENDING))
     except FileNotFoundError:
-        return
+        pass
     log_event("cancel_acknowledged", task_id=task_id)
 
 
@@ -1375,6 +1482,7 @@ def _require_capabilities(root: str, target) -> None:
         return
     update = (f"update this host's cortados-router checkout ({target.router}) to the current main, or run the task on "
               "another host")
+    asked_at = time.time()                      # before the request: an invalidation during it wins
     try:
         caps = _remote(target.name, "capabilities", {})
     except TaskError as exc:
@@ -1385,7 +1493,7 @@ def _require_capabilities(root: str, target) -> None:
     if missing:
         raise TaskError(f"start_task refused: execution host {target.describe()} lacks {', '.join(missing)} (an older "
                         f"cortados-router checkout there); nothing was sent: {update}")
-    _update_capabilities(root, target, have)
+    _update_capabilities(root, target, have, asked_at)
 
 
 def _duplicate_start(d: str, task_id: str, target, depth: int, delegate: bool) -> dict:
@@ -1892,11 +2000,12 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
                 failed = exc
         finally:
             os.close(lock_fd)                   # the start has settled (or stays unconfirmed): reconciliation may run
-        if os.path.exists(os.path.join(root, tid, "cancelled")):
+        if _cancel_pending(os.path.join(root, tid)) or os.path.exists(os.path.join(root, tid, "cancelled")):
             # cancel_task ran while the start was in flight (it marks the stub BEFORE it sends, so this check, after the
-            # release, sees every such cancel). It sent the cancel to the host itself (review r5, P2); a cancel the
-            # host has not acknowledged yet (CANCEL_PENDING) is sent again here. If this process dies first, the
-            # marker stays and status / list / the daily pass forward it (review r5, P1).
+            # release, sees every such cancel). It sent the cancel to the host itself (review r5, P2); unless the host's
+            # acknowledgement for this exact id is recorded (CANCEL_ACKED), the cancel is sent again here: CANCEL_PENDING
+            # or a `cancelled` marker alone both mean it is owed (review r6, P2). If this process dies first, the
+            # markers stay and status / list / the daily pass forward it (review r5, P1).
             if _cancel_pending(os.path.join(root, tid)):
                 try:
                     r = cancel(tid)
@@ -2737,7 +2846,7 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
             raise TaskError(f"execution host {stub['host']} answered status with {type(out).__name__}, not a record")
         if stub.get(START_UNCONFIRMED):
             _settle_stub(os.path.dirname(d), task_id, out)   # reconciled: the host answered for this id
-            if out.get("tombstone") is True:
+            if out.get("tombstone") is True and out.get("task_id") == task_id:
                 return _failed_record(task_id, {**stub, START_FAILED: NEVER_STARTED_TOMBSTONE})
         out["host"] = stub["host"]
         return out
@@ -3365,7 +3474,7 @@ def list_recent(n=20, ids=None) -> list:
         wanted = {x for x in ids if isinstance(x, str)}
         names = (x for x in names if x in wanted)
     ids = sorted(names, reverse=True)[:n]
-    rows, by_host = [], {}
+    rows, by_host, pending_by_host = [], {}, {}
     for tid in ids:
         try:
             state, meta, res = _state(os.path.join(root, tid))
@@ -3377,12 +3486,10 @@ def list_recent(n=20, ids=None) -> list:
             continue
         if state == "remote" and _cancel_pending(os.path.join(root, tid)) \
                 and not _start_in_flight(os.path.join(root, tid)):
-            # a cancel the host never acknowledged is forwarded by id (review r5, P1), confirmed or not
-            try:
-                r = cancel(tid)
-                rows.append({"task_id": tid, "host": meta["host"], "state": r.get("state"), "cancel_forwarded": True})
-            except TaskError as exc:
-                rows.append({"task_id": tid, "host": meta["host"], "state": CANCEL_PENDING, "error": str(exc)})
+            # a cancel the host never acknowledged is forwarded by id (review r5, P1), confirmed or not: all of a
+            # host's in one request below (review r6, P2)
+            pending_by_host.setdefault(meta["host"], []).append(tid)
+            rows.append({"task_id": tid, "host": meta["host"], "state": CANCEL_PENDING})
             continue
         if state == "remote" and meta.get(START_UNCONFIRMED):
             # shown as it is, never reconciled by a listing (task_status <id> asks the host for it)
@@ -3398,15 +3505,52 @@ def list_recent(n=20, ids=None) -> list:
                      "task_preview": meta.get("task_preview"), "host": meta.get("host"),
                      **({"workspace": meta["workspace"]} if meta.get("workspace") else {}),
                      **clean_origin_meta(meta.get("origin"))})
-    for host, tids in by_host.items():         # one round trip per host, never one per task
-        try:
-            remote = _remote(host, "list", {"limit": len(tids), "ids": tids})
-            found = {r.get("task_id"): r for r in remote if isinstance(r, dict)} if isinstance(remote, list) else {}
-            err = None
-        except TaskError as exc:
-            found, err = {}, str(exc)
+    # Every host call of this listing shares LIST_HOSTS_DEADLINE_S (review r6, P2: the MCP client times a request out
+    # at 60 s), and a host that failed once is not asked again in this listing.
+    deadline = time.monotonic() + LIST_HOSTS_DEADLINE_S
+    host_err = {}
+
+    def budget(host):
+        if host in host_err:
+            return None
+        left = deadline - time.monotonic()
+        if left < LIST_MIN_CALL_S:
+            host_err[host] = (f"execution host '{host}' not asked: this listing's {LIST_HOSTS_DEADLINE_S:g} s for "
+                              "host calls ran out")
+            return None
+        return min(exec_hosts.SSH_RPC_TIMEOUT_S, left)
+
+    for host, tids in pending_by_host.items():
+        t = budget(host)
+        replies = {}
+        if t is not None:
+            try:
+                replies = _forward_cancels(root, host, tids, t)
+            except TaskError as exc:
+                host_err[host] = str(exc)
         for row in rows:
-            if row.get("host") == host and row["state"] == "unknown":
+            if row.get("host") == host and row["state"] == CANCEL_PENDING and row["task_id"] in tids:
+                r = replies.get(row["task_id"])
+                if r is None:
+                    row["error"] = host_err.get(host) or f"execution host '{host}' did not answer for this id"
+                elif r.get("state") == CANCEL_PENDING:
+                    row["error"] = r.get("error")
+                else:
+                    row.update(state=r.get("state"), cancel_forwarded=True)
+    for host, tids in by_host.items():         # one round trip per host, never one per task
+        t = budget(host)
+        if t is None:
+            found, err = {}, host_err[host]
+        else:
+            try:
+                remote = _remote(host, "list", {"limit": len(tids), "ids": tids}, timeout_s=t)
+                found = {r.get("task_id"): r for r in remote if isinstance(r, dict)} if isinstance(remote, list) else {}
+                err = None
+            except TaskError as exc:
+                found, err = {}, str(exc)
+                host_err[host] = err
+        for row in rows:
+            if row.get("host") == host and row["state"] == "unknown" and row["task_id"] in tids:
                 if row["task_id"] in found:
                     row.update(found[row["task_id"]], host=host)
                 else:
@@ -3455,10 +3599,7 @@ def _cancel_remote(d: str, task_id: str, meta: dict) -> dict:
     try:
         out = _remote(host, "cancel", {"task_id": task_id, **({"tombstone": True} if unconfirmed else {})})
     except NoSuchRemoteTask:
-        # a confirmed task the host no longer has (pruned there): nothing runs under this id
-        _clear_cancel_pending(d, task_id)
-        return {"task_id": task_id, "state": "unknown", "host": host, "cancelled": False,
-                "reason": f"execution host {host} has no task under this id (pruned there); nothing to cancel"}
+        return _cancel_absent(d, task_id, host)
     except TaskError as exc:
         if in_flight:
             return {"task_id": task_id, "state": "cancelling", "cancelled": True, "host": host,
@@ -3468,18 +3609,87 @@ def _cancel_remote(d: str, task_id: str, meta: dict) -> dict:
         raise TaskError(f"{exc} ({pending})", ambiguous=exc.ambiguous) from None
     if not isinstance(out, dict):
         raise TaskError(f"execution host {host} answered cancel with {type(out).__name__}, not a record ({pending})")
+    return _apply_cancel_answer(d, task_id, meta, out, in_flight)
+
+
+def _cancel_absent(d: str, task_id: str, host: str) -> dict:
+    """The host's structured answer that it has no task under this (confirmed) id (pruned there): nothing runs under
+    it, so the pending cancel is settled."""
+    _clear_cancel_pending(d, task_id)
+    return {"task_id": task_id, "state": "unknown", "host": host, "cancelled": False,
+            "reason": f"execution host {host} has no task under this id (pruned there); nothing to cancel"}
+
+
+def _apply_cancel_answer(d: str, task_id: str, meta: dict, out: dict, in_flight: bool = False) -> dict:
+    """The host's cancel answer (a record) for remote stub `task_id`: settles an unconfirmed stub, clears
+    CANCEL_PENDING on an acknowledgement naming this exact id (review r6, P3), and shapes the reply. Shared by the
+    single cancel and the batched forward (_forward_cancels)."""
+    unconfirmed = bool(meta.get(START_UNCONFIRMED))
     if unconfirmed:
         _settle_stub(os.path.dirname(d), task_id, out)
     if _cancel_acked(task_id, out):
         _clear_cancel_pending(d, task_id)
-    if unconfirmed and out.get("tombstone") is True:
+    if unconfirmed and out.get("tombstone") is True and out.get("task_id") == task_id:
         # the host wrote (or had) the cancelled placeholder: nothing ever started, a late start launches nothing
         return {**_failed_record(task_id, {**meta, START_FAILED: NEVER_STARTED_TOMBSTONE}), "cancelled": True,
                 "tombstone": True, **({"start_in_progress": True} if in_flight else {})}
-    out["host"] = host
+    out["host"] = meta["host"]
     if in_flight:
         out["start_in_progress"] = True
     return out
+
+
+def _forward_cancels(root: str, host: str, tids: list, timeout_s: float) -> dict:
+    """Send the pending cancels of `tids` (remote stubs on `host`) in ONE `cancel_many` request (review r6, P2: one
+    30 s cancel per row once held list_tasks for minutes on a down host). Returns {task id: reply}; an id the host did
+    not answer by name stays CANCEL_PENDING. A failed request raises TaskError: every id stays pending."""
+    metas, items = {}, []
+    for tid in tids:
+        try:
+            meta = _stub(os.path.join(root, tid))
+        except (OSError, TaskError):
+            continue
+        if not meta:
+            continue
+        metas[tid] = meta
+        items.append({"task_id": tid, **({"tombstone": True} if meta.get(START_UNCONFIRMED) else {})})
+    if not items:
+        return {}
+    out = _remote(host, "cancel_many", {"items": items}, timeout_s=timeout_s)
+    answers = {}
+    for a in out if isinstance(out, list) else ():
+        if isinstance(a, dict) and a.get("task_id") in metas and a["task_id"] not in answers:
+            answers[a["task_id"]] = a
+    replies = {}
+    for tid, meta in metas.items():
+        d, a = os.path.join(root, tid), answers.get(tid)
+        if a is None:
+            replies[tid] = {"task_id": tid, "host": host, "state": CANCEL_PENDING,
+                            "error": f"execution host {host} did not answer the cancel of this id"}
+        elif a.get("absent") is True and not meta.get(START_UNCONFIRMED):
+            replies[tid] = _cancel_absent(d, tid, host)
+        elif isinstance(a.get("error"), str):
+            replies[tid] = {"task_id": tid, "host": host, "state": CANCEL_PENDING, "error": a["error"]}
+        else:
+            replies[tid] = _apply_cancel_answer(d, tid, meta, dict(a))
+    return replies
+
+
+def _remote_cancel_one(item) -> dict:
+    """One item of a `cancel_many` request, answered on this host exactly as a single `cancel` is, by id: an id never
+    started here with `tombstone` gets the cancelled placeholder, an unknown id is `absent`, an error is its text."""
+    tid = item.get("task_id") if isinstance(item, dict) else None
+    if not (isinstance(tid, str) and TASK_ID_RE.fullmatch(tid)):
+        return {"task_id": None, "error": "not a task id"}
+    tomb = item.get("tombstone") is True
+    try:
+        if _absent_here({"task_id": tid, **({"tombstone": True} if tomb else {})}):
+            return {"task_id": tid, "absent": True}
+        if tomb and not os.path.isdir(os.path.join(_private_root(), tid)):
+            return _tombstone(tid)
+        return cancel(tid)
+    except TaskError as exc:
+        return {"task_id": tid, "error": str(exc).strip() or type(exc).__name__}
 
 
 def _cancel_child(task_id: str) -> dict:
@@ -5384,6 +5594,11 @@ def serve_remote(stdin=None, stdout=None) -> int:
         elif op == "list":
             ids = args.get("ids")
             out = list_recent(args.get("limit", 20), ids if isinstance(ids, list) else None)
+        elif op == "cancel_many":
+            items = args.get("items")
+            if not (isinstance(items, list) and len(items) <= CHILDREN_LIST_BATCH):
+                raise TaskError(f"cancel_many takes a list of at most {CHILDREN_LIST_BATCH} items")
+            out = [_remote_cancel_one(it) for it in items]
         elif op == "cancel":
             tid = args.get("task_id")
             if (args.get("tombstone") is True and isinstance(tid, str) and TASK_ID_RE.fullmatch(tid)
