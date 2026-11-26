@@ -265,8 +265,10 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
         raise HostUnreachable(f"execution host {host.describe()} returned no reply to {op} (exit {rc}): "
                               f"{_tail(err) or _tail(out) or 'no output'}", ambiguous=True)
     if reply.get("v") != PROTOCOL:
-        raise HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
+        err = HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
                         f"{reply.get('v')!r}, this one speaks {PROTOCOL}: update the checkout there ({host.router})")
+        err.protocol = True                 # child_tasks drops its capability cache for this host
+        raise err
     if not reply.get("ok"):
         err = HostError(str(reply.get("error") or f"{op} failed on {host.describe()} without a reason"))
         failure = reply.get("failure")

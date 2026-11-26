@@ -20,6 +20,10 @@ layer:
 `tests/test_child_tasks.py` (the remote fixture and one spawn-failure test), `tests/test_nested_tasks.py` (new),
 README "Delegating whole tasks", AGENTS.md, this file.
 
+**Test isolation.** `child_tasks.tasks_dir()` follows `CORTADOS_TASKS_DIR`, not `CORTADOS_HOME`. `tests/__init__.py`
+gives the whole suite a throwaway tasks root and wraps `tasks_dir()` with a guard that raises for any tasks dir under
+the real home's `~/.config` or `~/.cortados` (`TestTasksDirGuard` in `tests/test_child_tasks.py`).
+
 **Acceptance check.**
 `python3 -B -m unittest tests.test_nested_tasks tests.test_child_tasks tests.test_task_watch tests.test_subagent_mcp`
 and the full suite (`python3 -B -m unittest discover -s tests -t .`), both OK.
@@ -68,12 +72,18 @@ reads as depth 1, no delegate). The new task's depth is that + 1 (0 + 1 when the
 - Over ssh (`--remote`), the requesting host computed the depth (it can see the caller's process tree) and sends it;
   the host takes the deeper of that and its own ancestry check (a `--remote` started by hand inside a child on the host
   itself still finds that child's runner) and applies the same rules.
-- **Older hosts fail closed (owner default, fix round 1).** A nested start on another host (`delegate: true`, or any
-  start from a sub-orchestrator) first asks the host's `capabilities` (`depth`, `delegate`, `start_id`,
-  `cancel_tombstone`; `REMOTE_CAPABILITIES`). A host on an older checkout answers "unknown remote operation", and the
-  start is refused with that said, before anything is sent. Plain tasks skip the handshake and stay backward compatible
-  (an older host that ignores the requested id gets its stub under its own id, as before). The warning when a host's
-  reply does not echo `depth`/`delegate` stays as a backstop.
+- **Every remote start needs the current protocol (fix round 4; all hosts deploy from the same main).** Any start on
+  another host, plain or nested, first needs the host's `capabilities` (`REMOTE_CAPABILITIES`: `depth`, `delegate`,
+  `start_id`, `cancel_tombstone`, `status_tombstone`, `start_refusal`). A host on an older checkout (it answers "unknown
+  remote operation", or lacks one) is refused BEFORE anything is recorded or sent, with "update this host's
+  cortados-router checkout". **The capability cache:** a confirmation is kept in the requester's tasks root
+  (`host-capabilities.json`, per host name + ssh destination + router path) for `CAPABILITY_CACHE_S` (10 min), so only
+  the first start in that window pays the handshake's ssh round trip; a refusal is never cached (an updated host is
+  picked up at once), and the entry is dropped on any protocol error (a protocol-version mismatch, an unknown
+  operation or request the host flags `failure.protocol`, or a start reply without the requested id). There is no
+  older-host compatibility left: no own-id replacement, and "no such task" is only ever the host's structured
+  `failure.absent`, never its text. The warning when a host's reply does not echo `depth`/`delegate` stays as a
+  backstop.
 - A start inside a sub-orchestrator records the child in `<sub task dir>/children/<child id>` before the spawn (for
   another host: before the request is sent, see the remote-start intent below), under `<sub task dir>/children.lock`.
 
@@ -113,12 +123,32 @@ not see that child's runner as the caller of every in-process start. Not an env 
   the start fails with the id named. Only the HOST's answer for the id settles it: `task_status <id>`, the cancel
   cascade, the sub-orchestrator's end report and the daily cleanup (`--cleanup-archive` runs `reconcile_unconfirmed`)
   ask the host by id. A task there confirms the stub; no task there (status sends `tombstone: true`, so the host writes
-  its cancelled placeholder under the id first; an older host's structured `{"absent": true}` answer) or only that
-  placeholder makes it `start_failed`: terminal, kept for the report, never running, and final (a start still in
-  flight finds the placeholder and launches nothing). While the host does not answer it stays `start_unconfirmed` and
-  is reported so (not running, not failed); `prune` never drops it by age. A cancel of a `start_unconfirmed` id writes
-  the placeholder (a TOMBSTONE) on the host and settles the stub as `start_failed`. The one removal: an older host's
-  reply naming the task under its own id replaces our stub with that id's.
+  its cancelled placeholder under the id first) or only that placeholder makes it `start_failed`: terminal, kept for
+  the report, never running, and final (a start that reaches the host later finds the placeholder and launches
+  nothing). While the host does not answer it stays `start_unconfirmed` and is reported so (not running, not failed);
+  `prune` never drops it by age. A cancel of a `start_unconfirmed` id writes the placeholder (a TOMBSTONE) on the host
+  and settles the stub as `start_failed`. An intent is never removed.
+- **A refusal settles at once (fix round 4, P3).** When the host's own start handler refuses a start that launched
+  nothing (a TaskError before any spawn: a cwd missing there, a depth refusal, a branch held), its reply carries
+  `failure: {"refused": true}` (capability `start_refusal`) and the requester settles the stub `start_failed`
+  immediately, with the host's reason. ssh failures, timeouts, lost replies and the host's unexpected exceptions are
+  never refusals: they stay `start_unconfirmed`.
+- **A start in flight is never reconciled (fix round 4, P2).** The requester takes an exclusive flock on
+  `<stub dir>/start.lock` BEFORE the stub is published and holds it until its start RPC has returned and the stub is
+  settled. Every reconciliation (task_status, wait_task, cancel_task and the cancel cascade, the end-of-run report,
+  the daily pass) probes it without blocking: held, it does not ask or tombstone the host. Status answers
+  `start_unconfirmed` with `start_in_progress: true` ("start in progress"), the daily pass reports the id under
+  `in_progress`. A crashed requester's lock is released by the kernel, so reconciliation then proceeds. A cancel of an
+  in-flight stub writes the requester-side `cancelled` marker FIRST, then probes the lock and answers `cancelling`
+  (`start_in_progress`); the start re-checks the marker after its RPC returns and the lock is released and cancels
+  what the host launched (round 1 logic; for a start that failed or stayed unconfirmed the cancel tombstones the id),
+  then fails ("was cancelled while its start ran"). A marked stub whose requester died is cancelled by the next
+  reconciliation of the id. (A sub-orchestrator's own cascade first waits on its children lock, which its start holds
+  across the RPC; past `CHILDREN_LOCK_WAIT_S` it cancels each child this way.)
+- **Readers (fix round 4, P3).** `list_tasks` shows an unconfirmed row as `start_unconfirmed` (with
+  `start_in_progress` while its start runs) and never reconciles it (task_status does). The live view's stub rows carry
+  `state: start_failed | start_unconfirmed`: a settled `start_failed` is drawn as `failed` ("never started on <host>"),
+  an unconfirmed one as `elsewhere` with "start unconfirmed"; neither as a task running there.
 - **A cancel always marks an existing task dir (fix round 2, P2).** Whatever `_state()` reads (a start paused between
   its mkdir and its `meta.json` past `META_GRACE_S` reads as failed), cancel writes the `cancelled` marker into the dir;
   a dir with no metadata answers `cancelling` (a stalled or still-running start, not a failed task). The start checks
@@ -198,8 +228,9 @@ outside the child-task boundary, stated plainly rather than closed:
    addition to the host's own MCP servers; if the host's user config also registers cortados-route, Claude Code's
    precedence picks one. Both run that host's checkout and decide depth by the process tree, so either is correct; a
    strict config (only cortados-route) would drop the host's other servers from sub-orchestrators.
-6. **Older execution hosts.** Default implemented: a nested start fails closed after the capability handshake (see
-   "How depth is enforced"); plain tasks stay backward compatible.
+6. **Older execution hosts.** Decided (orchestrator, fix round 4; every host deploys from the same main): every remote
+   start, plain or nested, fails closed after the cached capability handshake (see "How depth is enforced"); there is
+   no backward compatibility for remote starts.
 7. **Threat-model residual**: the same-owner bypasses above.
 
 ## Proposed change to the owner's orchestrator directive (NOT applied)

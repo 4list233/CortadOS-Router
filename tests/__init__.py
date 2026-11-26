@@ -28,3 +28,25 @@ from cortados_router import child_tasks as _child_tasks  # noqa: E402
 _child_tasks.ANCESTRY_SCOPE = "tasks_dir"
 for _name in ("CORTADOS_TASK_ID", "CORTADOS_TASK_DEPTH", "CORTADOS_TASK_DELEGATE"):
     os.environ.pop(_name, None)
+
+# Fix round 4 (review r4): child_tasks.tasks_dir() follows CORTADOS_TASKS_DIR (else ~/.config/cortados/tasks), NOT
+# CORTADOS_HOME, so a test that set only CORTADOS_HOME once wrote a task dir into the owner's real tasks root. The suite
+# gets its own throwaway tasks root, and a guard: any tasks dir under the real home's ~/.config or ~/.cortados (the
+# real HOME as the suite started, before any test patches HOME) raises instead of being used. Tested in
+# tests/test_child_tasks.py (TestTasksDirGuard).
+REAL_HOME = os.path.realpath(os.path.expanduser("~"))
+FORBIDDEN_ROOTS = tuple(os.path.join(REAL_HOME, x) for x in (".config", ".cortados"))
+os.environ["CORTADOS_TASKS_DIR"] = tempfile.mkdtemp(prefix="cortados-test-tasks-")
+_unguarded_tasks_dir = _child_tasks.tasks_dir
+
+
+def _guarded_tasks_dir() -> str:
+    d = _unguarded_tasks_dir()
+    real = os.path.realpath(d)
+    if any(real == r or real.startswith(r + os.sep) for r in FORBIDDEN_ROOTS):
+        raise AssertionError(f"test isolation: tasks dir {d} is under the real home; set CORTADOS_TASKS_DIR to a "
+                             "throwaway dir in the test")
+    return d
+
+
+_child_tasks.tasks_dir = _guarded_tasks_dir

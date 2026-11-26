@@ -322,10 +322,23 @@ CHILDREN_LIST_BATCH = 200                   # ids per remote `list` call (the ho
 HANDOFF_RE = re.compile(r"HANDOFF: (t\d{14}-[0-9a-f]{8})[ \t]*")
 FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})")    # a Markdown code fence (CommonMark: up to 3 spaces of indent)
 OUTCOME_INCOMPLETE = "incomplete"
-# What a --remote host answers to `capabilities` (an older checkout answers "unknown remote operation"). A nested start
-# (delegate: true, or any start from a sub-orchestrator) needs all of them on the target host, checked BEFORE the start
-# is sent: an older host would ignore depth/delegate and could not be reconciled after a lost reply (fails closed).
-REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "status_tombstone")
+# What a --remote host answers to `capabilities` (an older checkout answers "unknown remote operation"). EVERY remote
+# start (plain and nested; fix round 4: older hosts are not supported, every host deploys from the same main) needs all
+# of them on the target host, checked BEFORE anything is sent: an older host would ignore depth/delegate or the
+# requested id, or launch after the requester settled the id start_failed (review r4, P1). start_refusal: the host's
+# start handler marks a refusal that launched nothing (`failure.refused`), so the requester settles it at once.
+REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "status_tombstone", "start_refusal")
+# The requester's cache of hosts that confirmed REMOTE_CAPABILITIES, in its tasks root: one handshake per host per
+# CAPABILITY_CACHE_S, so a plain start does not pay a second ssh round trip each time. Only a confirmation is cached
+# (a refused host is asked again next time: an updated checkout is picked up at once); an entry is keyed by the host's
+# name, ssh destination and router path (a reconfigured entry is asked again) and dropped on any protocol error.
+CAPABILITY_CACHE = "host-capabilities.json"
+CAPABILITY_CACHE_S = 600
+# In a start_unconfirmed stub's dir: held (flock, exclusive) by the requester from before the stub is published until
+# its start RPC has returned and the stub is settled. Reconciliation (status, wait, cancel, the cascade, the daily pass)
+# probes it without blocking and leaves an in-flight start alone (review r4, P2: a daily pass once tombstoned a start
+# still in flight). A crashed requester's lock is released by the kernel, so reconciliation then proceeds.
+START_LOCK = "start.lock"
 START_UNCONFIRMED = "start_unconfirmed"     # a remote stub's flag: the start was sent, its reply never arrived
 # A remote stub's terminal flag (its reason, a string): the host itself answered that it has no task under this id, or
 # only the cancelled placeholder (tombstone) of one. Never running, never "failed" on the host; kept for the report.
@@ -1098,6 +1111,11 @@ def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
         out = exec_hosts.call(host, op, args, **({"timeout_s": timeout_s} if timeout_s is not None else {}))
     except exec_hosts.HostError as exc:            # includes HostUnreachable
         failure = getattr(exc, "failure", None)
+        if getattr(exc, "protocol", False) or (isinstance(failure, dict) and failure.get("protocol") is True):
+            _forget_capabilities(host)          # the host's checkout changed under us: handshake again next start
+        if op == "start" and isinstance(failure, dict) and failure.get("refused") is True:
+            # the host's own start handler refused, before launching anything (start_refusal): settled at once
+            raise RemoteRefused(str(exc)) from None
         if op == "start" and isinstance(failure, dict):
             # The host hit an unexpected exception inside its start(): the same guidance as here, naming the host.
             # Its type is shown to the caller: a bounded identifier only, never free text from the reply.
@@ -1107,9 +1125,8 @@ def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
             raise StartFailed(exc_type, f"execution host {host.describe()}",
                               failure.get("launched"), failure.get("task_id")) from None
         tid = args.get("task_id")
-        if op != "start" and isinstance(tid, str) and (
-                (isinstance(failure, dict) and failure.get("absent") is True and failure.get("task_id") == tid)
-                or str(exc) == f"no such task {tid}"):     # an older host's own task_path() answer, exact
+        if op != "start" and isinstance(tid, str) and isinstance(failure, dict) and failure.get("absent") is True \
+                and failure.get("task_id") == tid:      # the host's structured answer only, never its text
             raise NoSuchRemoteTask(f"execution host {host.describe()} has no task {tid}") from None
         raise TaskError(str(exc), ambiguous=getattr(exc, "ambiguous", False)) from None
     if not isinstance(out, (dict, list)):
@@ -1118,8 +1135,56 @@ def _remote(host_name: str, op: str, args: dict, timeout_s=None) -> dict:
 
 
 class NoSuchRemoteTask(TaskError):
-    """The execution host itself answered (a parsed reply, never ssh's exit status or stderr) that it has no task under
-    this id. The only answer that turns a start_unconfirmed intent into start_failed (_fail_stub)."""
+    """The execution host itself answered (a structured reply, never ssh's exit status, stderr or the error text) that
+    it has no task under this id: a confirmed task that is gone there (pruned)."""
+
+
+class RemoteRefused(TaskError):
+    """The execution host's own start handler refused the start before launching anything (a parsed reply carrying
+    `failure.refused`, never an ssh failure): the requester settles its intent as start_failed at once."""
+
+
+def _capability_key(host) -> dict:
+    return {"ssh": host.ssh, "router": host.router}
+
+
+def _cached_capabilities(root: str, host) -> bool:
+    """True when `host` confirmed REMOTE_CAPABILITIES less than CAPABILITY_CACHE_S ago under its current entry. An
+    unreadable cache is no cache (the handshake is asked again)."""
+    try:
+        rec = (_read_json(os.path.join(root, CAPABILITY_CACHE), REMOTE_STUB_MAX_BYTES) or {}).get(host.name)
+    except (TaskError, AttributeError):
+        return False
+    if not isinstance(rec, dict) or {k: rec.get(k) for k in ("ssh", "router")} != _capability_key(host):
+        return False
+    at, have = rec.get("at"), rec.get("capabilities")
+    return (isinstance(at, (int, float)) and 0 <= time.time() - at < CAPABILITY_CACHE_S and isinstance(have, list)
+            and all(c in have for c in REMOTE_CAPABILITIES))
+
+
+def _update_capabilities(root: str, host, have) -> None:
+    """Record (`have` a list) or drop (None) `host`'s cache entry. Best effort: a failed write only costs a handshake."""
+    path = os.path.join(root, CAPABILITY_CACHE)
+    try:
+        cache = _read_json(path, REMOTE_STUB_MAX_BYTES)
+        cache = cache if isinstance(cache, dict) else {}
+        if have is None:
+            if cache.pop(host.name, None) is None:
+                return
+        else:
+            cache[host.name] = {**_capability_key(host), "at": time.time(), "capabilities": list(have)}
+        _write_json(path, cache)
+    except (OSError, TaskError):
+        pass
+
+
+def _forget_capabilities(host) -> None:
+    try:
+        root = tasks_dir()
+        if os.path.isdir(root):
+            _update_capabilities(root, host, None)
+    except TaskError:
+        pass
 
 
 def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = None, parent_task_id=None,
@@ -1129,10 +1194,16 @@ def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = N
     parent task when it has one. `unconfirmed`: written before the start is sent (the remote-start intent); cleared by
     _confirm_stub once the host has answered for this id.
     FileExistsError (the id is taken) leaves everything as it was: the dir belongs to another task. Any other failure
-    removes only the dir this call created (review r2, P2: a caller never removes a dir it did not make)."""
+    removes only the dir this call created (review r2, P2: a caller never removes a dir it did not make).
+    With `unconfirmed`, returns the fd holding START_LOCK, taken BEFORE remote.json exists (so no reader ever sees an
+    unconfirmed stub of an in-flight start without its lock); the caller closes it once the start has settled."""
     d = os.path.join(root, task_id)
     os.mkdir(d, 0o700)                          # FileExistsError propagates with nothing touched
+    lock_fd = None
     try:
+        if unconfirmed:
+            lock_fd = os.open(os.path.join(d, START_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # a fresh file in a dir just made: never contended
         rec = {"host": host_name, "created_at": time.time()}
         if unconfirmed:
             rec[START_UNCONFIRMED] = True
@@ -1144,22 +1215,25 @@ def _write_stub(root: str, task_id: str, host_name: str, origin: dict | None = N
         _write_json(os.path.join(d, REMOTE_STUB), rec)
         _index_stub(root, task_id, o)
     except BaseException:
+        if lock_fd is not None:
+            os.close(lock_fd)
         shutil.rmtree(d, ignore_errors=True)    # ours: made by the mkdir above
         raise
+    return lock_fd
 
 
 STUB_ID_TRIES = 5                           # fresh ids tried when one is taken (4 random bytes per second: a
                                             # collision is rare; five in a row means something else is wrong)
 
 
-def _new_stub(root: str, host_name: str, origin: dict, parent_task_id) -> str:
-    """The remote-start intent's stub under a fresh id (start_unconfirmed). A taken id is never touched (review r2, P2:
-    an id collision once removed another task's record): a new id is drawn, STUB_ID_TRIES times, then refused."""
+def _new_stub(root: str, host_name: str, origin: dict, parent_task_id):
+    """(task id, START_LOCK fd): the remote-start intent's stub under a fresh id (start_unconfirmed), its start lock
+    held. A taken id is never touched (review r2, P2: an id collision once removed another task's record): a new id is
+    drawn, STUB_ID_TRIES times, then refused."""
     for _ in range(STUB_ID_TRIES):
         tid = _new_id()
         try:
-            _write_stub(root, tid, host_name, origin, parent_task_id, unconfirmed=True)
-            return tid
+            return tid, _write_stub(root, tid, host_name, origin, parent_task_id, unconfirmed=True)
         except FileExistsError:
             continue
         except OSError as exc:
@@ -1197,7 +1271,6 @@ def _fail_stub(root: str, task_id: str, reason: str) -> None:
 
 
 NEVER_STARTED_TOMBSTONE = "cancelled before its start reached the execution host; never started there"
-NEVER_STARTED_ABSENT = "the execution host has no task under this id: the start never reached it"
 
 
 def _settle_stub(root: str, task_id: str, answer) -> None:
@@ -1215,6 +1288,17 @@ def _failed_record(task_id: str, stub: dict) -> dict:
             "never_started": True}
 
 
+def _start_in_flight(d: str) -> bool:
+    """A requester holds this stub's START_LOCK: its start RPC has not returned yet (review r4, P2). Reconciliation
+    then leaves the id alone; a crashed requester's lock is gone, and this is False."""
+    return _lock_held(d, START_LOCK) is True
+
+
+def _in_flight_record(task_id: str, stub: dict) -> dict:
+    return {"task_id": task_id, "state": START_UNCONFIRMED, "host": stub.get("host"), "start_in_progress": True,
+            "note": "start in progress: its start request to the execution host has not returned yet; ask again"}
+
+
 def _tombstoned(d: str) -> bool:
     """A task dir that is only the cancelled placeholder of a start that never arrived (_tombstone)."""
     try:
@@ -1224,21 +1308,25 @@ def _tombstoned(d: str) -> bool:
     return isinstance(res, dict) and res.get("tombstone") is True
 
 
-def _require_capabilities(target) -> None:
-    """Refuse a nested start on a host that does not enforce nesting (owner default 2026-11-25: fail closed BEFORE
-    launching). An older checkout answers `capabilities` with "unknown remote operation": refused with that said."""
+def _require_capabilities(root: str, target) -> None:
+    """Refuse ANY remote start on a host that does not speak the current remote-start protocol (fix round 4: older
+    hosts are not supported), BEFORE anything is sent or recorded. Confirmed hosts are cached for CAPABILITY_CACHE_S
+    (_cached_capabilities), so only the first start in that window pays the handshake's ssh round trip."""
+    if _cached_capabilities(root, target):
+        return
+    update = (f"update this host's cortados-router checkout ({target.router}) to the current main, or run the task on "
+              "another host")
     try:
         caps = _remote(target.name, "capabilities", {})
     except TaskError as exc:
-        raise TaskError(f"start_task refused: execution host {target.describe()} did not confirm it supports nested "
-                        f"tasks ({exc}); a sub-orchestrator and its workers need a cortados-router checkout there "
-                        "that enforces depth and delegate. Update the checkout on that host, or run the task here"
-                        ) from None
+        raise TaskError(f"start_task refused: execution host {target.describe()} did not confirm the current "
+                        f"remote-start protocol ({exc}); nothing was sent. If the host is reachable, {update}") from None
     have = caps.get("capabilities") if isinstance(caps, dict) else None
     missing = [c for c in REMOTE_CAPABILITIES if not (isinstance(have, list) and c in have)]
     if missing:
-        raise TaskError(f"start_task refused: execution host {target.describe()} lacks {', '.join(missing)} for nested "
-                        "tasks (an older cortados-router checkout there?); update the checkout on that host")
+        raise TaskError(f"start_task refused: execution host {target.describe()} lacks {', '.join(missing)} (an older "
+                        f"cortados-router checkout there); nothing was sent: {update}")
+    _update_capabilities(root, target, have)
 
 
 def _duplicate_start(d: str, task_id: str, target, depth: int, delegate: bool) -> dict:
@@ -1343,7 +1431,10 @@ def start(*args, **kwargs) -> dict:
     progress = {"launched": "none", "task_id": None}
     try:
         return _start(progress, *args, **kwargs)
-    except TaskError:
+    except TaskError as exc:
+        # A refusal that launched nothing (no spawn and no request was under way): serve_remote tells the requester
+        # so (failure.refused, start_refusal), and its intent is settled start_failed at once (review r4, P3).
+        exc.refused = progress["launched"] == "none" and not isinstance(exc, StartFailed)
         raise
     except Exception as exc:
         _stderr_traceback()                     # the full exception for the operator's log, not for the caller
@@ -1608,6 +1699,49 @@ def _origin_arg(o: dict):
     return arg if any(arg.values()) else None
 
 
+def _send_remote_start(root: str, target, tid: str, args: dict, cwd, parent_id) -> dict:
+    """Send the start of intent `tid` (its stub start_unconfirmed, START_LOCK held by the caller) and settle the stub
+    from the host's answer: confirmed (the host answered with this id), start_failed (the host's own start handler
+    refused before launching anything, RemoteRefused), or left start_unconfirmed for any other failure (review r3, P1:
+    an intent is never deleted because its start failed; only the host's answer for the id settles it)."""
+    try:
+        out = _remote(target.name, "start", args)
+    except RemoteRefused as exc:
+        msg = _cwd_hint(str(exc), cwd, target)
+        _fail_stub(root, tid, f"refused by execution host {target.name}: {msg}"[:ERROR_LINE_CHARS])
+        raise TaskError(f"{msg} (task {tid}: {START_FAILED}, nothing was started)") from None
+    except StartFailed:
+        log_event(START_UNCONFIRMED, task_id=tid, host=target.name, parent_task_id=parent_id)
+        raise
+    except TaskError as exc:
+        # Any other failed start, ambiguous or not (ssh's exit status and stderr prove nothing): the record stays
+        # start_unconfirmed, under the parent too, so task_status reconciles it and cancel_task (and a
+        # sub-orchestrator's cascade) reaches it by id.
+        log_event(START_UNCONFIRMED, task_id=tid, host=target.name, parent_task_id=parent_id)
+        raise TaskError(f"{_cwd_hint(str(exc), cwd, target)}. The start of task {tid} on execution host "
+                        f"{target.describe()} failed or is unconfirmed: it is recorded here as {START_UNCONFIRMED} "
+                        f"until the host answers for that id; task_status {tid} asks the host (no such task there: "
+                        f"{START_FAILED}), cancel_task {tid} cancels it there (also if the start arrives later)",
+                        ambiguous=exc.ambiguous) from None
+    rtid = out.get("task_id") if isinstance(out, dict) else None
+    if rtid != tid:
+        # A host on the current protocol always answers with the requested id: anything else is a protocol error.
+        # Left start_unconfirmed (the host may hold it under our id); the capability cache is dropped.
+        _forget_capabilities(target)
+        raise TaskError(f"execution host {target.describe()} answered the start without the requested task id; task "
+                        f"{tid} is recorded here as {START_UNCONFIRMED} (task_status / cancel_task by that id). Update "
+                        "this host's cortados-router checkout", ambiguous=True)
+    _confirm_stub(root, tid)
+    return out
+
+
+def _cwd_hint(msg: str, cwd, target) -> str:
+    if cwd and "does not exist on execution host" in msg and os.path.isdir(cwd):
+        msg += (f" (it exists on this machine, {exec_hosts.short_hostname()}, only: child tasks run on "
+                f"{target.describe()}, not here)")
+    return msg
+
+
 def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tools, provider_url, token_file, chrome,
                 red, connectors, client, title, session_tag, repo, branch, host, parent_task_id, local, origin,
                 delegate, depth, caller, requested_id=None) -> dict:
@@ -1660,10 +1794,9 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
         if caller is not None:
             # the host does not know the parent: send it the parent's origin, so the task joins the main session's tree
             origin = _origin_arg(parent_origin(root, parent_id))
-        if delegate or caller is not None:
-            # A nested start needs a host that enforces depth/delegate and can reconcile a lost reply (owner default
-            # 2026-11-25): asked BEFORE anything is sent, so an older host refuses with nothing launched.
-            _require_capabilities(target)
+        # Every remote start needs a host on the current protocol (fix round 4): asked BEFORE anything is recorded or
+        # sent (cached per host, _require_capabilities), so an older host refuses with nothing launched.
+        _require_capabilities(root, target)
         # The remote-start INTENT (review r1, P1): the id is chosen here and the stub (flagged start_unconfirmed) and
         # the parent's child record are written BEFORE the request is sent. The host starts the task under exactly
         # this id (idempotent: a second start with it launches nothing), so a lost or timed-out reply leaves a record
@@ -1680,83 +1813,40 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
         stub_origin = clean_origin(origin)
         if stub_origin["origin_session"] is None and parent_id:
             stub_origin = {**stub_origin, **parent_origin(root, parent_id)}   # as the host does (_start, local branch)
-        tid = _new_stub(root, target.name, stub_origin, parent_id)
+        tid, lock_fd = _new_stub(root, target.name, stub_origin, parent_id)
+        failed = None
         try:
-            _record_child(caller, tid)          # under the children guard: a cancel cascade reaches it
-        except OSError as exc:
-            shutil.rmtree(os.path.join(root, tid), ignore_errors=True)   # made by _new_stub for this start
-            _unrecord_child(caller, tid)
-            raise TaskError(f"could not record the remote start locally ({type(exc).__name__}); not started") from None
-        args["task_id"] = tid
-        if caller is not None:
-            progress["recorded"] = tid
-        progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
-
-        def replaced_by(other: str):
-            """The host's own reply named the task under ANOTHER id (an older host chose it): that id's stub is the
-            record, ours never existed there. The only case an intent is removed; never because a start failed."""
-            shutil.rmtree(os.path.join(root, tid), ignore_errors=True)
-            _unrecord_child(caller, tid)
-            progress.pop("recorded", None)
-
-        try:
-            out = _remote(target.name, "start", args)
-        except StartFailed as exc:
-            if exc.task_id not in (None, tid):
-                # an older host chose its own id (plain starts only: nested ones passed the capability check)
-                own = f"the execution host answered under its own id {exc.task_id}"
-                if exc.launched == "yes":
-                    try:                        # the host has the task: make it trackable here, as a success would
-                        _write_stub(root, exc.task_id, target.name, stub_origin, parent_id)
-                    except Exception:           # (a taken id included: that dir is another task's, left untouched)
-                        _fail_stub(root, tid, own)
-                        raise StartFailed(exc.exc_type, exc.where, "maybe") from None
-                    replaced_by(exc.task_id)
-                else:
-                    _fail_stub(root, tid, own)
-            else:
-                # Our id stays recorded, start_unconfirmed (review r3, P1: never deleted because the start failed,
-                # launched "none" included); status, cancel or the end report settles it by asking the host.
-                log_event(START_UNCONFIRMED, task_id=tid, host=target.name, parent_task_id=parent_id)
-            raise
-        except TaskError as exc:
-            msg = str(exc)
-            if cwd and "does not exist on execution host" in msg and os.path.isdir(cwd):
-                msg += (f" (it exists on this machine, {exec_hosts.short_hostname()}, only: child tasks run on "
-                        f"{target.describe()}, not here)")
-            # Any failed start, refused or ambiguous (review r3, P1: ssh's exit status and stderr prove nothing, and the
-            # rule is simplest with no exceptions): the record stays start_unconfirmed, under the parent too, so
-            # task_status reconciles it and cancel_task (and a sub-orchestrator's cascade) reaches it by id. It
-            # becomes start_failed only when the host itself answers that it has no task under this id.
-            log_event(START_UNCONFIRMED, task_id=tid, host=target.name, parent_task_id=parent_id)
-            raise TaskError(f"{msg}. The start of task {tid} on execution host {target.describe()} failed or is "
-                            f"unconfirmed: it is recorded here as {START_UNCONFIRMED} until the host answers for that "
-                            f"id; task_status {tid} asks the host (no such task there: {START_FAILED}), cancel_task "
-                            f"{tid} cancels it there (also if the start arrives later)",
-                            ambiguous=exc.ambiguous) from None
-        rtid = out.get("task_id") if isinstance(out, dict) else None
-        if not isinstance(rtid, str) or not TASK_ID_RE.fullmatch(rtid):
-            # The host answered but named no task: left start_unconfirmed (the host may hold it under our id).
-            raise TaskError(f"execution host {target.describe()} started a task but returned no valid task_id; task "
-                            f"{tid} is recorded here as {START_UNCONFIRMED} (task_status / cancel_task by that id)",
-                            ambiguous=True)
-        if rtid != tid:
-            # An older host ignores the requested id (plain starts only reach one): the stub follows the host's id.
-            replaced_by(rtid)
-            tid = rtid
             try:
-                _write_stub(root, tid, target.name, stub_origin, parent_id)
-            except BaseException as exc:
-                # _write_stub removed what it made, and never a dir it did not make (a taken id is another task's)
-                try:
-                    _remote(target.name, "cancel", {"task_id": tid})
-                except TaskError as cancel_exc:
-                    raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
-                                    f"remote cancellation also failed: {cancel_exc}", ambiguous=True) from None
-                raise TaskError(f"remote task {tid} started but local bookkeeping failed ({type(exc).__name__}); "
-                                "the remote task was cancelled") from None
-        else:
-            _confirm_stub(root, tid)
+                _record_child(caller, tid)          # under the children guard: a cancel cascade reaches it
+            except OSError as exc:
+                shutil.rmtree(os.path.join(root, tid), ignore_errors=True)   # made by _new_stub for this start
+                _unrecord_child(caller, tid)
+                raise TaskError(f"could not record the remote start locally ({type(exc).__name__}); not started"
+                                ) from None
+            args["task_id"] = tid
+            if caller is not None:
+                progress["recorded"] = tid
+            progress["launched"] = "maybe"         # from here the request may reach the host and launch a child
+            try:
+                out = _send_remote_start(root, target, tid, args, cwd, parent_id)
+            except TaskError as exc:
+                failed = exc
+        finally:
+            os.close(lock_fd)                   # the start has settled (or stays unconfirmed): reconciliation may run
+        if os.path.exists(os.path.join(root, tid, "cancelled")):
+            # cancel_task ran while the start was in flight (it marks the stub BEFORE it probes the lock, so this check,
+            # after the release, sees every such cancel): whatever the host launched is cancelled now (round 1 logic;
+            # for a start that failed or stayed unconfirmed, the cancel tombstones the id there).
+            try:
+                r = cancel(tid)
+                how = "cancelled" if r.get("cancelled") else f"not cancelled ({r.get('reason') or r.get('state')})"
+            except TaskError as exc:
+                how = f"its cancel failed ({exc}); cancel it with cancel_task"
+            raise TaskError(f"start_task: task {tid} was cancelled while its start ran; what execution host "
+                            f"{target.describe()} launched under it was {how}"
+                            + (f" (the start itself: {failed})" if failed is not None else ""))
+        if failed is not None:
+            raise failed
         progress.update(launched="yes", task_id=tid)
         out["host"] = target.name
         out["watch_command"] = watch_command(tid)   # THIS machine's command (the host's own, if any, is not ours)
@@ -2363,11 +2453,11 @@ def clean_origin_meta(rec) -> dict:
 _REAP: dict = {}    # Popen handles of runners this server started: polled so an exited runner is reaped, not a zombie
 
 
-def _lock_held(d: str):
-    """True if a live runner holds <d>/runner.lock, False if not (the lock was acquirable), None if there is no lock
-    file. The probe takes the lock for an instant only."""
+def _lock_held(d: str, name: str = "runner.lock"):
+    """True if a live process holds <d>/<name> (the runner's lock, or a requester's START_LOCK), False if not (the
+    lock was acquirable), None if there is no lock file. The probe takes the lock for an instant only."""
     try:
-        fd = os.open(os.path.join(d, "runner.lock"), os.O_RDWR)
+        fd = os.open(os.path.join(d, name), os.O_RDWR)
     except FileNotFoundError:
         return None
     try:
@@ -2560,17 +2650,24 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
     stub = _stub(d)
     if stub and stub.get(START_FAILED):
         return _failed_record(task_id, stub)
+    if stub and stub.get(START_UNCONFIRMED):
+        if _start_in_flight(d):
+            return _in_flight_record(task_id, stub)     # never tombstone a start whose RPC is still under way
+        if os.path.exists(os.path.join(d, "cancelled")):
+            # cancel_task ran while the start was in flight and the requester did not carry it out (it crashed, or its
+            # cancel failed): reconciling this id carries the cancel out (the host tombstones or cancels the id)
+            try:
+                return cancel(task_id)
+            except TaskError as exc:
+                raise TaskError(f"{exc} (task {task_id} is {START_UNCONFIRMED} and marked cancelled here: its "
+                                f"cancel is sent to execution host {stub['host']} again once it answers)",
+                                ambiguous=exc.ambiguous) from None
     if stub:
         try:
             out = _remote(stub["host"], "status", {"task_id": task_id,
                                                    **({"tombstone": True} if stub.get(START_UNCONFIRMED) else {})},
                           timeout_s=max(RUN_FETCH_MIN_S, min(exec_hosts.SSH_RPC_TIMEOUT_S, deadline - time.monotonic()))
                           if deadline else None)
-        except NoSuchRemoteTask:
-            if not stub.get(START_UNCONFIRMED):
-                raise                                   # a confirmed task the host no longer has (pruned there)
-            _fail_stub(os.path.dirname(d), task_id, NEVER_STARTED_ABSENT)
-            return _failed_record(task_id, {**stub, START_FAILED: NEVER_STARTED_ABSENT})
         except TaskError as exc:
             if not stub.get(START_UNCONFIRMED):
                 raise
@@ -3073,6 +3170,18 @@ def peek_local(task_id) -> dict | None:
     return out
 
 
+def _stub_row(tid: str, rec: dict) -> dict:
+    """One remote stub as the live view reads it: metadata only, and its start state when the start is not confirmed
+    (review r4, P3: a settled start_failed must not read as a task running elsewhere)."""
+    row = {"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
+           **clean_origin_meta(rec.get("origin"))}
+    if rec.get(START_FAILED):
+        row["state"] = START_FAILED
+    elif rec.get(START_UNCONFIRMED):
+        row["state"] = START_UNCONFIRMED
+    return row
+
+
 REMOTE_STUBS_SCAN = 200            # newest task dirs looked at per call: a day of tasks at the owner's pace, a few stats each
 
 
@@ -3102,8 +3211,7 @@ def remote_stubs() -> list:
         except Exception:                       # a RecordError, or anything a planted stub makes the read raise
             continue
         if rec is not None:
-            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
-                        **clean_origin_meta(rec.get("origin"))})
+            out.append(_stub_row(tid, rec))
     return out
 
 
@@ -3124,8 +3232,7 @@ def remote_stubs_by_id(task_ids) -> list:
             out.append({"task_id": tid, "unreadable": True})
             continue
         if rec is not None:
-            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"),
-                        **clean_origin_meta(rec.get("origin"))})
+            out.append(_stub_row(tid, rec))
     return out
 
 
@@ -3153,7 +3260,7 @@ def remote_stubs_for(origin) -> list:
             continue
         o = clean_origin_meta(rec.get("origin")) if rec is not None else {}
         if o.get("origin_session") == origin:
-            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
+            out.append(_stub_row(tid, rec))
     return out
 
 
@@ -3182,7 +3289,7 @@ def remote_stubs_for_machine(machine) -> list:
         om = o.get("origin_machine")
         if not o.get("origin_session") and isinstance(om, str) and om and \
                 hmac.compare_digest(om.encode("utf-8", "surrogatepass"), machine.encode("utf-8", "surrogatepass")):
-            out.append({"task_id": tid, "host": rec.get("host"), "created_at": rec.get("created_at"), **o})
+            out.append(_stub_row(tid, rec))
     return out
 
 
@@ -3209,10 +3316,14 @@ def list_recent(n=20, ids=None) -> list:
         if state == "remote" and meta.get(START_FAILED):
             rows.append(_failed_record(tid, meta))
             continue
+        if state == "remote" and meta.get(START_UNCONFIRMED):
+            # shown as it is, never reconciled by a listing (task_status <id> asks the host for it)
+            rows.append({"task_id": tid, "host": meta["host"], "state": START_UNCONFIRMED,
+                         **({"start_in_progress": True} if _start_in_flight(os.path.join(root, tid)) else {})})
+            continue
         if state == "remote":
             by_host.setdefault(meta["host"], []).append(tid)
-            rows.append({"task_id": tid, "host": meta["host"], "state": "unknown",   # filled in from the host below
-                         **({START_UNCONFIRMED: True} if meta.get(START_UNCONFIRMED) else {})})
+            rows.append({"task_id": tid, "host": meta["host"], "state": "unknown"})   # filled in from the host below
             continue
         rows.append({"task_id": tid, "state": state, "cwd": meta.get("cwd"), "orchestrator": meta.get("orchestrator"),
                      **({"tombstone": True} if (res or {}).get("tombstone") is True else {}),
@@ -3249,16 +3360,18 @@ def cancel(task_id) -> dict:
                 "reason": f"task is already {START_FAILED} (never started on its host)"}
     if state == "remote":
         unconfirmed = bool(meta.get(START_UNCONFIRMED))
+        if unconfirmed:
+            # The requester-side marker FIRST, then the lock probe: a start still in flight re-checks the marker after
+            # its RPC returns and releases the lock, so it sees every cancel that found it in flight (review r4, P2).
+            open(os.path.join(d, "cancelled"), "w").close()
+            if _start_in_flight(d):
+                return {"task_id": task_id, "state": "cancelling", "cancelled": True, "host": meta["host"],
+                        "start_in_progress": True,
+                        "note": "its start request is in flight; marked cancelled here, so the start cancels what "
+                                "the host launched as soon as its reply arrives (or reconciliation does, if it died)"}
         # an unconfirmed start is cancelled by id: the host tombstones an id it never started (a late start then
-        # launches nothing); an older host ignores the flag and answers "no such task"
-        try:
-            out = _remote(meta["host"], "cancel", {"task_id": task_id, **({"tombstone": True} if unconfirmed else {})})
-        except NoSuchRemoteTask:
-            if not unconfirmed:
-                raise
-            _fail_stub(os.path.dirname(d), task_id, NEVER_STARTED_ABSENT)
-            return {**_failed_record(task_id, {**meta, START_FAILED: NEVER_STARTED_ABSENT}), "cancelled": False,
-                    "reason": f"task is {START_FAILED}: its host has no task under this id"}
+        # launches nothing)
+        out = _remote(meta["host"], "cancel", {"task_id": task_id, **({"tombstone": True} if unconfirmed else {})})
         if unconfirmed:
             _settle_stub(os.path.dirname(d), task_id, out)
             if isinstance(out, dict) and out.get("tombstone") is True:
@@ -3378,10 +3491,12 @@ def _children_states(kids: list) -> dict:
             continue
         if state == "remote" and meta.get(START_FAILED):
             rows[k] = {"task_id": k, "state": START_FAILED, "host": meta["host"], "error": meta[START_FAILED]}
+        elif state == "remote" and meta.get(START_UNCONFIRMED):
+            rows[k] = {"task_id": k, "state": START_UNCONFIRMED, "host": meta["host"]}
+            _reconcile_child_row(k, rows[k])    # asks the host for this id (settles, or stays unconfirmed)
         elif state == "remote":
             by_host.setdefault(meta["host"], []).append(k)
-            rows[k] = {"task_id": k, "state": "unknown", "host": meta["host"],
-                       **({START_UNCONFIRMED: True} if meta.get(START_UNCONFIRMED) else {})}
+            rows[k] = {"task_id": k, "state": "unknown", "host": meta["host"]}
         else:
             rows[k] = {"task_id": k, "state": state, **({"host": meta["host"]} if meta.get("host") else {})}
     for host, ids in by_host.items():
@@ -3391,16 +3506,12 @@ def _children_states(kids: list) -> dict:
                 remote = _remote(host, "list", {"limit": len(batch), "ids": batch})
             except TaskError as exc:
                 for k in batch:
-                    # an unconfirmed start whose host does not answer is reported as such: not running, not failed
-                    rows[k].update(state=START_UNCONFIRMED if rows[k].get(START_UNCONFIRMED) else "unreachable",
-                                   error=str(exc))
+                    rows[k].update(state="unreachable", error=str(exc))
                 continue
             found = {r.get("task_id"): r for r in remote if isinstance(r, dict)} if isinstance(remote, list) else {}
             for k in batch:
                 st = (found.get(k) or {}).get("state")
-                if rows[k].get(START_UNCONFIRMED):
-                    _reconcile_child_row(k, rows[k])     # asks the host for this id (settles, or stays unconfirmed)
-                elif isinstance(st, str) and st in TERMINAL_STATES + ("running",):
+                if isinstance(st, str) and st in TERMINAL_STATES + ("running",):
                     rows[k]["state"] = st
                 else:
                     rows[k]["error"] = (f"not listed by execution host '{host}'" if st is None
@@ -3416,11 +3527,11 @@ def _reconcile_child_row(task_id: str, row: dict) -> None:
     except TaskError as exc:
         row.update(state=START_UNCONFIRMED, error=str(exc))
         return
-    row.pop(START_UNCONFIRMED, None)
     state = st.get("state")
-    row["state"] = state if isinstance(state, str) and state in TERMINAL_STATES + ("running",) else "unknown"
-    if state == START_FAILED:
-        row["error"] = st.get("error")
+    row["state"] = state if isinstance(state, str) and state in TERMINAL_STATES + ("running", START_UNCONFIRMED) \
+        else "unknown"
+    if state == START_FAILED or st.get("start_in_progress"):
+        row["error"] = st.get("error") or st.get("note")
 
 
 def reconcile_unconfirmed(root: str | None = None) -> dict:
@@ -3428,7 +3539,7 @@ def reconcile_unconfirmed(root: str | None = None) -> dict:
     which settles it (confirmed, or start_failed when the host has no such id). One unreachable host leaves its stubs
     as they are. Returns counts and per-id errors (ids only)."""
     root = root or tasks_dir()
-    report = {"checked": 0, "settled": 0, "still_unconfirmed": [], "errors": []}
+    report = {"checked": 0, "settled": 0, "still_unconfirmed": [], "in_progress": [], "errors": []}
     try:
         names = sorted(x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x))
     except OSError as exc:
@@ -3443,9 +3554,12 @@ def reconcile_unconfirmed(root: str | None = None) -> dict:
             continue
         report["checked"] += 1
         try:
-            status(tid)
+            st = status(tid)                    # a start still in flight is skipped there (start in progress)
         except TaskError:
             report["still_unconfirmed"].append(tid)
+            continue
+        if st.get("start_in_progress"):
+            report["in_progress"].append(tid)
             continue
         report["settled"] += 1
     return report
@@ -5110,13 +5224,14 @@ def serve_remote(stdin=None, stdout=None) -> int:
         stdout.flush()
         return 0 if ok else 1
 
+    protocol_error = {"protocol": True}         # the requester drops its capability cache for this host
     try:
         req = json.load(stdin)
     except (ValueError, RecursionError):
-        return reply(False, "remote request is not JSON")
+        return reply(False, "remote request is not JSON", protocol_error)
     if not isinstance(req, dict) or req.get("v") != exec_hosts.PROTOCOL:
         return reply(False, f"remote request protocol {req.get('v') if isinstance(req, dict) else None!r} != {exec_hosts.PROTOCOL}: "
-                            "update the cortados-router checkout on both machines")
+                            "update the cortados-router checkout on both machines", protocol_error)
     op, args = req.get("op"), req.get("args") if isinstance(req.get("args"), dict) else {}
     try:
         host = exec_hosts.load().resolve(req.get("host"))
@@ -5171,13 +5286,15 @@ def serve_remote(stdin=None, stdout=None) -> int:
             else:
                 out = cancel(tid)
         else:
-            return reply(False, f"unknown remote operation {quoted(op)}")
+            return reply(False, f"unknown remote operation {quoted(op)}", protocol_error)
     except StartFailed as exc:                  # classified by start() itself: carry it so the caller can say what to do
         return reply(False, str(exc), exc.failure())
     except TaskError as exc:
         text = str(exc).strip() or (f"{op} failed on execution host {host.name}: {type(exc).__name__} without a "
                                     "message (a cortados-router bug: please report it)")
-        return reply(False, Redactor(tokens).text(text) if tokens else text)
+        refused = {"refused": True, "task_id": args.get("task_id")} if op == "start" and getattr(exc, "refused", False) \
+            else None
+        return reply(False, Redactor(tokens).text(text) if tokens else text, refused)
     except Exception as exc:                    # the type only: the text is unscrubbed and could echo configuration
         _stderr_traceback()
         # Outside start() (start classifies its own): for a start request nothing was launched yet.

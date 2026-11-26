@@ -612,18 +612,6 @@ class LifecycleFixTests(NestedBase):
         with self.assertRaises(ct.TaskError):                   # a caller never names the id
             ct.start("x", self.work, task_id="t20261125000000-cccccccc")
 
-    def test_a_clean_refusal_by_the_host_keeps_the_intent_until_the_host_answers_for_the_id(self):
-        # r3: no exception to the rule, a refusal included; the host's "no such id" then settles it as start_failed
-        self._air()
-        sub = self.fake_sub()
-        with mock.patch.object(ct, "caller_identity", return_value=sub):
-            r, _ = self.call("start_task", task="x", host="air", cwd="/no/such/dir/anywhere")
-        self.assertTrue(r.get("isError"))
-        self.assertIn("does not exist on execution host", r["content"][0]["text"])
-        tid = ct.children_of(sub["dir"])[0]
-        self.assertEqual(self.air_tasks(), [])
-        self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
-
     # --- P2: a start racing a cancel whose lock wait timed out ---------------------------------------------------
     def test_a_start_racing_a_timed_out_cancel_cancels_the_worker_it_launched(self):
         w1, gc = self.folder("w1"), self.folder("gc")
@@ -725,29 +713,6 @@ class LifecycleFixTests(NestedBase):
         self.assertEqual(calls, [("list", kids[:2]), ("list", kids[2:])])
         self.assertEqual({r["state"] for r in rows.values()}, {"succeeded"})
 
-    # --- older hosts: the capability handshake --------------------------------------------------------------
-    def test_delegate_to_a_host_without_the_capabilities_is_refused_before_launch(self):
-        self._air()
-        real = ct._remote
-        ops = []
-
-        def old_host(host_name, op, args, timeout_s=None):
-            ops.append(op)
-            if op == "capabilities":
-                raise ct.TaskError("unknown remote operation 'capabilities'")
-            return real(host_name, op, args, timeout_s)
-        with mock.patch.object(ct, "_remote", side_effect=old_host):
-            r, _ = self.call("start_task", task="x", host="air", delegate=True)
-            self.assertIn("did not confirm it supports nested tasks", r["content"][0]["text"])
-            self.assertEqual(ops, ["capabilities"])             # nothing was sent to start
-            self.assertEqual(self.air_tasks(), [])
-            self.assertEqual(self.task_dirs(), [])
-            # a plain task stays backward compatible: no handshake
-            out = self.start_task(cwd=None, host="air")
-        self.assertNotIn("capabilities", ops[1:])
-        self.wait_done(out["task_id"])
-
-
 class LifecycleFixRound2Tests(NestedBase):
     """Fix round 2 (review r2 on 880f0e0): every finding reproduced, then shown fixed."""
 
@@ -844,27 +809,6 @@ class LifecycleFixRound2Tests(NestedBase):
         self.assertTrue(os.path.exists(os.path.join(tdir, "cancelled")))
         _, st = self.call("task_status", task_id=tid)
         self.assertEqual((st["state"], st["never_started"]), (ct.START_FAILED, True))
-
-    def test_r3_an_older_hosts_structured_no_such_task_answer_also_settles_it(self):
-        self._air()
-        sub = self.fake_sub()
-        real = ct.exec_hosts.TRANSPORT
-
-        def old_host(argv, stdin, timeout):
-            req = json.loads(stdin)
-            if req["op"] == "capabilities":
-                return real(argv, stdin, timeout)
-            if req["op"] == "start":
-                raise subprocess.TimeoutExpired(argv, timeout)
-            tid = req["args"]["task_id"]
-            return 1, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False, "error": f"no such task {tid}",
-                                  "failure": {"absent": True, "task_id": tid}}).encode(), b""
-        with mock.patch.object(ct.exec_hosts, "TRANSPORT", old_host), \
-                mock.patch.object(ct, "caller_identity", return_value=sub):
-            self.call("start_task", task="x", host="air")
-            tid = ct.children_of(sub["dir"])[0]
-            self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
-            self.assertEqual(ct.cancel(tid)["state"], ct.START_FAILED)
 
     def test_r3_an_unreachable_host_leaves_it_start_unconfirmed_in_the_report(self):
         self._air()
@@ -1046,6 +990,215 @@ class RouteTaskInsideChildTests(NestedBase):
     def test_the_start_task_schema_offers_delegate(self):
         props = next(t for t in m.CHILD_TOOLS if t["name"] == "start_task")["inputSchema"]["properties"]
         self.assertEqual(props["delegate"]["type"], "boolean")
+
+
+class LifecycleFixRound4Tests(NestedBase):
+    """Fix round 4 (review r4 on 8f222bb): every remote start needs the current protocol (cached handshake); a start in
+    flight is never reconciled; a structured refusal settles at once; the live view shows start_failed."""
+
+    fake_sub = LifecycleFixTests.fake_sub
+    air_tasks = LifecycleFixTests.air_tasks
+
+    def stub_ids(self):
+        return sorted(x for x in self.task_dirs() if ct.TASK_ID_RE.fullmatch(x)
+                      and os.path.exists(os.path.join(ct.tasks_dir(), x, ct.REMOTE_STUB)))
+
+    def ops_through(self, answer_caps=None):
+        """Wrap the Air's transport: record every op; `answer_caps` (a reply dict) replaces the host's own answer."""
+        real, ops = ct.exec_hosts.TRANSPORT, []
+
+        def t(argv, stdin, timeout):
+            op = json.loads(stdin)["op"]
+            ops.append(op)
+            if op == "capabilities" and answer_caps is not None:
+                return 1, json.dumps({"v": ct.exec_hosts.PROTOCOL, **answer_caps}).encode(), b""
+            return real(argv, stdin, timeout)
+        p = mock.patch.object(ct.exec_hosts, "TRANSPORT", t)
+        p.start()
+        self.addCleanup(p.stop)
+        return ops, real
+
+    # --- P1 / P3: older hosts are refused before anything is sent, plain starts included ---------------------------
+    def test_a_host_without_the_capabilities_is_refused_before_send_plain_and_nested(self):
+        self._air()
+        older = [{"ok": False, "error": "unknown remote operation 'capabilities'"},          # before round 1
+                 {"ok": True, "result": {"capabilities": ["depth", "delegate", "start_id", "cancel_tombstone",
+                                                         "status_tombstone"]}}]                  # 8f222bb
+        for reply in older:
+            ops, _ = self.ops_through(reply)
+            for kw in ({}, {"delegate": True}):
+                with self.subTest(reply=reply, kw=kw):
+                    del ops[:]
+                    r, _ = self.call("start_task", task="x", host="air", **kw)
+                    text = r["content"][0]["text"]
+                    self.assertTrue(r.get("isError"))
+                    self.assertIn("update this host's cortados-router checkout", text)
+                    self.assertIn("nothing was sent", text)
+                    self.assertEqual(ops, ["capabilities"])     # no start request, ever
+            if reply["ok"]:
+                self.assertIn("lacks start_refusal", text)
+        self.assertEqual(self.stub_ids(), [])                   # nothing recorded here
+        self.assertEqual(self.air_tasks(), [])                  # nothing launched there
+
+    def test_the_capability_cache_spares_the_handshake_and_a_protocol_error_drops_it(self):
+        self._air()
+        ops, _ = self.ops_through()
+        a = self.start_task(cwd=None, host="air")
+        b = self.start_task(cwd=None, host="air")
+        self.assertEqual(ops.count("capabilities"), 1)          # the second start: cache hit, one ssh call only
+        self.assertEqual(ops.count("start"), 2)
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        self.assertTrue(ct._cached_capabilities(root, air))
+        with mock.patch.object(ct.time, "time", return_value=time.time() + ct.CAPABILITY_CACHE_S + 1):
+            self.assertFalse(ct._cached_capabilities(root, air))   # expired after 10 min
+        # a protocol error from the host (here: an operation it does not know) drops the entry
+        with self.assertRaises(ct.TaskError):
+            ct._remote("air", "no-such-op", {})
+        self.assertFalse(ct._cached_capabilities(root, air))
+        self.start_task(cwd=None, host="air")
+        self.assertEqual(ops.count("capabilities"), 2)
+        for out in (a, b):
+            self.wait_done(out["task_id"])
+
+    # --- P2: a start in flight is never reconciled ----------------------------------------------------------------
+    def gate_start(self):
+        sent, release = threading.Event(), threading.Event()
+        real = ct.exec_hosts.TRANSPORT
+
+        def gated(argv, stdin, timeout):
+            if json.loads(stdin)["op"] == "start":
+                sent.set()
+                self.assertTrue(release.wait(60))
+            return real(argv, stdin, timeout)
+        p = mock.patch.object(ct.exec_hosts, "TRANSPORT", gated)
+        p.start()
+        self.addCleanup(p.stop)
+        box = {}
+
+        def starter():
+            try:
+                box["out"] = ct.start("x", None, host="air")
+            except ct.TaskError as exc:
+                box["err"] = str(exc)
+        t = threading.Thread(target=starter)
+        t.start()
+        self.assertTrue(sent.wait(60))
+        [tid] = self.stub_ids()
+        return tid, release, t, box
+
+    def test_an_in_flight_start_is_skipped_by_reconciliation_and_completes(self):
+        # The reviewer's reproduction: the daily pass ran while the start RPC was in flight and tombstoned the id.
+        self._air()
+        tid, release, t, box = self.gate_start()
+        rep = ct.reconcile_unconfirmed()
+        self.assertEqual((rep["checked"], rep["settled"], rep["in_progress"]), (1, 0, [tid]))
+        st = ct.status(tid)
+        self.assertEqual((st["state"], st["start_in_progress"]), (ct.START_UNCONFIRMED, True))
+        self.assertEqual(ct.wait(tid, timeout_s=0)["state"], ct.START_UNCONFIRMED)
+        self.assertEqual(self.air_tasks(), [])                  # no tombstone was written there
+        rows = ct.list_recent()
+        self.assertEqual([(r["task_id"], r["state"], r.get("start_in_progress")) for r in rows],
+                         [(tid, ct.START_UNCONFIRMED, True)])
+        release.set()
+        t.join(60)
+        self.assertNotIn("err", box)
+        self.assertEqual(box["out"]["task_id"], tid)
+        self.assertNotIn("duplicate", box["out"])               # was: the start came back cancelled/duplicate
+        self.assertNotIn(ct.START_UNCONFIRMED, _load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB)))
+        self.assertEqual(self.wait_done(tid)["state"], "succeeded")
+
+    def test_a_crashed_requesters_stub_is_settled_by_reconciliation(self):
+        self._air()
+        root = ct._private_root()
+        tid, fd = ct._new_stub(root, "air", {}, None)           # the requester, before its RPC
+        rep = ct.reconcile_unconfirmed()
+        self.assertEqual((rep["settled"], rep["in_progress"]), (0, [tid]))
+        os.close(fd)                                            # it crashes: the kernel releases the lock
+        rep = ct.reconcile_unconfirmed()
+        self.assertEqual((rep["checked"], rep["settled"], rep["in_progress"]), (1, 1, []))
+        self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
+        self.assertTrue(os.path.exists(os.path.join(self.air_home, "tasks", tid, "cancelled")))   # tombstoned there
+
+    def test_a_cancel_during_an_in_flight_start_cancels_the_worker_after_the_rpc(self):
+        # (A sub-orchestrator's cascade waits on its children lock, which its start holds across the RPC; once that
+        # wait times out it cancels each child by id exactly like this.)
+        self._air()
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, release, t, box = self.gate_start()
+            c = ct.cancel(tid)
+            self.assertEqual((c["state"], c["cancelled"], c["start_in_progress"]), ("cancelling", True, True))
+            self.assertEqual(self.air_tasks(), [])              # nothing sent there yet: no tombstone either
+            release.set()
+            t.join(60)
+        self.assertNotIn("out", box)
+        self.assertIn(f"task {tid} was cancelled while its start ran", box["err"])
+        self.assertEqual(self.air_tasks(), [tid])               # the start did launch it...
+        self.assertEqual(self.wait_done(tid)["state"], "cancelled")   # ...and it was cancelled after the RPC
+
+    # --- P3: a structured refusal settles at once; list_tasks never reconciles; the live view shows start_failed ---
+    def test_a_structured_refusal_by_the_host_settles_start_failed_immediately(self):
+        self._air()
+        sub = self.fake_sub()
+        ops, _ = self.ops_through()
+        with mock.patch.object(ct, "caller_identity", return_value=sub):
+            r, _ = self.call("start_task", task="x", host="air", cwd="/no/such/dir/anywhere")
+        text = r["content"][0]["text"]
+        self.assertTrue(r.get("isError"))
+        self.assertIn("does not exist on execution host", text)
+        self.assertNotIn("_meta", r)                            # not ambiguous: the host said nothing launched
+        tid = ct.children_of(sub["dir"])[0]
+        self.assertIn(f"task {tid}: {ct.START_FAILED}", text)
+        stub = _load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB))
+        self.assertNotIn(ct.START_UNCONFIRMED, stub)
+        self.assertIn("does not exist on execution host", stub[ct.START_FAILED])
+        self.assertEqual(ops, ["capabilities", "start"])        # settled by the start's own reply, nothing more
+        self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
+        self.assertEqual(ops, ["capabilities", "start"])        # status answered here
+        self.assertEqual(self.air_tasks(), [])
+        # an ssh failure is NOT a refusal: it stays start_unconfirmed
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: (255, b"", b"down")):
+            r, _ = self.call("start_task", task="x", host="air")
+        self.assertIn(ct.START_UNCONFIRMED, r["content"][0]["text"])
+
+    def test_list_tasks_shows_an_unconfirmed_start_without_asking_the_host(self):
+        self._air()
+        tid, fd = ct._new_stub(ct._private_root(), "air", {}, None)
+        os.close(fd)
+        with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: self.fail("list_tasks must not reconcile")):
+            _, rows = self.call("list_tasks")
+        self.assertEqual([(x["task_id"], x["state"]) for x in rows["tasks"]], [(tid, ct.START_UNCONFIRMED)])
+        self.assertTrue(_load(os.path.join(ct.tasks_dir(), tid, ct.REMOTE_STUB))[ct.START_UNCONFIRMED])
+
+    def test_the_live_view_shows_a_settled_start_failed_as_failed(self):
+        from cortados_router.provider import live
+        root = ct._private_root()
+        failed, fd1 = ct._new_stub(root, "air", {}, None)
+        pending, fd2 = ct._new_stub(root, "air", {}, None)
+        for fd in (fd1, fd2):
+            os.close(fd)
+        ct._fail_stub(root, failed, "refused by execution host air: no")
+        stubs = {r["task_id"]: r for r in ct.remote_stubs()}
+        self.assertEqual((stubs[failed]["state"], stubs[pending]["state"]), (ct.START_FAILED, ct.START_UNCONFIRMED))
+        self.assertEqual({r["task_id"]: r.get("state") for r in ct.remote_stubs_by_id([failed, pending])},
+                         {failed: ct.START_FAILED, pending: ct.START_UNCONFIRMED})
+        away = live._elsewhere(ct.remote_stubs(), set(), time.time())
+        tree = live.orchestrators_section([], away, None, None, None, None, time.time())
+        nodes = {}
+
+        def walk(x):
+            if isinstance(x, dict):
+                if x.get("task_id") in (failed, pending):
+                    nodes[x["task_id"]] = x
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(tree)
+        self.assertEqual((nodes[failed]["state"], nodes[failed]["status"]), ("failed", "failed"))
+        self.assertIn("never started on air", nodes[failed]["phase"])
+        self.assertEqual(nodes[pending]["state"], "elsewhere")
+        self.assertIn("start unconfirmed", nodes[pending]["phase"])
 
 
 if __name__ == "__main__":

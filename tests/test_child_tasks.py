@@ -456,7 +456,7 @@ class ChildTaskBase(unittest.TestCase):
         self.assertFalse(r.get("isError"), r)
         return out["task_id"]
 
-    def _air(self, transport=None):
+    def _air(self, transport=None, caps=True):
         """Configure host 'air' as another machine. Its side (HOME, tasks dir, state, hosts file, token, provider URL)
         lives under tmp/air; the transport runs `child_tasks.py --remote` there instead of ssh."""
         self.air_home = os.path.join(self.tmp, "air")
@@ -489,6 +489,17 @@ class ChildTaskBase(unittest.TestCase):
             p = subprocess.run([sys.executable, "-B", "-c", REMOTE_WRAPPER, str(ct.REPO_ROOT)], input=stdin,
                                capture_output=True, env=env, timeout=timeout)
             return p.returncode, p.stdout, p.stderr
+        if transport is not None:
+            canned = transport
+
+            def transport(argv, stdin, timeout):
+                # a canned host speaks the current protocol (fix round 4: every remote start asks `capabilities`
+                # first); tests of a host without it pass a transport that answers it themselves via _air(caps=False)
+                if caps and json.loads(stdin).get("op") == "capabilities":
+                    self.caps_asked = getattr(self, "caps_asked", 0) + 1
+                    return 0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                                          "result": {"capabilities": list(ct.REMOTE_CAPABILITIES)}}).encode(), b""
+                return canned(argv, stdin, timeout)
         t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport or run_remote)
         t.start()
         self.addCleanup(t.stop)
@@ -1178,7 +1189,7 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(w2["state"], "cancelled")
         self.assertGreaterEqual(len(self.transport_calls), 6)
 
-    def test_remote_start_cancels_when_local_stub_write_fails(self):
+    def test_remote_start_sends_nothing_when_the_stub_write_fails_and_never_adopts_another_id(self):
         calls = []
         tid = "t20261109000000-000000aa"
 
@@ -1201,15 +1212,16 @@ class ChildTaskTests(ChildTaskBase):
         self.assertIn("not started", r["content"][0]["text"])
         self.assertEqual(calls, [])
         self.assertEqual([x for x in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(x)], [])
-        # An older host ignores the requested id and answers with its own (`tid`): the stub then follows that id, and
-        # when THAT write fails the host's task is cancelled.
-        with mock.patch.object(ct, "_write_json", side_effect=lambda path, obj: (_ for _ in ()).throw(OSError("disk full"))
-                               if path.endswith(os.path.join(tid, ct.REMOTE_STUB)) else real_write(path, obj)):
-            r, _ = self.call("start_task", task="x")
+        # Fix round 4 (review r4, P2/P3): no own-id replacement. A host answering under another id (`tid`) breaks the
+        # protocol: our intent stays start_unconfirmed under OUR id (nothing is deleted), the capability cache entry
+        # is dropped, and no stub is ever written under the host's id.
+        r, _ = self.call("start_task", task="x")
         self.assertTrue(r.get("isError"))
-        self.assertIn("remote task was cancelled", r["content"][0]["text"])
-        self.assertEqual(calls, ["start", "cancel"])
-        self.assertEqual([x for x in os.listdir(ct.tasks_dir()) if ct.TASK_ID_RE.fullmatch(x)], [])
+        self.assertIn("without the requested task id", r["content"][0]["text"])
+        self.assertEqual(calls, ["start"])
+        self.assert_only_unconfirmed_intents(1)
+        self.assertFalse(os.path.exists(os.path.join(ct.tasks_dir(), tid)))
+        self.assertFalse(ct._cached_capabilities(ct.tasks_dir(), ct._resolve_host("air")))
 
     def test_remote_start_checks_private_root_before_transport(self):
         self._air(transport=lambda a, s, t: self.fail("transport must not run"))
@@ -3922,6 +3934,32 @@ class _AnyRun(dict):
         return {**self.record, "run_id": k}
 
 
+class TestTasksDirGuard(unittest.TestCase):
+    """Fix round 4 (review r4): tasks_dir() follows CORTADOS_TASKS_DIR, not CORTADOS_HOME. The suite runs on its own
+    throwaway tasks root (tests/__init__.py), and any tasks dir under the real home's ~/.config or ~/.cortados raises
+    instead of being read or written."""
+
+    def test_the_suite_tasks_dir_is_a_throwaway_even_with_only_cortados_home_set(self):
+        import tests
+        with mock.patch.dict(os.environ, {"CORTADOS_HOME": tempfile.mkdtemp()}):
+            d = os.path.realpath(ct.tasks_dir())
+        for r in tests.FORBIDDEN_ROOTS:
+            self.assertFalse(d == r or d.startswith(r + os.sep), d)
+        self.assertFalse(d.startswith(tests.REAL_HOME + os.sep + ".config"), d)
+
+    def test_a_test_that_would_use_the_real_tasks_root_fails_before_touching_it(self):
+        import tests
+        real_default = os.path.join(tests.REAL_HOME, ".config", "cortados", "tasks")
+        for env in ({"CORTADOS_TASKS_DIR": "", "HOME": tests.REAL_HOME}, {"CORTADOS_TASKS_DIR": real_default},
+                    {"CORTADOS_TASKS_DIR": os.path.join(tests.REAL_HOME, ".cortados", "tasks")}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(ct.os, "makedirs", side_effect=AssertionError("must not create anything")):
+                with self.assertRaisesRegex(AssertionError, "test isolation"):
+                    ct._private_root()
+                with self.assertRaisesRegex(AssertionError, "test isolation"):
+                    ct.remote_stubs()
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -4068,7 +4106,8 @@ class StartTaskErrorTextTests(ChildTaskBase):
 
     def test_a_remote_failure_after_launch_is_tracked_here_by_its_task_id(self):
         tid = "t20261111000000-0123abcd"
-        r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": tid})
+        with mock.patch.object(ct, "_new_id", lambda: tid):   # a current host answers under the requested id
+            r = self._air_failure({"type": "OSError", "launched": "yes", "task_id": tid})
         text = self._text(r)
         self.assertIn(f"task_status {tid}", text)
         self.assertEqual(r["_meta"], {m.AMBIGUOUS_META: True, m.TASK_ID_META: tid})
@@ -4102,7 +4141,8 @@ class StartTaskErrorTextTests(ChildTaskBase):
 
     def test_a_remote_launchctl_timeout_is_tracked_here_with_its_cause(self):
         tid = "t20261111000000-0123abcd"
-        r = self._air_failure({"type": "LaunchctlTimeout", "launched": "yes", "task_id": tid})
+        with mock.patch.object(ct, "_new_id", lambda: tid):   # a current host answers under the requested id
+            r = self._air_failure({"type": "LaunchctlTimeout", "launched": "yes", "task_id": tid})
         text = self._text(r)
         self.assertIn("in execution host 'air'", text)
         self.assertIn("launchctl bootstrap did not answer", text)
