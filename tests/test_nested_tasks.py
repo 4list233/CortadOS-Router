@@ -1363,25 +1363,14 @@ class LifecycleFixRound5Tests(NestedBase):
         root, air = ct.tasks_dir(), ct._resolve_host("air")
         os.makedirs(root, exist_ok=True)
         ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES))
-        inside, go = threading.Event(), threading.Event()
-        real = ct._update_capabilities_locked
-
-        def slow(path, host, have):
-            if have is not None:                                # the confirming writer: read, then pause
-                inside.set()
-                self.assertTrue(go.wait(30))
-            return real(path, host, have)
-        with mock.patch.object(ct, "_update_capabilities_locked", slow):
-            a = threading.Thread(target=ct._update_capabilities, args=(root, air, list(ct.REMOTE_CAPABILITIES)))
-            a.start()
-            self.assertTrue(inside.wait(30))
-            b = threading.Thread(target=ct._update_capabilities, args=(root, air, None))   # the invalidation
-            b.start()
-            b.join(0.5)
-            self.assertTrue(b.is_alive())                       # serialized: it waits for the writer's lock
-            go.set()
-            a.join(30)
-            b.join(30)
+        seen = ct._invalid_markers(root, air)                   # the confirming writer's snapshot
+        fd = os.open(os.path.join(root, ct.CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)                      # a writer holds the lock
+            ct._forget_capabilities(air)                        # the invalidation does not wait for it
+        finally:
+            os.close(fd)
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), seen)
         self.assertFalse(ct._cached_capabilities(root, air))    # the invalidation sticks
 
 
@@ -1544,7 +1533,7 @@ class LifecycleFixRound6Tests(NestedBase):
         self._air()
         root, air = ct.tasks_dir(), ct._resolve_host("air")
         os.makedirs(root, exist_ok=True)
-        before = time.time()
+        before = ct._invalid_markers(root, air)
         ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), before)
         self.assertTrue(ct._cached_capabilities(root, air))
         fd = os.open(os.path.join(root, ct.CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
@@ -1555,13 +1544,12 @@ class LifecycleFixRound6Tests(NestedBase):
             self.assertFalse(ct._cached_capabilities(root, air))
         finally:
             os.close(fd)
-        # a handshake asked BEFORE the invalidation does not clear it; one asked after it does
+        # a handshake whose snapshot predates the invalidation does not clear it; one snapshotted after it does
         ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), before)
         self.assertFalse(ct._cached_capabilities(root, air))
-        time.sleep(0.01)
-        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), time.time())
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), ct._invalid_markers(root, air))
         self.assertTrue(ct._cached_capabilities(root, air))
-        self.assertFalse(os.path.exists(ct._invalid_path(root, air)))
+        self.assertEqual(ct._invalid_markers(root, air), frozenset())
 
     def test_p2_a_protocol_error_invalidates_and_the_next_start_handshakes(self):
         self._air()
@@ -1609,6 +1597,93 @@ class LifecycleFixRound6Tests(NestedBase):
         self.assertTrue(stub.get(ct.START_UNCONFIRMED))
         self.assertNotIn(ct.START_FAILED, stub)
         self.assertTrue(ct._cancel_pending(os.path.join(root, tid)))
+
+
+class LifecycleFixRound7Tests(NestedBase):
+    """Fix round 7 (review r7 on 8d2e89c): one uniquely named marker per invalidation; a handshake removes only the
+    markers it snapshotted before it was sent; an invalidation never takes the cache lock."""
+
+    def setup_cache(self):
+        self._air()
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        return root, air
+
+    def test_p2_an_invalidation_during_a_confirmation_survives_it(self):
+        root, air = self.setup_cache()
+        ct._forget_capabilities(air)                            # an older invalidation
+        caps = {"capabilities": list(ct.REMOTE_CAPABILITIES)}
+
+        def handshake(host_name, op, args, timeout_s=None):     # the RPC: meanwhile another process invalidates
+            self.assertEqual(op, "capabilities")
+            ct._forget_capabilities(air)
+            return caps
+        with mock.patch.object(ct, "_remote", handshake):
+            ct._require_capabilities(root, air)
+        markers = ct._invalid_markers(root, air)
+        self.assertEqual(len(markers), 1)                       # the older one removed, the newer one kept
+        self.assertFalse(ct._cached_capabilities(root, air))
+        with mock.patch.object(ct, "_remote", lambda *a, **k: caps):
+            ct._require_capabilities(root, air)                 # a later handshake clears it
+        self.assertEqual(ct._invalid_markers(root, air), frozenset())
+        self.assertTrue(ct._cached_capabilities(root, air))
+
+    def test_p2_a_marker_created_between_snapshot_and_write_survives(self):
+        root, air = self.setup_cache()
+        seen = ct._invalid_markers(root, air)
+        real = ct._flock_wait
+
+        def lock_then_invalidate(fd, wait_s):                   # the confirmation holds the lock...
+            real(fd, wait_s)
+            ct._forget_capabilities(air)                        # ...while another process invalidates, lock-free
+        with mock.patch.object(ct, "_flock_wait", lock_then_invalidate):
+            ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), seen)
+        self.assertEqual(len(ct._invalid_markers(root, air)), 1)
+        self.assertFalse(ct._cached_capabilities(root, air))
+
+    def test_two_invalidations_then_a_later_handshake_clears_both(self):
+        root, air = self.setup_cache()
+        ct._forget_capabilities(air)
+        ct._forget_capabilities(air)
+        self.assertEqual(len(ct._invalid_markers(root, air)), 2)
+        self.assertFalse(ct._cached_capabilities(root, air))
+        with mock.patch.object(ct, "_remote", lambda *a, **k: {"capabilities": list(ct.REMOTE_CAPABILITIES)}):
+            ct._require_capabilities(root, air)
+        self.assertEqual(ct._invalid_markers(root, air), frozenset())
+        self.assertTrue(ct._cached_capabilities(root, air))
+
+    def test_an_unreadable_marker_dir_is_invalid_and_records_nothing(self):
+        root, air = self.setup_cache()
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES))
+        with mock.patch.object(ct.os, "scandir", side_effect=PermissionError):
+            self.assertIsNone(ct._invalid_markers(root, air))
+            self.assertFalse(ct._cached_capabilities(root, air))
+        ct._forget_capabilities(air)
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES), None)
+        self.assertFalse(ct._cached_capabilities(root, air))
+
+    def test_p3_a_protocol_error_in_a_listing_takes_no_lock(self):
+        self._air()
+        ct.start("x", None, host="air")                         # a remote stub to list, capabilities cached
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        self.assertTrue(ct._cached_capabilities(root, air))
+        bad = lambda a, s, t: (0, json.dumps({"v": "old", "ok": True, "result": {}}).encode(), b"")
+        locks = []
+        fd = os.open(os.path.join(root, ct.CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)                      # a busy lock would cost CAPABILITY_LOCK_WAIT_S
+            start = time.monotonic()
+            with mock.patch.object(ct, "_flock_wait", lambda *a: locks.append(a)), \
+                    mock.patch.object(ct, "LIST_HOSTS_DEADLINE_S", 1.5), \
+                    mock.patch.object(ct.exec_hosts, "TRANSPORT", bad):
+                rows = ct.list_recent()
+            took = time.monotonic() - start
+        finally:
+            os.close(fd)
+        self.assertEqual(locks, [])
+        self.assertLess(took, 1.5)
+        self.assertTrue(rows and all(r.get("error") for r in rows if r.get("host") == "air"))
+        self.assertFalse(ct._cached_capabilities(root, air))
 
 
 if __name__ == "__main__":

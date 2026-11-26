@@ -64,6 +64,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 if __name__ == "__main__" and not __package__:
@@ -336,19 +337,18 @@ REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "sta
 # The requester's cache of hosts that confirmed REMOTE_CAPABILITIES, in its tasks root: one handshake per host per
 # CAPABILITY_CACHE_S, so a plain start does not pay a second ssh round trip each time. Only a confirmation is cached
 # (a refused host is asked again next time: an updated checkout is picked up at once); an entry is keyed by the host's
-# name, ssh destination and router path (a reconfigured entry is asked again) and dropped on any protocol error.
+# name, ssh destination and router path (a reconfigured entry is asked again) and invalidated on any protocol error.
 CAPABILITY_CACHE = "host-capabilities.json"
 CAPABILITY_CACHE_S = 600
-# Its sibling lock file: every read-modify-write of the cache (a recorded confirmation and an invalidation alike) runs
-# under an exclusive flock on it, so a writer that read the cache before an invalidation cannot write the dropped host
-# back (review r5, P3). Waited for at most CAPABILITY_LOCK_WAIT_S: the cache is best effort, a busy lock only costs a
-# handshake (a recorded confirmation is skipped; an invalidation never depends on it: CAPABILITY_INVALID below).
+# Its sibling lock file: every read-modify-write of the cache (a recorded confirmation and the markers it clears) runs
+# under an exclusive flock on it (review r5, P3). Waited for at most CAPABILITY_LOCK_WAIT_S, by a confirmation only:
+# the cache is best effort, a busy lock only costs a handshake. An invalidation never takes it (CAPABILITY_INVALID).
 CAPABILITY_LOCK = "host-capabilities.lock"
 CAPABILITY_LOCK_WAIT_S = 5
-# Per host, beside the cache: `<CAPABILITY_INVALID>.<hash of the host's name>` ({"at": time}), written (atomic
-# rename, no lock) on every protocol error before the locked drop is tried, so an invalidation is never skipped
-# (review r6, P2). _cached_capabilities checks it first; only a handshake SENT after it, recorded under the lock,
-# removes it.
+# Per host, beside the cache: `<CAPABILITY_INVALID>.<hash of the host's name>.<uuid4>`, one NEW empty file per
+# invalidation (O_EXCL, no lock, no wait), so an invalidation is never skipped (review r6, P2) and never waits (review
+# r7, P3). _cached_capabilities treats the host as invalid while ANY of its markers exists; a handshake removes only
+# the markers it snapshotted before it was sent (review r7, P2: a newer marker survives; no timestamps, no clock).
 CAPABILITY_INVALID = "host-capabilities.invalid"
 # In a start_unconfirmed stub's dir: held (flock, exclusive) by the requester from before the stub is published until
 # its start RPC has returned and the stub is settled. Reconciliation (status, wait, cancel, the cascade, the daily pass)
@@ -1174,39 +1174,59 @@ def _capability_key(host) -> dict:
     return {"ssh": host.ssh, "router": host.router}
 
 
-def _invalid_path(root: str, host) -> str:
-    """CAPABILITY_INVALID's file for `host`: keyed by a hash of the host's name (a name is configuration, not a safe
-    file name)."""
+def _invalid_prefix(host) -> str:
+    """The name prefix of `host`'s CAPABILITY_INVALID markers: keyed by a hash of the host's name (a name is
+    configuration, not a safe file name)."""
     key = hashlib.sha256(str(host.name).encode("utf-8", "surrogatepass")).hexdigest()[:16]
-    return os.path.join(root, f"{CAPABILITY_INVALID}.{key}")
+    return f"{CAPABILITY_INVALID}.{key}."
 
 
-def _invalidated_at(root: str, host):
-    """When `host`'s capabilities were last invalidated (a float), or None when they are not invalidated. A file that
-    exists but cannot be read is invalid all the same (its mtime, else +inf: fail closed)."""
-    path = _invalid_path(root, host)
+def _invalid_markers(root: str, host):
+    """The names of `host`'s invalidation markers in `root` (a frozenset; empty: not invalidated), or None when the
+    directory cannot be read (fail closed: callers treat None as invalidated and record nothing)."""
+    prefix = _invalid_prefix(host)
     try:
-        with open(path, encoding="utf-8") as f:
-            at = json.loads(f.read(256)).get("at")
-        if isinstance(at, (int, float)):
-            return float(at)
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, AttributeError, RecursionError):
-        pass
-    try:
-        return os.stat(path).st_mtime
-    except FileNotFoundError:
-        return None
+        with os.scandir(root) as it:
+            return frozenset(e.name for e in it if e.name.startswith(prefix))
     except OSError:
-        return float("inf")
+        return None
+
+
+def _invalidate(root: str, host) -> None:
+    """Invalidate `host`'s cached capabilities: create a NEW uniquely named marker (O_EXCL, no lock, no wait: fix round
+    7, review r7 P2/P3). Only a handshake whose snapshot (taken before it was sent) named this marker can remove it."""
+    path = os.path.join(root, _invalid_prefix(host) + uuid.uuid4().hex)
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        return
+    except OSError as exc:
+        log_event("capability_invalidate_failed", host=host.name, error=type(exc).__name__)
+    # No marker: try once, without waiting, to drop the cache entry itself (a busy lock is logged, never waited for).
+    try:
+        fd = os.open(os.path.join(root, CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log_event("capability_cache_failed", host=host.name, error="lock_busy", drop=True)
+            return
+        try:
+            cache = _read_json(os.path.join(root, CAPABILITY_CACHE), REMOTE_STUB_MAX_BYTES)
+            if isinstance(cache, dict) and cache.pop(host.name, None) is not None:
+                _write_json(os.path.join(root, CAPABILITY_CACHE), cache)
+        except (OSError, TaskError):
+            pass
+    finally:
+        os.close(fd)
 
 
 def _cached_capabilities(root: str, host) -> bool:
-    """True when `host` confirmed REMOTE_CAPABILITIES less than CAPABILITY_CACHE_S ago under its current entry and has
-    not been invalidated since (CAPABILITY_INVALID, checked FIRST: review r6, P2). An unreadable cache is no cache
-    (the handshake is asked again)."""
-    if _invalidated_at(root, host) is not None:
+    """True when `host` confirmed REMOTE_CAPABILITIES less than CAPABILITY_CACHE_S ago under its current entry and no
+    invalidation marker of it exists (CAPABILITY_INVALID, checked FIRST; an unreadable directory counts as invalid).
+    An unreadable cache is no cache (the handshake is asked again)."""
+    if _invalid_markers(root, host) != frozenset():
         return False
     try:
         rec = (_read_json(os.path.join(root, CAPABILITY_CACHE), REMOTE_STUB_MAX_BYTES) or {}).get(host.name)
@@ -1219,66 +1239,55 @@ def _cached_capabilities(root: str, host) -> bool:
             and all(c in have for c in REMOTE_CAPABILITIES))
 
 
-def _update_capabilities(root: str, host, have, asked_at=None) -> None:
-    """Record (`have` a list; `asked_at` the time.time() the handshake was SENT) or drop (None) `host`'s cache entry,
-    the whole read-modify-write under CAPABILITY_LOCK (review r5, P3: unserialized writers could resurrect a dropped
-    entry). A drop first writes CAPABILITY_INVALID (no lock: review r6, P2, a busy lock once skipped the drop and
-    left a stale confirmation usable), so it can never be skipped; a confirmation removes that file only when its
-    handshake was sent after the invalidation. Best effort otherwise: a skipped confirmation only costs a handshake."""
-    if have is None:
-        try:
-            _write_json(_invalid_path(root, host), {"at": time.time()})
-        except OSError as exc:
-            # The file could not be written: the drop below, under the lock, is the only invalidation left.
-            log_event("capability_invalidate_failed", host=host.name, error=type(exc).__name__)
+def _update_capabilities(root: str, host, have, seen=frozenset()) -> None:
+    """Record `host`'s confirmed capabilities `have` (a list). `seen` is the set of its invalidation markers snapshotted
+    BEFORE the handshake was sent (_invalid_markers; None: unreadable, nothing recorded). Under CAPABILITY_LOCK (review
+    r5, P3) it unlinks exactly those markers and writes the entry; a marker created after the snapshot survives, so the
+    cache stays invalid until a later handshake (fix round 7, review r7 P2: no timestamps, no clock). Best effort: a
+    busy lock or a failed unlink skips the write, which only costs the next start a handshake."""
+    if seen is None:
+        return
     path = os.path.join(root, CAPABILITY_CACHE)
     try:
         fd = os.open(os.path.join(root, CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as exc:
-        log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=have is None)
+        log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=False)
         return
     try:
         try:
             _flock_wait(fd, CAPABILITY_LOCK_WAIT_S)
         except TimeoutError:
-            log_event("capability_cache_failed", host=host.name, error="lock_timeout", drop=have is None)
+            log_event("capability_cache_failed", host=host.name, error="lock_timeout", drop=False)
             return
-        if have is not None:
-            inv = _invalidated_at(root, host)
-            if inv is not None:
-                if asked_at is None or not asked_at > inv:
-                    return                      # invalidated after (or while) this handshake was asked: not recorded
-                try:
-                    os.unlink(_invalid_path(root, host))
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=False)
-                    return
-        _update_capabilities_locked(path, host, have)
+        prefix = _invalid_prefix(host)
+        for name in seen:
+            if not name.startswith(prefix) or os.sep in name:
+                continue
+            try:
+                os.unlink(os.path.join(root, name))
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=False)
+                return
+        try:
+            cache = _read_json(path, REMOTE_STUB_MAX_BYTES)
+            cache = cache if isinstance(cache, dict) else {}
+            cache[host.name] = {**_capability_key(host), "at": time.time(), "capabilities": list(have)}
+            _write_json(path, cache)
+        except (OSError, TaskError):
+            pass
     finally:
         os.close(fd)
 
 
-def _update_capabilities_locked(path: str, host, have) -> None:
-    try:
-        cache = _read_json(path, REMOTE_STUB_MAX_BYTES)
-        cache = cache if isinstance(cache, dict) else {}
-        if have is None:
-            if cache.pop(host.name, None) is None:
-                return
-        else:
-            cache[host.name] = {**_capability_key(host), "at": time.time(), "capabilities": list(have)}
-        _write_json(path, cache)
-    except (OSError, TaskError):
-        pass
-
-
 def _forget_capabilities(host) -> None:
+    """Invalidate `host`'s cached capabilities (a protocol error). Lock-free and never waits (review r7, P3: a
+    listing's protocol error once waited up to CAPABILITY_LOCK_WAIT_S outside its deadline)."""
     try:
         root = tasks_dir()
         if os.path.isdir(root):
-            _update_capabilities(root, host, None)
+            _invalidate(root, host)
     except TaskError:
         pass
 
@@ -1482,7 +1491,7 @@ def _require_capabilities(root: str, target) -> None:
         return
     update = (f"update this host's cortados-router checkout ({target.router}) to the current main, or run the task on "
               "another host")
-    asked_at = time.time()                      # before the request: an invalidation during it wins
+    seen = _invalid_markers(root, target)       # before the request: a marker created during it survives
     try:
         caps = _remote(target.name, "capabilities", {})
     except TaskError as exc:
@@ -1493,7 +1502,7 @@ def _require_capabilities(root: str, target) -> None:
     if missing:
         raise TaskError(f"start_task refused: execution host {target.describe()} lacks {', '.join(missing)} (an older "
                         f"cortados-router checkout there); nothing was sent: {update}")
-    _update_capabilities(root, target, have, asked_at)
+    _update_capabilities(root, target, have, seen)
 
 
 def _duplicate_start(d: str, task_id: str, target, depth: int, delegate: bool) -> dict:

@@ -79,16 +79,19 @@ reads as depth 1, no delegate). The new task's depth is that + 1 (0 + 1 when the
   cortados-router checkout". **The capability cache:** a confirmation is kept in the requester's tasks root
   (`host-capabilities.json`, per host name + ssh destination + router path) for `CAPABILITY_CACHE_S` (10 min), so only
   the first start in that window pays the handshake's ssh round trip; a refusal is never cached (an updated host is
-  picked up at once), and the entry is dropped on any protocol error (a protocol-version mismatch, an unknown
-  operation or request the host flags `failure.protocol`, or a start reply without the requested id). Every
-  read-modify-write of the cache, a confirmation and a drop alike, runs under an exclusive flock on its sibling
-  `host-capabilities.lock` (fix round 5, P3: a writer that read the cache before a drop could write the dropped entry
-  back); a lock busy past `CAPABILITY_LOCK_WAIT_S` (5 s) skips the write and logs `capability_cache_failed`. A drop
-  never depends on that lock (fix round 6, P2: a busy lock once skipped the drop and left a stale confirmation usable
-  for up to 10 min): it first writes `host-capabilities.invalid.<hash of the host name>` (`{"at": time}`, atomic
-  rename, no lock), which `_cached_capabilities` checks before the cache, an unreadable one counting as invalid. Only a
-  confirmation whose handshake was SENT after that time, recorded under the lock, removes it; a skipped confirmation
-  just costs the next start a handshake. There is no
+  picked up at once), and the host is invalidated on any protocol error (a protocol-version mismatch, an unknown
+  operation or request the host flags `failure.protocol`, or a start reply without the requested id). Each
+  invalidation creates its OWN empty marker `host-capabilities.invalid.<hash of the host name>.<uuid4>` (`O_EXCL`, no
+  lock, never waits: fix round 7, P3, a listing's protocol error once waited up to 5 s for the lock outside its 20 s
+  deadline); `_cached_capabilities` treats the host as invalid while ANY of its markers exists, or when the tasks root
+  cannot be read. A handshake snapshots the host's marker names BEFORE it sends the request; on success, under an
+  exclusive flock on `host-capabilities.lock` (fix round 5, P3: serialized cache writers), it unlinks only the markers
+  in its snapshot and writes the entry. A marker created after the snapshot survives, so the cache stays invalid until
+  a later handshake (fix round 7, P2: the earlier `{"at": time}` comparison let a confirmation remove a newer
+  invalidation, and depended on the clock; there are no timestamps in the ordering now). A lock busy past
+  `CAPABILITY_LOCK_WAIT_S` (5 s) skips the confirmation and logs `capability_cache_failed`; a skipped confirmation
+  just costs the next start a handshake. A marker that cannot be created is logged (`capability_invalidate_failed`)
+  and the cache entry is dropped only if the lock is free at once. There is no
   older-host compatibility left: no own-id replacement, and "no such task" is only ever the host's structured
   `failure.absent`, never its text. The warning when a host's reply does not echo `depth`/`delegate` stays as a
   backstop.
