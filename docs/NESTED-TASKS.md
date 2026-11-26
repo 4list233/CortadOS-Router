@@ -104,17 +104,21 @@ not see that child's runner as the caller of every in-process start. Not an env 
 - **The remote-start intent (fix round 1, P1).** For a start on another host the requesting side chooses the task id,
   writes the stub (flagged `start_unconfirmed`) and the parent's child record BEFORE the request is sent, and sends the
   id. The host starts the task under exactly that id; a second start with it launches nothing and answers with the
-  existing task (`duplicate: true`; idempotent: mkdir of the task dir is the start's first step). A host that refuses
-  cleanly, or a request that provably never left, drops the intent. "Provably never left" (fix round 2, P1) is an ssh
-  exit 255 with no output whose last stderr line is ssh's own pre-session failure (connect refused / no route / timed
-  out, name resolution, host key, authentication: `exec_hosts.PRE_SESSION_RE`); any other exit 255 is ambiguous (an
-  established connection that drops after the launch also exits 255) and keeps the intent. The stub is drawn under a
-  fresh id: a taken id is never touched (fix round 2, P2: a collision once removed another task's record); a new id is
-  drawn up to `STUB_ID_TRIES` (5) times, then the start is refused. A lost or timed-out reply keeps it: the start
-  fails with the id named, `task_status <id>` asks the host (and clears the flag once the host answers for the id),
-  `cancel_task <id>` and the parent's cascade cancel it by id. A cancel of a `start_unconfirmed` id the host never
-  started leaves a TOMBSTONE there (a cancelled record under the id), so a start still in flight finds the dir and
-  launches nothing.
+  existing task (`duplicate: true`; idempotent: mkdir of the task dir is the start's first step). The stub is drawn
+  under a fresh id: a taken id is never touched (fix round 2, P2: a collision once removed another task's record); a new
+  id is drawn up to `STUB_ID_TRIES` (5) times, then the start is refused.
+- **An intent is never deleted because its start failed (fix round 3, P1).** On ANY failed or ambiguous start (a host
+  refusal, a lost or timed-out reply, any ssh exit 255 whatever its stderr says: a remote command can launch the worker
+  and then exit 255 with an ancillary connection's diagnostic) the stub stays `start_unconfirmed` under its parent, and
+  the start fails with the id named. Only the HOST's answer for the id settles it: `task_status <id>`, the cancel
+  cascade, the sub-orchestrator's end report and the daily cleanup (`--cleanup-archive` runs `reconcile_unconfirmed`)
+  ask the host by id. A task there confirms the stub; no task there (status sends `tombstone: true`, so the host writes
+  its cancelled placeholder under the id first; an older host's structured `{"absent": true}` answer) or only that
+  placeholder makes it `start_failed`: terminal, kept for the report, never running, and final (a start still in
+  flight finds the placeholder and launches nothing). While the host does not answer it stays `start_unconfirmed` and
+  is reported so (not running, not failed); `prune` never drops it by age. A cancel of a `start_unconfirmed` id writes
+  the placeholder (a TOMBSTONE) on the host and settles the stub as `start_failed`. The one removal: an older host's
+  reply naming the task under its own id replaces our stub with that id's.
 - **A cancel always marks an existing task dir (fix round 2, P2).** Whatever `_state()` reads (a start paused between
   its mkdir and its `meta.json` past `META_GRACE_S` reads as failed), cancel writes the `cancelled` marker into the dir;
   a dir with no metadata answers `cancelling` (a stalled or still-running start, not a failed task). The start checks

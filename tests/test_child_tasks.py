@@ -1228,8 +1228,18 @@ class ChildTaskTests(ChildTaskBase):
         text = r["content"][0]["text"]
         self.assertIn(f"cwd {self.work!r} does not exist on execution host 'air' (ssh air-fake)", text)
         self.assertIn("it exists on this machine", text)
-        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
+        self.assert_only_unconfirmed_intents(1)
         self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
+
+    def assert_only_unconfirmed_intents(self, n):
+        """Review r3, P1: a failed remote start keeps its intent (a start_unconfirmed stub), never a local task."""
+        root = os.path.join(self.tmp, "tasks")
+        ids = [x for x in os.listdir(root) if ct.TASK_ID_RE.fullmatch(x)] if os.path.isdir(root) else []
+        self.assertEqual(len(ids), n, ids)
+        for tid in ids:
+            stub = _load(os.path.join(root, tid, ct.REMOTE_STUB))
+            self.assertTrue(stub[ct.START_UNCONFIRMED], stub)
+            self.assertFalse(os.path.exists(os.path.join(root, tid, "meta.json")))
 
     def test_an_unreachable_host_is_a_clear_error_and_nothing_runs_here(self):
         self._air(transport=lambda argv, stdin, timeout: (255, b"", b"ssh: connect to host air port 22: No route to host"))
@@ -1239,7 +1249,7 @@ class ChildTaskTests(ChildTaskBase):
             text = r["content"][0]["text"]
             self.assertIn("execution host 'air' (ssh air-fake) is unreachable", text)
             self.assertIn("No route to host", text)
-        self.assertEqual(os.listdir(os.path.join(self.tmp, "tasks")) if os.path.isdir(os.path.join(self.tmp, "tasks")) else [], [])
+        self.assert_only_unconfirmed_intents(2)     # review r3: a failed start keeps its intent; nothing runs here
         self.assertFalse(os.path.exists(os.path.join(self.work, "fake-argv.json")))
         self.assertFalse(os.path.exists(os.path.join(self.ws_root, "active")) and os.listdir(os.path.join(self.ws_root, "active")))
         # an explicit local host still works
