@@ -54,7 +54,9 @@ class HostUnreachable(HostError):
     """The host did not answer: ssh could not connect, timed out, or the remote command produced no reply.
     `ambiguous` is True when the request may have reached the host and run there (a timeout once the session was up,
     or a remote command that ran but left no reply): a `start` may then have launched a child nobody heard about.
-    False for failures before anything was sent (ssh could not be run, or exited 255 on connect/authentication)."""
+    False only when ssh itself could not be run. Every exit 255 is ambiguous (review r3, P1): ssh's stderr is not proof
+    of non-delivery (a remote command can launch the child, then exit 255 with a diagnostic of an ancillary
+    connection), so no stderr text ever makes a start "never delivered"."""
 
     def __init__(self, msg: str, ambiguous: bool = False):
         super().__init__(msg)
@@ -246,8 +248,12 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
                               ambiguous=True) from None
     except OSError as exc:
         raise HostUnreachable(f"cannot run ssh for execution host {host.describe()}: {type(exc).__name__}: {exc}") from None
-    if rc == 255:                                       # ssh's own exit status for a connection/authentication failure
-        raise HostUnreachable(f"execution host {host.describe()} is unreachable: {_tail(err) or 'ssh exited 255'}")
+    if rc == 255:
+        # ssh's exit status for ITS OWN failures, before the session or after it (an established connection dropped
+        # while the remote command ran, or the remote command exited 255 itself): the host may have acted. Always
+        # ambiguous (review r3, P1: stderr text is not proof); the requester reconciles by id with the host.
+        raise HostUnreachable(f"execution host {host.describe()} is unreachable: {_tail(err) or 'ssh exited 255'}",
+                              ambiguous=True)
     text = out.decode("utf-8", "replace").strip()
     line = text.rsplit("\n", 1)[-1] if text else ""    # the reply is the last line (a login banner may precede it)
     try:
@@ -259,8 +265,10 @@ def call(host: Host, op: str, args: dict, timeout_s: float = SSH_RPC_TIMEOUT_S, 
         raise HostUnreachable(f"execution host {host.describe()} returned no reply to {op} (exit {rc}): "
                               f"{_tail(err) or _tail(out) or 'no output'}", ambiguous=True)
     if reply.get("v") != PROTOCOL:
-        raise HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
+        err = HostError(f"execution host {host.describe()} runs a cortados-router checkout speaking protocol "
                         f"{reply.get('v')!r}, this one speaks {PROTOCOL}: update the checkout there ({host.router})")
+        err.protocol = True                 # child_tasks drops its capability cache for this host
+        raise err
     if not reply.get("ok"):
         err = HostError(str(reply.get("error") or f"{op} failed on {host.describe()} without a reason"))
         failure = reply.get("failure")

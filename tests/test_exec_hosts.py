@@ -180,7 +180,7 @@ class CallTests(unittest.TestCase):
             self.assertIn("unreachable", str(cm.exception))
             self.assertIn("'air' (ssh air)", str(cm.exception))
             self.assertIn("No route to host", str(cm.exception))
-            self.assertFalse(cm.exception.ambiguous)            # nothing was sent: a definite failure
+            self.assertTrue(cm.exception.ambiguous)             # review r3: ssh's stderr is never proof of non-delivery
             self.reply = subprocess.TimeoutExpired("ssh", 30)
             with self.assertRaises(eh.HostUnreachable) as cm:
                 eh.call(self.host, "start", {}, transport=self.transport)

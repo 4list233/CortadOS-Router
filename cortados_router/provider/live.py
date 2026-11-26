@@ -904,6 +904,19 @@ def _all_workers(view: dict[str, Any]) -> list[tuple[dict[str, Any] | None, dict
     return out
 
 
+# A remote stub's start state (child_tasks._stub_row): a settled start_failed is shown failed, an unconfirmed start as
+# elsewhere with that said; neither is ever shown as a task running there (review r4, P3).
+_STUB_START_STATES = (child_tasks.START_FAILED, child_tasks.START_UNCONFIRMED)
+
+
+def _away_state(x: dict[str, Any]) -> dict[str, Any]:
+    if x.get("state") == child_tasks.START_FAILED:
+        return {"state": "failed", "phase": "never started on " + x["host"] + ": its start failed"}
+    if x.get("state") == child_tasks.START_UNCONFIRMED:
+        return {"state": "elsewhere", "phase": "start unconfirmed on " + x["host"] + " (task_status asks it)"}
+    return {"state": "elsewhere", "phase": "runs on " + x["host"] + "; its state is on that host"}
+
+
 def _elsewhere(stubs: list | None, known: set[str], now: float, cap: int | None = ELSEWHERE_MAX) -> list[dict[str, Any]]:
     """Remote stubs re-validated (the tasks dir is a file tree, read as untrusted), minus any task the local log already
     shows, newest first, within STALE_RUNNING_S (no child runs longer: see the constant). `cap` None: every one (the
@@ -917,7 +930,9 @@ def _elsewhere(stubs: list | None, known: set[str], now: float, cap: int | None 
         if tid is None or host is None or tid in known or not _num(at) or not now - STALE_RUNNING_S <= at <= now:
             continue
         org = {k: office.clean(s.get(k), rule) for k, rule in _ORIGIN_RULES}
+        start = s.get("state") if s.get("state") in _STUB_START_STATES else None
         out.append({"task_id": tid, "host": host, "started_at": round(float(at), 3),
+                    **({"state": start} if start else {}),       # its start failed / is unconfirmed (never running)
                     **{k: v for k, v in org.items() if v}})   # who started it, when the stub recorded it
     out.sort(key=lambda x: -x["started_at"])
     return out if cap is None else out[:cap]
@@ -1270,8 +1285,7 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
     conflicted = _UnionRuns(conflicted, conflicted_runs(None, [backend, ended], run_origins))
     subs = _subs_by_run(backend, ended, now)
     by_id = {r["task_id"]: r for r in rows if r.get("task_id")}
-    away = [{"task_id": x["task_id"], "title": None, "state": "elsewhere", "phase": "runs on " + x["host"] +
-             "; its state is on that host", "host": x["host"], "started_at": x["started_at"], "ended_at": None,
+    away = [{"task_id": x["task_id"], "title": None, **_away_state(x), "host": x["host"], "started_at": x["started_at"], "ended_at": None,
              "elapsed_s": None, "origin_session": x.get("origin_session"), "origin_project": x.get("origin_project"),
              "origin_device": x.get("origin_device"), "origin_machine": x.get("origin_machine")}
             for x in elsewhere or [] if x.get("task_id") not in by_id]

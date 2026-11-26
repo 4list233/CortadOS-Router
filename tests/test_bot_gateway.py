@@ -282,7 +282,7 @@ class GatewayTest(unittest.TestCase):
         self.assertNotIn("child died", json.dumps(r))
         self.assertEqual(self.gw.running, set())
 
-    def _remote_air(self, transport):
+    def _remote_air(self, transport, caps=True):
         """The real start path (call_child_tool -> child_tasks.start -> exec_hosts.call) to a remote host 'air' whose
         ssh is replaced by `transport` (never ssh)."""
         tmp = os.path.realpath(tempfile.mkdtemp())
@@ -295,7 +295,14 @@ class GatewayTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("CORTADOS_CHILD_TASK", None)
-        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", transport)
+        def current_protocol(argv, stdin, timeout):
+            # the host speaks the current protocol: every remote start asks `capabilities` first (child_tasks fix
+            # round 4); `transport` sees every other operation
+            if caps and json.loads(stdin).get("op") == "capabilities":
+                return 0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                                      "result": {"capabilities": list(ct.REMOTE_CAPABILITIES)}}).encode(), b""
+            return transport(argv, stdin, timeout)
+        t = mock.patch.object(ct.exec_hosts, "TRANSPORT", current_protocol)
         t.start()
         self.addCleanup(t.stop)
         self.gw.child = subagent_mcp.call_child_tool
@@ -326,10 +333,16 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual((self.gw.reserved, self.gw.running), ({}, set()))
 
     def test_definite_start_failure_releases_the_reservation(self):
+        # Definite: an unreachable host fails the capability handshake, before anything is sent (child_tasks fix
+        # round 4; a 255 on the start itself is ambiguous since round 3), and the host's own refusal of the start.
+        caps_ok = json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": True,
+                              "result": {"capabilities": list(ct.REMOTE_CAPABILITIES)}}).encode()
         replies = iter([(255, b"", b"ssh: connect to host air port 22: Connection refused"),
+                        (0, caps_ok, b""),
                         (0, json.dumps({"v": ct.exec_hosts.PROTOCOL, "ok": False,
-                                        "error": "cwd '/nope' does not exist on execution host air"}).encode(), b"")])
-        self._remote_air(lambda argv, stdin, timeout: next(replies))
+                                        "error": "cwd '/nope' does not exist on execution host air",
+                                        "failure": {"refused": True}}).encode(), b"")])
+        self._remote_air(lambda argv, stdin, timeout: next(replies), caps=False)
         for want in ("unreachable", "does not exist"):
             r = self.start()
             self.assertIn(want, r["result"]["content"][0]["text"])

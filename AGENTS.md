@@ -188,6 +188,29 @@ heading. Tests use a fake claude binary, a fake transport in place of ssh and a 
 (`tests/test_child_tasks.py`, `tests/test_exec_hosts.py`, `tests/test_workspaces.py`); never launch a real child,
 open ssh or call the real launchctl in tests.
 
+Nested tasks (owner 2026-11-25, `docs/NESTED-TASKS.md`): exactly one more layer. Depth 0 main session → depth 1 child
+(a SUB-ORCHESTRATOR when started with `start_task(delegate: true)`, main session only) → depth 2 workers, which never
+start tasks. `child_tasks.caller_identity()` decides the caller's depth from the host's own record: the `meta.json`
+(`depth`, `delegate`) of the nearest child-task runner among the caller's process ancestors (one `ps` table; never an
+env var; a claim env without a runner above it is refused; ps failing refuses); `check_depth` refuses a worker's start,
+a start from a child without `delegate`, `delegate` from anywhere but depth 0 and `chrome` from a sub-orchestrator, each logged as a
+`refused` event (`reason: depth_limit`). A sub-orchestrator gets `SUB_ORCHESTRATOR_DIRECTIVE` and cortados-route
+(route_task allowed by the same record), records each child in `<its task dir>/children/` under `children.lock`
+(cancel writes the `cancelled` marker under the same lock, then cascades), waits in the FOREGROUND with `wait_command`
+(`--timeout 540`, rerun on exit 3), and its runner records every child's state at the end (by explicit id) and applies the owner defaults: unnamed running workers cancelled + outcome `incomplete`, `HANDOFF: <id>` lines exempt; a failed, cancelled or capped sub-orchestrator's workers cancelled. A start re-checks the parent's marker after launching (a cancel whose lock wait timed out). Remote starts send a requester-chosen id (stub `start_unconfirmed` written first; idempotent on the host; never deleted because a start failed: only the host's answer by id settles it, confirmed or `start_failed` (no such id / its tombstone); status and cancel of an unknown id tombstone it); EVERY start on another host (plain too: no older-host
+compatibility, fix round 4) needs its `capabilities`, checked before anything is sent and cached per host for 10 min in
+the requester's tasks root (`host-capabilities.json`, dropped on any protocol error); the requester holds
+`<stub>/start.lock` while its start RPC is in flight and passive reconciliation skips a held one ("start in progress"),
+while cancel_task and the cascade always send the cancel to the host by id at once; `<stub>/cancel_pending` (written before
+`cancelled`) keeps a cancel until the host acknowledges it by exact id (`cancel_acked`), and status/wait/list and the daily
+pass forward it, list_tasks in one `cancel_many` per host under a 20 s listing deadline (fix rounds 5 and 6); a capability
+drop writes `host-capabilities.invalid.<hash>` first, never skipped by a busy lock (fix round 6); a
+host's structured start refusal (`failure.refused`) settles the stub `start_failed` at once. Tests never use the real
+tasks root: `tests/__init__.py` sets a throwaway `CORTADOS_TASKS_DIR` and guards `tasks_dir()` against the real home. `--remote` starts carry
+`depth`/`delegate`; the host keeps the deeper depth. Tests: `tests/test_nested_tasks.py` (fake claude playing the
+sub-orchestrator and workers under real runners); the suite's ancestry scope is set in `tests/__init__.py`
+(`ANCESTRY_SCOPE = "tasks_dir"`, a module attribute on purpose).
+
 Being told when a child ends (#87): `start_task` returns `watch_command`, a blocking CLI for this machine
 (`python3 -B <repo>/cortados_router/child_tasks.py --watch <task_id> [...] [--timeout S] [--interval S] [--stall S]`).
 **After every start_task the orchestrator runs `watch_command` in the background** (a Claude Code session is woken when a
