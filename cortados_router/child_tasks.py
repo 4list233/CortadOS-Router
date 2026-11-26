@@ -334,12 +334,25 @@ REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "sta
 # name, ssh destination and router path (a reconfigured entry is asked again) and dropped on any protocol error.
 CAPABILITY_CACHE = "host-capabilities.json"
 CAPABILITY_CACHE_S = 600
+# Its sibling lock file: every read-modify-write of the cache (a recorded confirmation and an invalidation alike) runs
+# under an exclusive flock on it, so a writer that read the cache before an invalidation cannot write the dropped host
+# back (review r5, P3). Waited for at most CAPABILITY_LOCK_WAIT_S: the cache is best effort, a busy lock only costs a
+# handshake (a recorded confirmation is skipped; an invalidation is never skipped silently: it is logged).
+CAPABILITY_LOCK = "host-capabilities.lock"
+CAPABILITY_LOCK_WAIT_S = 5
 # In a start_unconfirmed stub's dir: held (flock, exclusive) by the requester from before the stub is published until
 # its start RPC has returned and the stub is settled. Reconciliation (status, wait, cancel, the cascade, the daily pass)
 # probes it without blocking and leaves an in-flight start alone (review r4, P2: a daily pass once tombstoned a start
 # still in flight). A crashed requester's lock is released by the kernel, so reconciliation then proceeds.
 START_LOCK = "start.lock"
 START_UNCONFIRMED = "start_unconfirmed"     # a remote stub's flag: the start was sent, its reply never arrived
+# In a remote stub's dir (confirmed or not): a cancel_task / cascade cancel of this id that its host has not yet
+# acknowledged (review r5, P1: a cancel marked while the start was in flight was lost when the requester died after
+# the start was confirmed). Written before the cancel is sent, independent of the start's confirmation state, and
+# removed ONLY when the host answers the cancel for this id (cancelled, already ended, its tombstone, or no such task).
+# status / wait / list and the daily pass forward it to the host by id whenever the host answers; a stub carrying it is
+# never pruned by age. A file of its own, not a field of remote.json, so no concurrent rewrite of the stub can drop it.
+CANCEL_PENDING = "cancel_pending"
 # A remote stub's terminal flag (its reason, a string): the host itself answered that it has no task under this id, or
 # only the cancelled placeholder (tombstone) of one. Never running, never "failed" on the host; kept for the report.
 # The one rule (review r3, P1): an intent is never deleted because its start failed; it stays start_unconfirmed until
@@ -846,8 +859,8 @@ def prune(root: str, now: float | None = None, errors: list | None = None, red=N
             # A remote stub is only a pointer (the host prunes the task itself): dropped by age alone, except an
             # unconfirmed start (review r3, P1): it is the only record of a task that may run there, kept until its
             # host answers for the id (status / cancel / the daily reconcile_unconfirmed).
-            if state == "remote" and meta.get(START_UNCONFIRMED):
-                continue
+            if state == "remote" and (meta.get(START_UNCONFIRMED) or _cancel_pending(d)):
+                continue                        # likewise a stub whose cancel the host has not acknowledged
             if state != "running" and started < cutoff:
                 why = _prune_export(d, meta, res, red, budget) if state != "remote" else None
                 if why:
@@ -1163,8 +1176,27 @@ def _cached_capabilities(root: str, host) -> bool:
 
 
 def _update_capabilities(root: str, host, have) -> None:
-    """Record (`have` a list) or drop (None) `host`'s cache entry. Best effort: a failed write only costs a handshake."""
+    """Record (`have` a list) or drop (None) `host`'s cache entry, the whole read-modify-write under CAPABILITY_LOCK
+    (review r5, P3: unserialized writers could resurrect a dropped entry). Best effort: a failed write only costs a
+    handshake."""
     path = os.path.join(root, CAPABILITY_CACHE)
+    try:
+        fd = os.open(os.path.join(root, CAPABILITY_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        log_event("capability_cache_failed", host=host.name, error=type(exc).__name__, drop=have is None)
+        return
+    try:
+        try:
+            _flock_wait(fd, CAPABILITY_LOCK_WAIT_S)
+        except TimeoutError:
+            log_event("capability_cache_failed", host=host.name, error="lock_timeout", drop=have is None)
+            return
+        _update_capabilities_locked(path, host, have)
+    finally:
+        os.close(fd)
+
+
+def _update_capabilities_locked(path: str, host, have) -> None:
     try:
         cache = _read_json(path, REMOTE_STUB_MAX_BYTES)
         cache = cache if isinstance(cache, dict) else {}
@@ -1292,6 +1324,33 @@ def _start_in_flight(d: str) -> bool:
     """A requester holds this stub's START_LOCK: its start RPC has not returned yet (review r4, P2). Reconciliation
     then leaves the id alone; a crashed requester's lock is gone, and this is False."""
     return _lock_held(d, START_LOCK) is True
+
+
+def _cancel_pending(d: str) -> bool:
+    return os.path.exists(os.path.join(d, CANCEL_PENDING))
+
+
+def _mark_cancel_pending(d: str) -> None:
+    """Before a remote stub's cancel is sent: the `cancelled` marker (the in-flight start's post-RPC re-check reads it)
+    and CANCEL_PENDING (cleared only by the host's acknowledgement, _cancel_acked)."""
+    for name in ("cancelled", CANCEL_PENDING):
+        open(os.path.join(d, name), "w").close()
+
+
+def _cancel_acked(task_id: str, out) -> bool:
+    """The host's cancel answer settles the cancel for this id: it cancelled it (or is cancelling it), the task had
+    already ended, or the id is its cancelled placeholder (tombstone). A refusal (e.g. the recorded pid is not the
+    task's runner) is not an acknowledgement: the cancel stays pending and is sent again."""
+    return (isinstance(out, dict) and out.get("task_id") in (None, task_id)
+            and (out.get("cancelled") is True or out.get("tombstone") is True or out.get("state") in TERMINAL_STATES))
+
+
+def _clear_cancel_pending(d: str, task_id: str) -> None:
+    try:
+        os.unlink(os.path.join(d, CANCEL_PENDING))
+    except FileNotFoundError:
+        return
+    log_event("cancel_acknowledged", task_id=task_id)
 
 
 def _in_flight_record(task_id: str, stub: dict) -> dict:
@@ -1834,14 +1893,18 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
         finally:
             os.close(lock_fd)                   # the start has settled (or stays unconfirmed): reconciliation may run
         if os.path.exists(os.path.join(root, tid, "cancelled")):
-            # cancel_task ran while the start was in flight (it marks the stub BEFORE it probes the lock, so this check,
-            # after the release, sees every such cancel): whatever the host launched is cancelled now (round 1 logic;
-            # for a start that failed or stayed unconfirmed, the cancel tombstones the id there).
-            try:
-                r = cancel(tid)
-                how = "cancelled" if r.get("cancelled") else f"not cancelled ({r.get('reason') or r.get('state')})"
-            except TaskError as exc:
-                how = f"its cancel failed ({exc}); cancel it with cancel_task"
+            # cancel_task ran while the start was in flight (it marks the stub BEFORE it sends, so this check, after the
+            # release, sees every such cancel). It sent the cancel to the host itself (review r5, P2); a cancel the
+            # host has not acknowledged yet (CANCEL_PENDING) is sent again here. If this process dies first, the
+            # marker stays and status / list / the daily pass forward it (review r5, P1).
+            if _cancel_pending(os.path.join(root, tid)):
+                try:
+                    r = cancel(tid)
+                    how = "cancelled" if r.get("cancelled") else f"not cancelled ({r.get('reason') or r.get('state')})"
+                except TaskError as exc:
+                    how = f"its cancel failed ({exc}); it stays {CANCEL_PENDING} and is sent again by task_status"
+            else:
+                how = "cancelled (the cancel reached the host while the start ran)"
             raise TaskError(f"start_task: task {tid} was cancelled while its start ran; what execution host "
                             f"{target.describe()} launched under it was {how}"
                             + (f" (the start itself: {failed})" if failed is not None else ""))
@@ -2649,19 +2712,15 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
     d = task_path(task_id)
     stub = _stub(d)
     if stub and stub.get(START_FAILED):
+        _clear_cancel_pending(d, task_id)               # never started there: nothing left to cancel
         return _failed_record(task_id, stub)
-    if stub and stub.get(START_UNCONFIRMED):
-        if _start_in_flight(d):
-            return _in_flight_record(task_id, stub)     # never tombstone a start whose RPC is still under way
-        if os.path.exists(os.path.join(d, "cancelled")):
-            # cancel_task ran while the start was in flight and the requester did not carry it out (it crashed, or its
-            # cancel failed): reconciling this id carries the cancel out (the host tombstones or cancels the id)
-            try:
-                return cancel(task_id)
-            except TaskError as exc:
-                raise TaskError(f"{exc} (task {task_id} is {START_UNCONFIRMED} and marked cancelled here: its "
-                                f"cancel is sent to execution host {stub['host']} again once it answers)",
-                                ambiguous=exc.ambiguous) from None
+    if stub and (stub.get(START_UNCONFIRMED) or _cancel_pending(d)) and _start_in_flight(d):
+        return _in_flight_record(task_id, stub)         # passive: never reconcile a start whose RPC is under way
+    if stub and _cancel_pending(d):
+        # A cancel the host never acknowledged (review r5, P1: the requester died after its start was confirmed, or
+        # the cancel's own ssh failed), confirmed stub or not: carried out now, by id (cancel() clears the marker
+        # only on the host's acknowledgement).
+        return cancel(task_id)
     if stub:
         try:
             out = _remote(stub["host"], "status", {"task_id": task_id,
@@ -2883,7 +2942,7 @@ def wait(task_id, timeout_s=None, red=None, poll_s=0.5, provider_url="", token="
     d = task_path(task_id)
     end = start + t
     stub = _stub(d)
-    if stub and (stub.get(START_FAILED) or stub.get(START_UNCONFIRMED)):
+    if stub and (stub.get(START_FAILED) or stub.get(START_UNCONFIRMED) or _cancel_pending(d)):
         return status(task_id, red, provider_url, token)   # settled here, or by asking the host for this id first
     if stub:
         # The host waits (one ssh session held open), shortened by the round trip so the reply lands inside our cap;
@@ -3316,6 +3375,15 @@ def list_recent(n=20, ids=None) -> list:
         if state == "remote" and meta.get(START_FAILED):
             rows.append(_failed_record(tid, meta))
             continue
+        if state == "remote" and _cancel_pending(os.path.join(root, tid)) \
+                and not _start_in_flight(os.path.join(root, tid)):
+            # a cancel the host never acknowledged is forwarded by id (review r5, P1), confirmed or not
+            try:
+                r = cancel(tid)
+                rows.append({"task_id": tid, "host": meta["host"], "state": r.get("state"), "cancel_forwarded": True})
+            except TaskError as exc:
+                rows.append({"task_id": tid, "host": meta["host"], "state": CANCEL_PENDING, "error": str(exc)})
+            continue
         if state == "remote" and meta.get(START_UNCONFIRMED):
             # shown as it is, never reconciled by a listing (task_status <id> asks the host for it)
             rows.append({"task_id": tid, "host": meta["host"], "state": START_UNCONFIRMED,
@@ -3356,36 +3424,61 @@ def cancel(task_id) -> dict:
     d = task_path(task_id)
     state, meta, _ = _state(d)
     if state == "remote" and meta.get(START_FAILED):
+        _clear_cancel_pending(d, task_id)
         return {**_failed_record(task_id, meta), "cancelled": False,
                 "reason": f"task is already {START_FAILED} (never started on its host)"}
     if state == "remote":
-        unconfirmed = bool(meta.get(START_UNCONFIRMED))
-        if unconfirmed:
-            # The requester-side marker FIRST, then the lock probe: a start still in flight re-checks the marker after
-            # its RPC returns and releases the lock, so it sees every cancel that found it in flight (review r4, P2).
-            open(os.path.join(d, "cancelled"), "w").close()
-            if _start_in_flight(d):
-                return {"task_id": task_id, "state": "cancelling", "cancelled": True, "host": meta["host"],
-                        "start_in_progress": True,
-                        "note": "its start request is in flight; marked cancelled here, so the start cancels what "
-                                "the host launched as soon as its reply arrives (or reconciliation does, if it died)"}
-        # an unconfirmed start is cancelled by id: the host tombstones an id it never started (a late start then
-        # launches nothing)
-        out = _remote(meta["host"], "cancel", {"task_id": task_id, **({"tombstone": True} if unconfirmed else {})})
-        if unconfirmed:
-            _settle_stub(os.path.dirname(d), task_id, out)
-            if isinstance(out, dict) and out.get("tombstone") is True:
-                # the host wrote (or had) the cancelled placeholder: nothing ever started, a late start launches nothing
-                return {**_failed_record(task_id, {**meta, START_FAILED: NEVER_STARTED_TOMBSTONE}), "cancelled": True,
-                        "tombstone": True}
-        out["host"] = meta["host"]
-        return out
+        return _cancel_remote(d, task_id, meta)
     out = _cancel_local(d, task_id, state, meta)
     if _tombstoned(d):
         out["tombstone"] = True
     kids = children_of(d)                       # EVERY child, however many (review r1, P2)
     if kids:
         out["children"] = [_cancel_child(k) for k in kids]
+    return out
+
+
+def _cancel_remote(d: str, task_id: str, meta: dict) -> dict:
+    """An explicit cancel of a remote stub: always sent to its host by id at once (review r5, P2: a suspended
+    requester holding START_LOCK once blocked every cancel), START_LOCK held or not. The requester-side markers come
+    FIRST (_mark_cancel_pending): CANCEL_PENDING until the host acknowledges, and `cancelled` for the in-flight start's
+    post-RPC re-check. An unconfirmed id is cancelled with `tombstone`: on the host an id it never started gets the
+    cancelled placeholder (the start, in flight or late, then launches nothing), one it started is cancelled."""
+    host = meta["host"]
+    unconfirmed = bool(meta.get(START_UNCONFIRMED))
+    _mark_cancel_pending(d)
+    in_flight = unconfirmed and _start_in_flight(d)
+    pending = (f"task {task_id} stays {CANCEL_PENDING} here"
+               + (f" (its start is {START_UNCONFIRMED})" if unconfirmed else "")
+               + f": task_status / wait_task / list_tasks and the daily pass send its cancel to execution host {host} "
+                 "again until it answers")
+    try:
+        out = _remote(host, "cancel", {"task_id": task_id, **({"tombstone": True} if unconfirmed else {})})
+    except NoSuchRemoteTask:
+        # a confirmed task the host no longer has (pruned there): nothing runs under this id
+        _clear_cancel_pending(d, task_id)
+        return {"task_id": task_id, "state": "unknown", "host": host, "cancelled": False,
+                "reason": f"execution host {host} has no task under this id (pruned there); nothing to cancel"}
+    except TaskError as exc:
+        if in_flight:
+            return {"task_id": task_id, "state": "cancelling", "cancelled": True, "host": host,
+                    "start_in_progress": True, "error": str(exc),
+                    "note": f"its start request is in flight and the cancel did not reach the host; {pending} (and "
+                            "the start re-checks it as soon as its reply arrives)"}
+        raise TaskError(f"{exc} ({pending})", ambiguous=exc.ambiguous) from None
+    if not isinstance(out, dict):
+        raise TaskError(f"execution host {host} answered cancel with {type(out).__name__}, not a record ({pending})")
+    if unconfirmed:
+        _settle_stub(os.path.dirname(d), task_id, out)
+    if _cancel_acked(task_id, out):
+        _clear_cancel_pending(d, task_id)
+    if unconfirmed and out.get("tombstone") is True:
+        # the host wrote (or had) the cancelled placeholder: nothing ever started, a late start launches nothing
+        return {**_failed_record(task_id, {**meta, START_FAILED: NEVER_STARTED_TOMBSTONE}), "cancelled": True,
+                "tombstone": True, **({"start_in_progress": True} if in_flight else {})}
+    out["host"] = host
+    if in_flight:
+        out["start_in_progress"] = True
     return out
 
 
@@ -3535,11 +3628,13 @@ def _reconcile_child_row(task_id: str, row: dict) -> None:
 
 
 def reconcile_unconfirmed(root: str | None = None) -> dict:
-    """The daily cleanup's pass over this machine's start_unconfirmed stubs: each is asked of its host by id (status),
-    which settles it (confirmed, or start_failed when the host has no such id). One unreachable host leaves its stubs
-    as they are. Returns counts and per-id errors (ids only)."""
+    """The daily cleanup's pass over this machine's start_unconfirmed stubs and stubs with a CANCEL_PENDING cancel
+    (confirmed or not, review r5 P1): each is asked of its host by id (status), which settles it (confirmed, or
+    start_failed when the host has no such id) or forwards its pending cancel. A stub whose start is in flight
+    (START_LOCK held) is skipped. One unreachable host leaves its stubs as they are. Returns counts and ids only."""
     root = root or tasks_dir()
-    report = {"checked": 0, "settled": 0, "still_unconfirmed": [], "in_progress": [], "errors": []}
+    report = {"checked": 0, "settled": 0, "still_unconfirmed": [], "in_progress": [], "cancels_forwarded": 0,
+              "cancel_pending": [], "errors": []}
     try:
         names = sorted(x for x in os.listdir(root) if TASK_ID_RE.fullmatch(x))
     except OSError as exc:
@@ -3550,18 +3645,29 @@ def reconcile_unconfirmed(root: str | None = None) -> dict:
             stub = _stub(os.path.join(root, tid))
         except (OSError, TaskError):
             continue
-        if not (stub and stub.get(START_UNCONFIRMED)):
+        d = os.path.join(root, tid)
+        pending = bool(stub) and _cancel_pending(d)
+        if not (stub and (stub.get(START_UNCONFIRMED) or pending)):
             continue
         report["checked"] += 1
         try:
-            st = status(tid)                    # a start still in flight is skipped there (start in progress)
-        except TaskError:
-            report["still_unconfirmed"].append(tid)
+            st = status(tid)                    # a start still in flight is skipped there (start in progress); a
+        except TaskError:                       # pending cancel is forwarded to the host (review r5, P1)
+            if stub.get(START_UNCONFIRMED):
+                report["still_unconfirmed"].append(tid)
+            if pending:
+                report["cancel_pending"].append(tid)
             continue
         if st.get("start_in_progress"):
             report["in_progress"].append(tid)
             continue
-        report["settled"] += 1
+        if pending:
+            if _cancel_pending(d):
+                report["cancel_pending"].append(tid)
+            else:
+                report["cancels_forwarded"] += 1
+        if stub.get(START_UNCONFIRMED):
+            report["settled"] += 1
     return report
 
 

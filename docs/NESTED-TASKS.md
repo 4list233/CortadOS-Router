@@ -80,7 +80,10 @@ reads as depth 1, no delegate). The new task's depth is that + 1 (0 + 1 when the
   (`host-capabilities.json`, per host name + ssh destination + router path) for `CAPABILITY_CACHE_S` (10 min), so only
   the first start in that window pays the handshake's ssh round trip; a refusal is never cached (an updated host is
   picked up at once), and the entry is dropped on any protocol error (a protocol-version mismatch, an unknown
-  operation or request the host flags `failure.protocol`, or a start reply without the requested id). There is no
+  operation or request the host flags `failure.protocol`, or a start reply without the requested id). Every
+  read-modify-write of the cache, a confirmation and a drop alike, runs under an exclusive flock on its sibling
+  `host-capabilities.lock` (fix round 5, P3: a writer that read the cache before a drop could write the dropped entry
+  back); a lock busy past `CAPABILITY_LOCK_WAIT_S` (5 s) skips the write and logs `capability_cache_failed`. There is no
   older-host compatibility left: no own-id replacement, and "no such task" is only ever the host's structured
   `failure.absent`, never its text. The warning when a host's reply does not echo `depth`/`delegate` stays as a
   backstop.
@@ -133,18 +136,32 @@ not see that child's runner as the caller of every in-process start. Not an env 
   `failure: {"refused": true}` (capability `start_refusal`) and the requester settles the stub `start_failed`
   immediately, with the host's reason. ssh failures, timeouts, lost replies and the host's unexpected exceptions are
   never refusals: they stay `start_unconfirmed`.
-- **A start in flight is never reconciled (fix round 4, P2).** The requester takes an exclusive flock on
-  `<stub dir>/start.lock` BEFORE the stub is published and holds it until its start RPC has returned and the stub is
-  settled. Every reconciliation (task_status, wait_task, cancel_task and the cancel cascade, the end-of-run report,
+- **A start in flight is never PASSIVELY reconciled (fix round 4, P2; narrowed in fix round 5).** The requester takes
+  an exclusive flock on `<stub dir>/start.lock` BEFORE the stub is published and holds it until its start RPC has
+  returned and the stub is settled. Passive reconciliation (task_status, wait_task, list_tasks, the end-of-run report,
   the daily pass) probes it without blocking: held, it does not ask or tombstone the host. Status answers
   `start_unconfirmed` with `start_in_progress: true` ("start in progress"), the daily pass reports the id under
-  `in_progress`. A crashed requester's lock is released by the kernel, so reconciliation then proceeds. A cancel of an
-  in-flight stub writes the requester-side `cancelled` marker FIRST, then probes the lock and answers `cancelling`
-  (`start_in_progress`); the start re-checks the marker after its RPC returns and the lock is released and cancels
-  what the host launched (round 1 logic; for a start that failed or stayed unconfirmed the cancel tombstones the id),
-  then fails ("was cancelled while its start ran"). A marked stub whose requester died is cancelled by the next
-  reconciliation of the id. (A sub-orchestrator's own cascade first waits on its children lock, which its start holds
-  across the RPC; past `CHILDREN_LOCK_WAIT_S` it cancels each child this way.)
+  `in_progress`. A crashed requester's lock is released by the kernel, so reconciliation then proceeds.
+- **An explicit cancel always reaches the host (fix round 5, P2).** cancel_task and the cancel cascade never wait on
+  `start.lock` (a suspended requester could hold it for hours while the host runs the worker). They write the
+  requester-side markers FIRST (`cancelled` and `cancel_pending`, below), then send the cancel to the host by id at
+  once (`tombstone: true` while the stub is unconfirmed). On the host, an id with no task dir gets the cancelled
+  placeholder, so the in-flight start finds it and launches nothing (the stub settles `start_failed`); an id it already
+  runs is cancelled. The start still re-checks the `cancelled` marker after its RPC returns: if the cancel is still
+  pending there (its send failed) it sends it again, and the start fails ("was cancelled while its start ran"). A
+  cancel whose send fails while the start is in flight answers `cancelling` (`start_in_progress`, with the error);
+  otherwise it is an error naming the pending cancel. (A sub-orchestrator's own cascade first waits on its children
+  lock, which its start holds across the RPC; past `CHILDREN_LOCK_WAIT_S` it cancels each child this way.)
+- **A cancel is never lost (fix round 5, P1).** `<stub dir>/cancel_pending` (a file of its own, so no rewrite of
+  `remote.json` can drop it) is written before every cancel of a remote stub is sent, whatever the start's
+  confirmation state, and removed ONLY when the host acknowledges the cancel for that id: it cancelled (or is
+  cancelling) the task, the task had already ended, the id is its placeholder, or a confirmed id is gone there (pruned).
+  A refusal (e.g. "the recorded pid is not this task's runner") is no acknowledgement. While it is present,
+  task_status, wait_task, list_tasks and the daily pass (`reconcile_unconfirmed`: `cancels_forwarded`,
+  `cancel_pending`) forward the cancel to the host by id whenever the host answers, confirmed and unconfirmed stubs
+  alike (a stub whose start lock is held is skipped by them, as above), and `prune` never drops the stub by age. So a
+  requester that dies after its start was confirmed but before its re-check leaves the cancel to the next
+  reconciliation; the worker does not keep running.
 - **Readers (fix round 4, P3).** `list_tasks` shows an unconfirmed row as `start_unconfirmed` (with
   `start_in_progress` while its start runs) and never reconciles it (task_status does). The live view's stub rows carry
   `state: start_failed | start_unconfirmed`: a settled `start_failed` is drawn as `failed` ("never started on <host>"),

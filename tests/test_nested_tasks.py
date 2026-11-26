@@ -1119,21 +1119,25 @@ class LifecycleFixRound4Tests(NestedBase):
         self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
         self.assertTrue(os.path.exists(os.path.join(self.air_home, "tasks", tid, "cancelled")))   # tombstoned there
 
-    def test_a_cancel_during_an_in_flight_start_cancels_the_worker_after_the_rpc(self):
-        # (A sub-orchestrator's cascade waits on its children lock, which its start holds across the RPC; once that
-        # wait times out it cancels each child by id exactly like this.)
+    def test_a_cancel_during_an_in_flight_start_reaches_the_host_at_once(self):
+        # Round 5 (review r5, P2): the cancel is sent by id even though the start holds START_LOCK; the host writes the
+        # cancelled placeholder, so the start (arriving after it) launches nothing. (A sub-orchestrator's cascade
+        # cancels each child by id exactly like this.)
         self._air()
         with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
             tid, release, t, box = self.gate_start()
             c = ct.cancel(tid)
-            self.assertEqual((c["state"], c["cancelled"], c["start_in_progress"]), ("cancelling", True, True))
-            self.assertEqual(self.air_tasks(), [])              # nothing sent there yet: no tombstone either
+            self.assertEqual((c["state"], c["cancelled"], c.get("tombstone")), (ct.START_FAILED, True, True))
+            self.assertEqual(self.air_tasks(), [tid])           # the placeholder is there before the start arrives
+            self.assertFalse(ct._cancel_pending(os.path.join(ct.tasks_dir(), tid)))   # acknowledged
             release.set()
             t.join(60)
         self.assertNotIn("out", box)
         self.assertIn(f"task {tid} was cancelled while its start ran", box["err"])
-        self.assertEqual(self.air_tasks(), [tid])               # the start did launch it...
-        self.assertEqual(self.wait_done(tid)["state"], "cancelled")   # ...and it was cancelled after the RPC
+        air_d = os.path.join(self.air_home, "tasks", tid)
+        self.assertFalse(os.path.exists(os.path.join(air_d, "meta.json")))   # nothing launched there
+        self.assertTrue(_load(os.path.join(air_d, "result.json"))["tombstone"])
+        self.assertEqual(ct.status(tid)["state"], ct.START_FAILED)
 
     # --- P3: a structured refusal settles at once; list_tasks never reconciles; the live view shows start_failed ---
     def test_a_structured_refusal_by_the_host_settles_start_failed_immediately(self):
@@ -1199,6 +1203,185 @@ class LifecycleFixRound4Tests(NestedBase):
         self.assertIn("never started on air", nodes[failed]["phase"])
         self.assertEqual(nodes[pending]["state"], "elsewhere")
         self.assertIn("start unconfirmed", nodes[pending]["phase"])
+
+
+
+class LifecycleFixRound5Tests(NestedBase):
+    """Fix round 5 (review r5 on 7a423aa): a durable cancel_pending marker forwarded by reconciliation; an explicit
+    cancel always reaches the host, START_LOCK held or not; the capability cache's writes are serialized."""
+
+    air_tasks = LifecycleFixTests.air_tasks
+    stub_ids = LifecycleFixRound4Tests.stub_ids
+
+    def transport(self, after_start=False):
+        """The Air's transport with a gated start (held before it is sent, or with `after_start` after the host has
+        launched, its reply held) and a switch that makes `cancel` fail like a dropped ssh."""
+        real = ct.exec_hosts.TRANSPORT
+        sent, release, down = threading.Event(), threading.Event(), {"cancel": False}
+
+        def t(argv, stdin, timeout):
+            op = json.loads(stdin)["op"]
+            if op == "cancel" and down["cancel"]:
+                return 255, b"", b"ssh: connection reset"
+            if op == "start":
+                if after_start:
+                    out = real(argv, stdin, timeout)
+                    sent.set()
+                    self.assertTrue(release.wait(60))
+                    return out
+                sent.set()
+                self.assertTrue(release.wait(60))
+            return real(argv, stdin, timeout)
+        p = mock.patch.object(ct.exec_hosts, "TRANSPORT", t)
+        p.start()
+        self.addCleanup(p.stop)
+        return sent, release, down
+
+    def air_state(self, tid):
+        return ct._remote("air", "status", {"task_id": tid})["state"]
+
+    def crash_after_confirm(self):
+        """The reviewer's reproduction of P1: cancel marks the in-flight stub but its own send fails; the start then
+        succeeds, _confirm_stub clears start_unconfirmed, and the requester dies before its post-RPC re-check. Returns
+        the id of the worker left running on the Air."""
+        self._air()
+        sent, release, down = self.transport(after_start=True)
+
+        class Crash(BaseException):
+            pass
+        real_confirm = ct._confirm_stub
+
+        def confirm_then_crash(root, tid):
+            real_confirm(root, tid)
+            raise Crash()
+        box = {}
+
+        def starter():
+            try:
+                ct.start("x", None, host="air")
+            except Crash:
+                box["crashed"] = True
+        with mock.patch.object(ct, "_confirm_stub", confirm_then_crash):
+            th = threading.Thread(target=starter)
+            th.start()
+            self.assertTrue(sent.wait(60))
+            [tid] = self.stub_ids()
+            down["cancel"] = True
+            c = ct.cancel(tid)
+            self.assertEqual((c["state"], c["start_in_progress"]), ("cancelling", True))
+            self.assertIn("did not reach the host", c["note"])
+            down["cancel"] = False
+            release.set()
+            th.join(60)
+        self.assertTrue(box.get("crashed"))
+        d = os.path.join(ct.tasks_dir(), tid)
+        self.assertNotIn(ct.START_UNCONFIRMED, _load(os.path.join(d, ct.REMOTE_STUB)))   # confirmed
+        self.assertTrue(ct._cancel_pending(d))                                          # the cancel is not lost
+        self.assertEqual(self.air_state(tid), "running")                               # the worker runs
+        return tid, d
+
+    def test_p1_a_pending_cancel_of_a_confirmed_stub_is_forwarded_by_status(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, d = self.crash_after_confirm()
+            ct.status(tid)                                      # reconciliation forwards the cancel by id
+            self.assertFalse(ct._cancel_pending(d))             # the host acknowledged it
+            self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_p1_a_pending_cancel_of_a_confirmed_stub_is_forwarded_by_the_daily_pass(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, d = self.crash_after_confirm()
+            # the stub is not pruned by age while its cancel is pending
+            self.assertNotIn(tid, ct.prune(ct.tasks_dir(), now=time.time() + 30 * 86400))
+            self.assertTrue(os.path.isdir(d))
+            rep = ct.reconcile_unconfirmed()
+            self.assertEqual((rep["checked"], rep["cancels_forwarded"], rep["cancel_pending"]), (1, 1, []))
+            self.assertFalse(ct._cancel_pending(d))
+            self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_p1_an_unreachable_host_keeps_the_cancel_pending(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            tid, d = self.crash_after_confirm()
+            with mock.patch.object(ct.exec_hosts, "TRANSPORT", lambda a, s, t: (255, b"", b"down")):
+                with self.assertRaises(ct.TaskError) as cm:
+                    ct.status(tid)
+                self.assertIn(ct.CANCEL_PENDING, str(cm.exception))
+                rep = ct.reconcile_unconfirmed()
+                self.assertEqual(rep["cancel_pending"], [tid])
+            self.assertTrue(ct._cancel_pending(d))
+            rows = ct.list_recent()                             # a listing forwards it too once the host answers
+            self.assertEqual([(r["task_id"], r.get("cancel_forwarded")) for r in rows], [(tid, True)])
+            self.assertFalse(ct._cancel_pending(d))
+            self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_p2_a_suspended_requester_does_not_block_an_explicit_cancel_of_a_running_worker(self):
+        # The start reached the host (the worker runs there) and the requester is suspended holding START_LOCK.
+        self._air()
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_MODE": "sleep"}):
+            sent, release, _ = self.transport(after_start=True)
+            box = {}
+
+            def starter():
+                try:
+                    box["out"] = ct.start("x", None, host="air")
+                except ct.TaskError as exc:
+                    box["err"] = str(exc)
+            th = threading.Thread(target=starter)
+            th.start()
+            self.assertTrue(sent.wait(60))
+            [tid] = self.stub_ids()
+            d = os.path.join(ct.tasks_dir(), tid)
+            self.assertTrue(ct._start_in_flight(d))
+            self.assertTrue(ct.status(tid).get("start_in_progress"))   # passive reconciliation still skips it
+            c = ct.cancel(tid)                                  # explicit: sent to the host at once
+            self.assertTrue(c["cancelled"], c)
+            self.assertTrue(c["start_in_progress"])
+            self.assertFalse(ct._cancel_pending(d))
+            self.assertIn(self.air_state(tid), ("cancelled", "running"))   # cancelling there
+            release.set()                                       # the requester wakes up
+            th.join(60)
+        self.assertIn(f"task {tid} was cancelled while its start ran", box["err"])
+        self.assertEqual(self.wait_done(tid)["state"], "cancelled")
+
+    def test_p2_the_cascade_reaches_a_child_whose_start_is_held(self):
+        self._air()
+        sub = LifecycleFixTests.fake_sub(self)
+        root = ct._private_root()
+        tid, fd = ct._new_stub(root, "air", {}, sub["task_id"])   # a requester suspended before its start RPC
+        try:
+            ct._record_child(sub, tid)
+            out = ct.cancel(sub["task_id"])
+            [row] = out["children"]
+            self.assertEqual((row["task_id"], row["cancelled"]), (tid, True))
+            self.assertEqual(self.air_tasks(), [tid])           # the placeholder: a later start launches nothing
+            self.assertTrue(_load(os.path.join(self.air_home, "tasks", tid, "result.json"))["tombstone"])
+        finally:
+            os.close(fd)
+
+    def test_p3_concurrent_cache_writers_cannot_resurrect_an_invalidated_entry(self):
+        self._air()
+        root, air = ct.tasks_dir(), ct._resolve_host("air")
+        os.makedirs(root, exist_ok=True)
+        ct._update_capabilities(root, air, list(ct.REMOTE_CAPABILITIES))
+        inside, go = threading.Event(), threading.Event()
+        real = ct._update_capabilities_locked
+
+        def slow(path, host, have):
+            if have is not None:                                # the confirming writer: read, then pause
+                inside.set()
+                self.assertTrue(go.wait(30))
+            return real(path, host, have)
+        with mock.patch.object(ct, "_update_capabilities_locked", slow):
+            a = threading.Thread(target=ct._update_capabilities, args=(root, air, list(ct.REMOTE_CAPABILITIES)))
+            a.start()
+            self.assertTrue(inside.wait(30))
+            b = threading.Thread(target=ct._update_capabilities, args=(root, air, None))   # the invalidation
+            b.start()
+            b.join(0.5)
+            self.assertTrue(b.is_alive())                       # serialized: it waits for the writer's lock
+            go.set()
+            a.join(30)
+            b.join(30)
+        self.assertFalse(ct._cached_capabilities(root, air))    # the invalidation sticks
 
 
 if __name__ == "__main__":
