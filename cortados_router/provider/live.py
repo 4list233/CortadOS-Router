@@ -1385,6 +1385,9 @@ def orchestrators_section(rows: list[dict[str, Any]], elsewhere: list[dict[str, 
                      [(o or {}).get("last_activity") or 0], default=0)
         out.append({
             "origin": origin, "kind": kind,
+            # the orchestrator's name (office round 2): its Claude Code session name, from the session's heartbeat; a
+            # bot or unattributed group has none (the Office keeps their fixed labels), nor does a session never named
+            "name": office.clean((o or {}).get("name"), office.SESSION_NAME_RE) if kind == "session" else None,
             "project": g.get("project") or (o or {}).get("project"), "device": g.get("device") or (o or {}).get("device"),
             "status": (o or {}).get("status") or ("n/a" if kind != "session" else "not live"),
             "model": (o or {}).get("model"), "tool": (o or {}).get("tool"),
@@ -1420,8 +1423,8 @@ SESSION_PATH = "/v1/cortados/live/session"
 # token counts), workspace and browser (task internals the floor does not draw), parent_hidden, the session filter,
 # conflicts, task_hosts and inputs_truncated (fleet diagnostics, the dashboard's). Every value kept is already
 # re-validated by the live view (office.clean rules, fixed vocabularies, numbers): no request text, path or argument.
-_TREE_GROUP_KEYS = ("origin", "kind", "project", "device", "host", "status", "model", "pick", "tool", "client", "client_source",
-                    "last_activity", "counts", "attention", "tasks_hidden", "routed_hidden")
+_TREE_GROUP_KEYS = ("origin", "kind", "name", "project", "device", "host", "status", "model", "pick", "tool", "client",
+                    "client_source", "last_activity", "counts", "attention", "tasks_hidden", "routed_hidden")
 _TREE_TASK_KEYS = ("task_id", "title", "state", "status", "phase", "tool", "host", "provider", "lane", "local_backend",
                    "model", "started_at", "ended_at", "elapsed_s", "parent_task_id", "origin_via", "sub_sessions_hidden")
 _TREE_SUB_KEYS = ("ref", "role", "status", "phase", "provider", "lane", "local_backend", "model", "pick", "started_at",
@@ -1491,6 +1494,79 @@ def _tree_lobby(conv: dict[str, Any], groups: list[dict[str, Any]]) -> dict[str,
               if isinstance(e, dict)]
     return {"as_of": conv.get("as_of"), "status": conv.get("status") or "error", "errors": errors,
             "truncated": bool(conv.get("hidden")), "items": out}
+
+
+# GET /v1/cortados/office/servers (office round 2, owner 2026-11-27): the Office's server room, a rack per host and an S1
+# console. Built from the same collect() snapshot as the tree, under the same office:read scope, and allowlisted the same
+# way: fixed names, fixed vocabularies, numbers and timestamps. No hardware figure, job, flag, account, token, routed-call
+# row or request text: the room shows whether a machine and the scorer are up and how fast S1 scores, nothing else.
+OFFICE_SERVERS_PATH = "/v1/cortados/office/servers"   # clients.OFFICE_SERVERS_PATH (a test keeps the two equal)
+# Racks the room draws: the fleet is three machines and a PC; 8 bounds a misconfigured host list, never a real fleet.
+SERVER_RACKS_MAX = 8
+SERVER_HOST_STATES = ("up", "down", "unknown")
+_SERVER_HOST_KEYS = ("name", "state", "as_of", "provider")
+_SERVER_S1_KEYS = ("status", "health", "model", "as_of", "probe_ms", "p50_ms", "p90_ms", "calls_1h", "scored_1h",
+                   "degraded_pct_1h", "degraded")
+
+
+def _server_host(it: dict[str, Any], provider_host: str | None, now: float) -> dict[str, Any] | None:
+    """One rack: `up` for the provider host (it is answering this request) or a host whose heartbeat is fresh, `down`
+    for a host whose heartbeat went stale (it stopped reporting), `unknown` for a host that never sent one since the
+    provider started. `as_of`: when that was known (the heartbeat's receipt; now for the provider host)."""
+    name = office.clean(it.get("name"), _HOST_RE)
+    if name is None:
+        return None
+    hb = it.get("heartbeat") if isinstance(it.get("heartbeat"), dict) else None
+    at = hb.get("received_at") if hb and _num(hb.get("received_at")) else None
+    if name == provider_host:
+        state, at = "up", now
+    elif it.get("heartbeat_state") == "fresh":
+        state = "up"
+    elif it.get("heartbeat_state") == "stale":
+        state = "down"
+    else:
+        state, at = "unknown", None
+    return {"name": name, "state": state, "as_of": _r(at, 3), "provider": name == provider_host}
+
+
+def office_servers(snap: dict[str, Any]) -> dict[str, Any]:
+    """GET /v1/cortados/office/servers: `hosts` (one rack each, DEFAULT_HOSTS first, then by name; at most
+    SERVER_RACKS_MAX) and `s1` (the scorer: the provider's probe `status`, the S1 host's own `health` and served
+    `model` from its heartbeat, the probe's `probe_ms`, and over the last hour of routed calls the S1 scoring time's
+    `p50_ms`/`p90_ms`, `calls_1h`, `scored_1h` (calls S1 scored, not degraded), `degraded_pct_1h`, and `degraded`: the
+    routing check's warning, live.s1_routing). Every value re-validated; a section that failed keeps its status and
+    errors ({source, error class})."""
+    now = snap.get("generated_at") if _num(snap.get("generated_at")) else time.time()
+    h = snap.get("hosts") if isinstance(snap.get("hosts"), dict) else {}
+    me = office.clean(h.get("provider_host"), _HOST_RE)
+    racks = [r for r in (_server_host(it, me, now) for it in h.get("items") or [] if isinstance(it, dict)) if r]
+    order = {n: i for i, n in enumerate(DEFAULT_HOSTS)}
+    racks.sort(key=lambda r: (order.get(r["name"], len(order)), r["name"]))
+    s = snap.get("s1") if isinstance(snap.get("s1"), dict) else {}
+    routing = s.get("routing") if isinstance(s.get("routing"), dict) else {}
+    hour = next((w for w in routing.get("windows") or [] if isinstance(w, dict) and w.get("window") == "60m"), {})
+    num = (lambda v, nd=1: _r(v, nd) if _num(v) and v >= 0 else None)
+    count = (lambda v: int(round(v)) if _num(v) and v >= 0 else None)       # calls are whole numbers
+    calls, degraded = count(hour.get("calls")), count(hour.get("degraded"))
+    # the S1 host's own report: the first fresh heartbeat carrying an s1 block (the Studio's, today)
+    beat = next((it["heartbeat"]["s1"] for it in h.get("items") or [] if isinstance(it, dict)
+                 and it.get("heartbeat_state") == "fresh" and isinstance(it.get("heartbeat"), dict)
+                 and isinstance(it["heartbeat"].get("s1"), dict)), {})
+    s1 = {"status": s.get("status") if s.get("status") in S1_HEALTH else "unknown",
+          "health": beat.get("health") if beat.get("health") in S1_HEALTH else None,
+          "model": office.clean(beat.get("model"), _SUMMARY_RE),
+          "as_of": _r(s.get("as_of"), 3) if _num(s.get("as_of")) else None,
+          "probe_ms": num(s.get("latency_ms")), "p50_ms": num(hour.get("s1_ms_p50")), "p90_ms": num(hour.get("s1_ms_p90")),
+          "calls_1h": calls, "scored_1h": (max(0, calls - degraded) if calls is not None and degraded is not None
+                                           else None),
+          "degraded_pct_1h": num(hour.get("degraded_pct")), "degraded": routing.get("status") == "warn"}
+    errs = lambda sec: [{"source": e.get("source"), "error": e.get("error")}  # noqa: E731
+                        for e in (sec.get("errors") or []) if isinstance(e, dict)]
+    return {"version": VERSION, "generated_at": _r(now, 3),
+            "hosts": {"as_of": _r(h.get("as_of"), 3) if _num(h.get("as_of")) else None,
+                      "status": h.get("status") or "error", "errors": errs(h),
+                      "truncated": len(racks) > SERVER_RACKS_MAX, "items": racks[:SERVER_RACKS_MAX]},
+            "s1": {**s1, "errors": errs(s)}}
 
 
 def session_view(snap: dict[str, Any], session: str) -> dict[str, Any]:
@@ -1577,7 +1653,8 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             covered.add("main:" + ident)
             o = floor.get("orchestrator") or {}
             w = {"tool": o.get("tool"), "status": o.get("status"),   # the main loop's tool, as the floor knows it
-                 "client": o.get("client") if o.get("client") in office.CLIENTS else None}
+                 "client": o.get("client") if o.get("client") in office.CLIENTS else None,
+                 "name": office.clean(o.get("name"), office.SESSION_NAME_RE)}   # the session's name (its heartbeat)
         if kind_of == "main":
             kind = "orchestrator"
         elif kind_of == "r":
@@ -1610,6 +1687,7 @@ def _backend_items(backend: list, view: dict[str, Any], now: float) -> tuple[lis
             client = WIRE_CLIENT.get(c.get("wire"))
             items[-1]["client"] = client or w.get("client")
             items[-1]["client_source"] = "wire" if client else ("heartbeat" if w.get("client") else None)
+            items[-1]["name"] = w.get("name")
     return items, covered
 
 
@@ -1653,7 +1731,9 @@ def _floor_orchestrators(view: dict[str, Any], covered: set[str]) -> list[dict[s
                           "last_activity": o.get("last_seen"),
                           # the session's own heartbeat claim (office.CLIENTS), the tree's third family source (#77 E7)
                           "client": o.get("client") if o.get("client") in office.CLIENTS else None,
-                          "client_source": "heartbeat" if o.get("client") in office.CLIENTS else None})
+                          "client_source": "heartbeat" if o.get("client") in office.CLIENTS else None,
+                          # the session's name as Claude Code shows it (office round 2), from its heartbeat
+                          "name": office.clean(o.get("name"), office.SESSION_NAME_RE)})
     return items
 
 

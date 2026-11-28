@@ -194,6 +194,36 @@ const NAME_MAX = 64;
 // so the key can never be two rooms.
 const LOBBY_KEY = 'lobby';
 const LOBBY_LABEL = 'No orchestrator';
+// The server room (office round 2): racks per host and the S1 console, from GET /v1/cortados/office/servers. Its key
+// is refused as a bot origin too (groupKey), so it can never be an orchestrator's room.
+export const SERVERS_KEY = 'servers';
+const SERVERS_LABEL = 'Server room';
+// A child's name line (owner decision 2026-11-27): "<orchestrator name> › <task title>". The orchestrator part is cut
+// to ORCH_PREFIX_MAX so the task title, the part that differs between a room's people, keeps most of the 64 characters.
+export const CHILD_SEPARATOR = ' › ';
+const ORCH_PREFIX_MAX = 24;
+const childName = (orch, rest) => (orch === null ? rest
+  : shortText(shortText(orch, ORCH_PREFIX_MAX) + CHILD_SEPARATOR + rest));
+
+// ---- room colours (office round 2, owner 2026-11-27: each room a stable colour) ----
+// One colour per room, chosen by a hash of the room's key (its session tag or named origin), so a session keeps its
+// colour across polls, bridge restarts and room moves. The rooms patch tints the room's floor and door sign with it
+// (claw3d/cortadosRooms.ts CORTADOS_ROOM_COLORS, a test keeps the two equal); the people of the room wear it as their
+// trousers (the voxel profile's bottomColor: the family owns the top). The list is Claw3D's own clothing colours
+// (src/lib/avatars/profile.ts AGENT_AVATAR_CLOTHING_COLOR_OPTIONS at 51337f7): normalizeAgentAvatarProfile replaces any
+// other value with a seed-random one. Seven of its eight, one per orchestrator room; the eighth, slate, is the grey of
+// the rooms nobody orchestrates (unattributed, lobby) and the server room. Two rooms can share a colour (7 colours);
+// their door signs still tell them apart ([ESCALATE] B10).
+export const ROOM_COLORS = Object.freeze(['#7090ff', '#34d399', '#f59e0b', '#f43f5e', '#8b5cf6', '#f5f5f4', '#2d3748']);
+export const NEUTRAL_ROOM_COLOR = '#64748b';
+/** FNV-1a 32-bit of a room key: the same function as cortadosRooms.ts cortadosRoomHash. */
+export function roomHash(key) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i++) { h ^= key.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+export const roomColor = key => (key === 'unattributed' || key === LOBBY_KEY || key === SERVERS_KEY
+  ? NEUTRAL_ROOM_COLOR : ROOM_COLORS[roomHash(key) % ROOM_COLORS.length]);
 
 // The host badge (#77 brand): where a person runs, as the provider's KNOWN host name (exec-hosts.json: air, pro, studio),
 // shown at the end of the nameplate subtitle ("claude-opus-5 · Air"). A task's own exec host; an orchestrator's from
@@ -233,7 +263,7 @@ function groupKey(group) {
   if (group.kind === 'unattributed' && group.origin === null) return 'unattributed';
   if (group.kind === 'session' && typeof group.origin === 'string' && GROUP_RE.test(group.origin)) return group.origin;
   if (group.kind === 'bot' && typeof group.origin === 'string' && NAMED_ORIGIN_RE.test(group.origin) &&
-      group.origin !== 'unattributed' && group.origin !== LOBBY_KEY) return group.origin;
+      group.origin !== 'unattributed' && group.origin !== LOBBY_KEY && group.origin !== SERVERS_KEY) return group.origin;
   if (group.kind === 'untagged') return null;
   throw new Error('invalid office tree group');
 }
@@ -265,8 +295,12 @@ function treeUsable(section) {
  * unavailable (treeUsable) throws, as a malformed one does: the caller keeps the last roster.
  *
  * Pure: the same tree gives the same agents (time is the tree's own generated_at, the provider's clock).
+ *
+ * Office round 2 (owner 2026-11-27): a room is named after its orchestrator's Claude Code session (the group's `name`,
+ * else its project), each of its people's name line starts "<that name> › "; every room carries a stable colour
+ * (roomColor); `servers` (GET /v1/cortados/office/servers, mapServers) adds the server room last, or nothing when null.
  */
-export function mapTree(tree) {
+export function mapTree(tree, servers = null) {
   if (!object(tree) || tree.version !== 1 || !finite(tree.generated_at) || !object(tree.orchestrators) ||
       !Array.isArray(tree.orchestrators.items)) throw new Error('invalid office tree');
   // An unavailable tree is a failed poll, never an empty floor (#77 review round 1: an HTTP 200 carrying
@@ -281,12 +315,18 @@ export function mapTree(tree) {
   let people = 0;
   for (const g of tree.orchestrators.items) {
     if (!object(g)) throw new Error('invalid office tree group');
-    checkStrings(g, ['project', 'device', 'host', 'status', 'model', 'tool', 'client', 'client_source'], 'group');
+    checkStrings(g, ['name', 'project', 'device', 'host', 'status', 'model', 'tool', 'client', 'client_source'], 'group');
     if (!Array.isArray(g.tasks) || !Array.isArray(g.routed)) throw new Error('invalid office tree group');
     const key = groupKey(g);
     if (key === null) continue;
+    // The room's name (owner decision 2026-11-27): the orchestrator's Claude Code session name, as the provider got it
+    // from the session's heartbeat (`name`); unknown (an older mod, a session not named yet), the project as before.
+    // The bot and the unattributed room keep their fixed labels.
+    const sessionName = g.kind === 'session' ? shortText(g.name)?.trim() || null : null;
     const label = key === 'unattributed' ? 'Unattributed' : g.kind === 'bot' ? 'Grok Bot'
-      : shortText(g.project) ?? 'Orchestrator';
+      : sessionName ?? shortText(g.project) ?? 'Orchestrator';
+    // the name a child's name line starts with: none in the unattributed room, which has no orchestrator
+    const orchName = key === 'unattributed' ? null : label;
     const room = [];
     const orchestratorId = key === 'unattributed' ? null : 'office-' + key + '-orchestrator';
     const push = person => {
@@ -296,12 +336,16 @@ export function mapTree(tree) {
       room.push(person);
     };
     const groupHost = hostName(g.host);
+    const color = roomColor(key);
     const base = (id, kind, parent, depth, host = groupHost) => ({ id, kind, parent, depth, group: key,
-      groupLabel: label, project: text(g.project), host });
+      groupLabel: label, roomColor: color, project: text(g.project), host });
     if (orchestratorId) {
       const { family, source } = orchestratorFamily(g);
+      // named after its session, the plate's second line keeps the project it works in: "CortadOS-Router · model · Pro"
+      const model = shortText(g.model) ?? (g.kind === 'bot' ? 'bot gateway' : 'orchestrator');
+      const project = sessionName !== null ? shortText(g.project, 32) : null;
       push({ ...base(orchestratorId, 'orchestrator', null, 0), name: label,
-        role: withHost(shortText(g.model) ?? (g.kind === 'bot' ? 'bot gateway' : 'orchestrator'), groupHost),
+        role: withHost(project === null ? model : project + RETURN_SEPARATOR + model, groupHost),
         status: g.status === 'working' ? 'working' : 'idle', taskStatus: null, returning: false,
         family, familySource: source, outfit: 'suit', provider: null, lane: null, localBackend: null,
         model: text(g.model), tool: text(g.tool), title: null, client: CLIENT_FAMILY.has(text(g.client)) ? g.client : null });
@@ -319,7 +363,8 @@ export function mapTree(tree) {
       const finished = n.status === 'done' || n.status === 'failed';
       const model = shortText(n.model);
       const taskHost = hostName(n.host);
-      const common = { ...base(id, 'task', parent, depth + 1, taskHost), name: shortText(n.title) ?? 'Task ' + n.task_id.slice(-8),
+      const common = { ...base(id, 'task', parent, depth + 1, taskHost),
+        name: childName(orchName, shortText(n.title) ?? 'Task ' + n.task_id.slice(-8)),
         taskStatus: n.status, provider: text(n.provider), lane: text(n.lane), localBackend: knownBackend(n.local_backend),
         model: text(n.model), tool: text(n.tool), title: text(n.title),
         family: characterFamily(n.provider, n.lane, n.model, n.local_backend), outfit: 'worker' };
@@ -344,7 +389,7 @@ export function mapTree(tree) {
           // the task's own main loop is the task figure; a finished helper just leaves (E8)
           if (s.role === 'main' || (s.status !== 'running' && s.status !== 'waiting')) continue;
           push({ ...base('office-' + key + '-sub-' + n.task_id + '-' + s.ref, 'helper', id, depth + 2, taskHost),
-            name: 'Helper · ' + (shortText(n.title, 48) ?? n.task_id.slice(-8)),
+            name: childName(orchName, 'Helper · ' + (shortText(n.title, 48) ?? n.task_id.slice(-8))),
             role: withHost(shortText(s.model) ?? 'helper', taskHost),
             status: s.status === 'running' ? 'working' : 'idle', taskStatus: s.status, returning: false,
             provider: text(s.provider), lane: text(s.lane), localBackend: knownBackend(s.local_backend),
@@ -362,7 +407,7 @@ export function mapTree(tree) {
       checkStrings(r, ['title', 'phase', 'tool', 'provider', 'lane', 'model'], 'helper');
       if (r.status !== 'running' && r.status !== 'waiting') continue;
       push({ ...base('office-' + key + '-routed-' + r.ref, 'helper', orchestratorId, 1),
-        name: shortText(r.title) ?? 'Helper', role: withHost(shortText(r.model) ?? 'helper', groupHost),
+        name: childName(orchName, shortText(r.title) ?? 'Helper'), role: withHost(shortText(r.model) ?? 'helper', groupHost),
         status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status, returning: false,
         provider: text(r.provider), lane: text(r.lane), localBackend: null, model: text(r.model), tool: text(r.tool),
         title: text(r.title), family: characterFamily(r.provider, r.lane, r.model), outfit: 'worker' });
@@ -388,7 +433,7 @@ export function mapTree(tree) {
       if (++people > TREE_PEOPLE_MAX) throw new Error('invalid office tree');
       ids.add(id);
       room.push({ id, kind: 'helper', parent: null, depth: 1, group: LOBBY_KEY, groupLabel: LOBBY_LABEL,
-        project: null, host: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
+        roomColor: roomColor(LOBBY_KEY), project: null, host: null, name: shortText(r.title) ?? (r.kind === 'conversation' ? 'Conversation' : 'Helper'),
         role: shortText(r.model) ?? 'routed', status: r.status === 'running' ? 'working' : 'idle', taskStatus: r.status,
         returning: false, provider: text(r.provider), lane: text(r.lane), localBackend: knownBackend(r.local_backend),
         model: text(r.model), tool: text(r.tool), title: text(r.title),
@@ -398,19 +443,90 @@ export function mapTree(tree) {
   }
   const last = key => (key === 'unattributed') + 2 * (key === LOBBY_KEY);
   rooms.sort((a, b) => last(a.key) - last(b.key));   // stable: tree order otherwise
+  // The server room (office round 2) comes last: it is a fixed room of the floor (the rooms patch seats it), never one
+  // of the orchestrator rooms. No servers view (an older provider, a failed first poll): no one in it.
+  if (servers !== null) {
+    const people = mapServers(servers);
+    for (const p of people) {
+      if (ids.has(p.id)) throw new Error('duplicate office identity');
+      ids.add(p.id);
+    }
+    rooms.push({ key: SERVERS_KEY, people });
+  }
   return rooms.flatMap((room, index) => room.people.map(p => toAgent(p, index)));
+}
+
+// ---- the server room (office round 2, owner 2026-11-27) ----
+const SERVER_HOST_STATES = new Set(['up', 'down', 'unknown']);
+const SERVER_S1_STATES = new Set(['up', 'down', 'unknown']);
+const SERVER_RACKS_MAX = 8;            // live.SERVER_RACKS_MAX
+const nonNegative = value => finite(value) && value >= 0;
+const ms = value => Math.round(value) + ' ms';
+/** "12 s", "4 min", "3 h": how long ago, from the provider's own clock (generated_at). */
+function ago(now, at) {
+  const s = Math.max(0, Math.round(now - at));
+  return s < 120 ? s + ' s' : s < 7200 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
+}
+
+/**
+ * GET /v1/cortados/office/servers -> the server room's people, validated field by field (live.office_servers):
+ * one figure per host standing at its rack (name "Air", subtitle "up · provider" / "up · 8 s ago" / "down · seen 14 min
+ * ago" / "no heartbeat"; status idle when up, error when down) and the S1 console (name "S1 · <served model>", subtitle
+ * "up · p50 180 ms · p90 420 ms · 96 scored/h" and "· degraded" when the routing check warns; status working while it
+ * scored in the last hour, error when down or degraded). Numbers and fixed words only; nothing else of the view is kept.
+ */
+export function mapServers(view) {
+  if (!object(view) || view.version !== 1 || !finite(view.generated_at) || !object(view.hosts) ||
+      !Array.isArray(view.hosts.items) || view.hosts.items.length > SERVER_RACKS_MAX || !object(view.s1)) {
+    throw new Error('invalid office servers');
+  }
+  const now = view.generated_at;
+  const base = (id, kind) => ({ id, kind, parent: null, depth: 1, group: SERVERS_KEY, groupLabel: SERVERS_LABEL,
+    roomColor: roomColor(SERVERS_KEY), project: null, returning: false, provider: null, lane: null, localBackend: null,
+    tool: null, title: null, outfit: 'worker' });
+  const people = [];
+  const seen = new Set();
+  for (const h of view.hosts.items) {
+    if (!object(h) || hostName(h.name) === null || !SERVER_HOST_STATES.has(h.state) || seen.has(h.name) ||
+        (h.as_of !== null && !finite(h.as_of)) || typeof h.provider !== 'boolean') {
+      throw new Error('invalid office servers host');
+    }
+    seen.add(h.name);
+    const role = h.state === 'up' ? (h.provider ? 'up · provider' : h.as_of !== null ? 'up · ' + ago(now, h.as_of) + ' ago' : 'up')
+      : h.state === 'down' ? (h.as_of !== null ? 'down · seen ' + ago(now, h.as_of) + ' ago' : 'down') : 'no heartbeat';
+    people.push({ ...base('office-servers-host-' + h.name, 'host'), name: hostLabel(h.name), role, host: h.name,
+      status: h.state === 'down' ? 'error' : 'idle', taskStatus: h.state, model: null, family: 'unknown' });
+  }
+  const s = view.s1;
+  if (!SERVER_S1_STATES.has(s.status) || (s.health !== null && !SERVER_S1_STATES.has(s.health)) ||
+      (s.model !== null && typeof s.model !== 'string') || typeof s.degraded !== 'boolean' ||
+      ['probe_ms', 'p50_ms', 'p90_ms', 'calls_1h', 'scored_1h', 'degraded_pct_1h']
+        .some(k => s[k] !== null && !nonNegative(s[k]))) {
+    throw new Error('invalid office servers s1');
+  }
+  const parts = [s.status];
+  if (nonNegative(s.p50_ms)) parts.push('p50 ' + ms(s.p50_ms));
+  if (nonNegative(s.p90_ms)) parts.push('p90 ' + ms(s.p90_ms));
+  if (nonNegative(s.scored_1h)) parts.push(Math.round(s.scored_1h) + ' scored/h');
+  if (s.degraded) parts.push('degraded');
+  people.push({ ...base('office-servers-s1', 's1'), name: shortText('S1 · ' + (shortText(s.model, 40) ?? 'scorer')),
+    role: parts.join(RETURN_SEPARATOR), host: null, taskStatus: s.status, model: text(s.model), family: 'local',
+    status: s.status === 'down' || s.degraded ? 'error' : nonNegative(s.scored_1h) && s.scored_1h > 0 ? 'working' : 'idle' });
+  return people;
 }
 
 /** One person as a Claw3D agent: the stock fields Studio reads (name; role = the nameplate subtitle, E5) and the
  * CortadOS `office` extension. Allowlisted: nothing of the tree is spread into the output. */
 function toAgent(p, roomIndex) {
-  const emoji = p.kind === 'orchestrator' ? '👔' : p.kind === 'helper' ? '🛠️' : '🤖';
+  const emoji = p.kind === 'orchestrator' ? '👔' : p.kind === 'helper' ? '🛠️' : p.kind === 'host' ? '🗄️'
+    : p.kind === 's1' ? '🧮' : '🤖';
   return {
     id: p.id, name: p.name, role: p.role,
     identity: { name: p.name, emoji, avatarUrl: avatarDataUrl(p.family, p.outfit),
-      avatarProfile: avatarProfile(p.family, p.outfit, p.id) },
+      avatarProfile: avatarProfile(p.family, p.outfit, p.id, { roomColor: p.roomColor ?? null, host: p.host }) },
     office: {
-      floor: p.group, group: p.group, groupLabel: p.groupLabel, room: roomIndex, kind: p.kind, parent: p.parent,
+      floor: p.group, group: p.group, groupLabel: p.groupLabel, roomColor: p.roomColor ?? null, room: roomIndex,
+      kind: p.kind, parent: p.parent,
       depth: p.depth, project: p.project, host: p.host, provider: p.provider, lane: p.lane,
       localBackend: p.localBackend, model: p.model, status: p.status, taskStatus: p.taskStatus,
       returning: p.returning, returnUntil: p.returnUntil ?? null, tool: p.tool, title: p.title,
@@ -495,9 +611,10 @@ export class OfficeGateway {
     else this.send({ type: 'res', id: frame.id, ok: false,
       error: { code: 'READ_ONLY', message: 'Office adapter is read-only' } });
   }
-  /** One poll's tree (GET /v1/cortados/office/tree): mapTree validates it before the last good roster is replaced. */
-  update(tree) {
-    const next = mapTree(tree); // validate before replacing the last good state
+  /** One poll's tree (GET /v1/cortados/office/tree) and server room (GET /v1/cortados/office/servers, or null):
+   * mapTree validates both before the last good roster is replaced. */
+  update(tree, servers = null) {
+    const next = mapTree(tree, servers); // validate before replacing the last good state
     const old = new Map(this.agents.map(a => [a.id, a]));
     this.agents = next;
     if (!this.connected) return;
@@ -548,13 +665,17 @@ export class OfficeGateway {
 
 const OFFICE_PATH = '/v1/cortados/office';
 export const TREE_PATH = '/v1/cortados/office/tree';
-/** Only GET the exact office endpoint (or, with `path`, the tree beside it). Reject redirects to avoid credential
- * forwarding. */
+// The server room's view (office round 2): the provider's live.OFFICE_SERVERS_PATH, under the same office:read token.
+export const SERVERS_PATH = '/v1/cortados/office/servers';
+/** The exact paths the bridge may GET, all beside the configured office URL; nothing else is ever requested. */
+export const POLL_PATHS = Object.freeze([OFFICE_PATH, TREE_PATH, SERVERS_PATH]);
+/** Only GET the exact office endpoint (or, with `path`, the tree or the server room beside it). Reject redirects to
+ * avoid credential forwarding. */
 export async function pollOffice({ url, tokenFile, fetchImpl = fetch, signal, path = OFFICE_PATH }) {
   let endpoint = new URL(url);
   if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password ||
       endpoint.pathname !== OFFICE_PATH || endpoint.search || endpoint.hash ||
-      ![OFFICE_PATH, TREE_PATH].includes(path)) {
+      !POLL_PATHS.includes(path)) {
     throw new Error('invalid office URL');
   }
   endpoint = new URL(path, endpoint);
@@ -581,14 +702,39 @@ export async function pollTree({ url, ...options }) {
   return pollOffice({ ...options, url, path: TREE_PATH });
 }
 
+/** GET the server room's view: the exact servers endpoint beside the configured office URL, same rules as pollTree. */
+export async function pollServers({ url, ...options }) {
+  const endpoint = new URL(url);
+  if (endpoint.pathname !== '/v1/cortados/office' || endpoint.search || endpoint.hash) throw new Error('invalid office URL');
+  return pollOffice({ ...options, url, path: SERVERS_PATH });
+}
+
+/**
+ * Poll the tree and the server room every `intervalMs`. The tree decides the roster: a failed tree poll keeps the last
+ * roster. The server room is secondary: a failed or invalid servers poll keeps the last good server room (said once
+ * per failure on stderr), so a provider without the servers endpoint still draws every orchestrator's room.
+ */
+// `pollRoom`: the server room's poll; by default pollServers alongside the default tree poll, none beside a caller's own
+// `poll` (a test's or a diagnostic's stub must not reach the network).
 export async function runPolling({ gateway, intervalMs = 5000, signal, onError = reportPollError, poll = pollTree,
-  ...options }) {
+  pollRoom = poll === pollTree ? pollServers : null, ...options }) {
   if (typeof onError !== 'function') throw new Error('error reporter must be a function');
   if (!Number.isFinite(intervalMs) || intervalMs < POLL_MIN_MS || intervalMs > POLL_MAX_MS) {
     throw new Error('poll interval must be 1..3600 seconds');
   }
+  let servers = null;
   while (!signal?.aborted) {
-    try { gateway.update(await poll({ ...options, signal })); }
+    if (pollRoom) {
+      try {
+        const next = await pollRoom({ ...options, signal });
+        mapServers(next);                 // validated before it replaces the last good server room
+        servers = next;
+      } catch {
+        if (signal?.aborted) break;
+        onError('Office server room unavailable; last successful server room retained (may be stale)');
+      }
+    }
+    try { gateway.update(await poll({ ...options, signal }), servers); }
     catch {
       if (signal?.aborted) break;
       // Never log exceptions: fetch/read errors may contain URLs, paths or tokens. Never fall back to the flat

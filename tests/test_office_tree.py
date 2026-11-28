@@ -27,6 +27,7 @@ LOOSE = "t20261111095500-d0000002"           # no origin, running: the unattribu
 LOBBY_ASK = "c-000000000012"                 # E9: a one-off routed question, no orchestrator, no task
 LOBBY_LOOP = "outcome-loop-0001"             # E9: the S1 outcome loop's routed call, no task
 FIXTURE = Path(__file__).resolve().parents[1] / "integrations/office-claw3d/fixtures/sample-tree.json"
+SERVERS_FIXTURE = FIXTURE.with_name("sample-servers.json")   # the server room (office round 2), ServerRoom.snap()
 
 
 def events():
@@ -66,8 +67,9 @@ def sample_tree():
 
 
 def write_fixture():
-    """Regenerate the adapter's fixture after a deliberate change to the tree's shape."""
+    """Regenerate the adapter's fixtures after a deliberate change to the tree's or the server room's shape."""
     FIXTURE.write_text(json.dumps(sample_tree(), indent=1, ensure_ascii=False) + "\n")
+    SERVERS_FIXTURE.write_text(json.dumps(live.office_servers(ServerRoom().snap()), indent=1, ensure_ascii=False) + "\n")
 
 
 def keys_everywhere(x, out=None):
@@ -245,6 +247,144 @@ class FamilySources(unittest.TestCase):
             self.assertEqual(server.Registry._conversation_meta(s)["local_backend"], "ollama")
 
 
+class SessionName(unittest.TestCase):
+    """Office round 2 (owner 2026-11-27): an orchestrator is named as Claude Code names its session. The mod sends the
+    name in its heartbeat (`name`), the provider validates it (office.SESSION_NAME_RE) and publishes it as the group's
+    `name`; a session that never sent one, the bot and the unattributed group have none."""
+
+    def named_board(self, name, now=NOW - 2):
+        plain = ot.board
+
+        def board():
+            b = plain()
+            b.heartbeat({"session": ot.MINE, "status": "working", "project": "CortadOS-Router", "device": "pro",
+                         "model": "claude-opus-5", "tool": None, "client": "claude-code", "name": name}, now=now)
+            return b
+        return board
+
+    def test_the_heartbeat_name_is_the_rooms_name(self):
+        hb, bad = office.validate_heartbeat({"session": ot.MINE, "status": "idle", "name": "Office round 2"})
+        self.assertEqual((hb["name"], bad), ("Office round 2", None))
+        with mock.patch.object(ot, "board", self.named_board("Office round 2")):
+            t = live.office_tree(tree_view())
+        g = {x["origin"]: x for x in t["orchestrators"]["items"]}
+        self.assertEqual(g[ot.MINE]["name"], "Office round 2")
+        self.assertIsNone(g[ot.OTHER]["name"])                    # its session sent no name
+        self.assertIsNone(g["grokbot"]["name"])
+        self.assertIsNone(g[None]["name"])
+
+    def test_a_routed_main_loop_keeps_its_heartbeat_name(self):
+        """OTHER's main loop routes (a `main:` conversation): the name still comes from its own heartbeat."""
+        plain = ot.board
+
+        def board():
+            b = plain()
+            b.heartbeat({"session": ot.OTHER, "status": "working", "project": "Grounds", "device": "studio",
+                         "model": "claude-opus-5", "tool": None, "client": None, "name": "Grounds capture"},
+                        now=NOW - 2)
+            return b
+        with mock.patch.object(ot, "board", board):
+            g = {x["origin"]: x for x in live.office_tree(tree_view())["orchestrators"]["items"]}
+        self.assertEqual(g[ot.OTHER]["name"], "Grounds capture")
+
+    def test_name_rule(self):
+        base = {"session": ot.MINE, "status": "working"}
+        for ok in ("x", "Fix the router's S1 guard", "a" * 64):
+            self.assertEqual(office.validate_heartbeat({**base, "name": ok})[0]["name"], ok)
+        for none in (None, ""):
+            self.assertIsNone(office.validate_heartbeat({**base, "name": none})[0]["name"])
+        self.assertIsNone(office.validate_heartbeat(base)[0]["name"])
+        # too long, control characters, non-ASCII, an address, not a string: the heartbeat is refused, never cut here
+        for bad in ("a" * 65, "line\nbreak", "café", "ssh 10.0.0.7", 7, ["x"]):
+            self.assertEqual(office.validate_heartbeat({**base, "name": bad}), (None, "name"), bad)
+
+
+class ServerRoom(unittest.TestCase):
+    """GET /v1/cortados/office/servers (office round 2): racks per host and the S1 console, numbers and fixed words."""
+
+    def snap(self, **over):
+        snap = {"generated_at": NOW,
+                "hosts": {"as_of": NOW, "status": "ok", "errors": [], "provider_host": "air",
+                          "items": [
+                              {"name": "studio", "roles": ["exec host"], "heartbeat_state": "fresh",
+                               "heartbeat": {"received_at": NOW - 8, "age_s": 8, "ttl_s": 900, "stale": False,
+                                             "jobs": [{"name": "s1-scorer", "summary": ot.SECRET}],
+                                             "s1": {"health": "up", "model": "s1-qwen3-4b-sft-v7", "flags": ["no-promote"],
+                                                    "pending": "evaluation_pending", "loaded_s": 40.0}},
+                               "hardware": {"cpu_busy_pct": 42.0, "mem_total_bytes": 1, "chip": "Apple M3 Ultra"}},
+                              {"name": "air", "roles": ["provider", "default exec host"], "heartbeat_state": "none",
+                               "heartbeat": None, "hardware": None},
+                              {"name": "pc", "roles": [], "heartbeat_state": "stale",
+                               "heartbeat": {"received_at": NOW - 1800, "age_s": 1800, "ttl_s": 900, "stale": True,
+                                             "jobs": [], "s1": None}, "hardware": None},
+                              {"name": "pro", "roles": [], "heartbeat_state": "none", "heartbeat": None,
+                               "hardware": None},
+                              {"name": "Forests-MacBook", "heartbeat_state": "fresh"}]},
+                "s1": {"as_of": NOW, "status": "up", "errors": [], "available": True, "http_status": 200,
+                       "latency_ms": 23.4, "reason": ot.SECRET,
+                       "routing": {"status": "ok", "warn_above_pct": 20.0, "warning": None, "windows": [
+                           {"window": "5m", "calls": 4, "degraded": 0, "degraded_pct": 0.0, "s1_ms_p50": 150.0,
+                            "s1_ms_p90": 300.0, "degraded_wait_ms_p50": None},
+                           {"window": "60m", "calls": 96, "degraded": 6, "degraded_pct": 6.2, "s1_ms_p50": 181.2,
+                            "s1_ms_p90": 420.0, "degraded_wait_ms_p50": 15000.0}]}},
+                "subscriptions": {"items": [{"account": "owner@example.com"}]}}
+        snap.update(over)
+        return snap
+
+    def test_exact_fields(self):
+        v = live.office_servers(self.snap())
+        self.assertEqual(set(v), {"version", "generated_at", "hosts", "s1"})
+        self.assertEqual(set(v["hosts"]), {"as_of", "status", "errors", "truncated", "items"})
+        for h in v["hosts"]["items"]:
+            self.assertEqual(set(h), set(live._SERVER_HOST_KEYS))
+        self.assertEqual(set(v["s1"]), set(live._SERVER_S1_KEYS) | {"errors"})
+        raw = json.dumps(v)
+        for secret in (ot.SECRET, "owner@example.com", "cpu_busy_pct", "Apple", "no-promote", "evaluation_pending",
+                       "s1-scorer", "Forests", "roles", "jobs"):
+            self.assertNotIn(secret, raw, secret)
+
+    def test_hosts_up_down_unknown(self):
+        hosts = live.office_servers(self.snap())["hosts"]["items"]
+        self.assertEqual([(h["name"], h["state"], h["as_of"], h["provider"]) for h in hosts],
+                         [("air", "up", NOW, True), ("studio", "up", NOW - 8, False),
+                          ("pro", "unknown", None, False), ("pc", "down", NOW - 1800, False)])
+
+    def test_s1_numbers(self):
+        s1 = live.office_servers(self.snap())["s1"]
+        self.assertEqual(s1, {"status": "up", "health": "up", "model": "s1-qwen3-4b-sft-v7", "as_of": NOW,
+                              "probe_ms": 23.4, "p50_ms": 181.2, "p90_ms": 420.0, "calls_1h": 96, "scored_1h": 90,
+                              "degraded_pct_1h": 6.2, "degraded": False, "errors": []})
+        warn = self.snap()
+        warn["s1"]["routing"]["status"] = "warn"
+        self.assertTrue(live.office_servers(warn)["s1"]["degraded"])
+
+    def test_missing_sections_are_said_not_invented(self):
+        v = live.office_servers({"generated_at": NOW})
+        self.assertEqual((v["hosts"]["status"], v["hosts"]["items"]), ("error", []))
+        self.assertEqual(v["s1"], {"status": "unknown", "health": None, "model": None, "as_of": None, "probe_ms": None,
+                                   "p50_ms": None, "p90_ms": None, "calls_1h": None, "scored_1h": None,
+                                   "degraded_pct_1h": None, "degraded": False, "errors": []})
+        bad = self.snap(s1={"status": "up; rm", "latency_ms": -1, "routing": {"windows": [
+            {"window": "60m", "calls": "96", "s1_ms_p50": float("nan")}]}})
+        s1 = live.office_servers(bad)["s1"]
+        self.assertEqual((s1["status"], s1["probe_ms"], s1["calls_1h"], s1["p50_ms"]), ("unknown", None, None, None))
+
+    def test_racks_capped(self):
+        items = [{"name": f"host{i}", "heartbeat_state": "none"} for i in range(12)]
+        v = live.office_servers(self.snap(hosts={"status": "ok", "items": items}))
+        self.assertEqual((len(v["hosts"]["items"]), v["hosts"]["truncated"]), (live.SERVER_RACKS_MAX, True))
+
+    def test_the_adapter_fixture_is_what_the_provider_builds(self):
+        self.assertEqual(json.loads(SERVERS_FIXTURE.read_text()), live.office_servers(self.snap()),
+                         "regenerate with: python3 -B -c 'from tests.test_office_tree import write_fixture; "
+                         "write_fixture()'")
+
+    def test_collect_feeds_it(self):
+        v = live.office_servers(tree_view())
+        self.assertEqual(v["version"], 1)
+        self.assertIn("studio", [h["name"] for h in v["hosts"]["items"]])
+
+
 class TreeEndpoint(EndpointHarness):
     """The real endpoint: the office:read token reads the tree and nothing of the live view."""
 
@@ -279,6 +419,32 @@ class TreeEndpoint(EndpointHarness):
     def test_paths_agree(self):
         self.assertEqual(clients.OFFICE_TREE_PATH, live.OFFICE_TREE_PATH)
         self.assertEqual(server.endpoint_id(live.OFFICE_TREE_PATH), "office_tree")
+        self.assertEqual(clients.OFFICE_SERVERS_PATH, live.OFFICE_SERVERS_PATH)
+        self.assertEqual(server.endpoint_id(live.OFFICE_SERVERS_PATH), "office_servers")
+        self.assertEqual(clients.SCOPES["office:read"], frozenset({
+            ("GET", clients.OFFICE_PATH), ("GET", clients.OFFICE_TREE_PATH), ("GET", clients.OFFICE_SERVERS_PATH)}))
+
+    def test_office_read_opens_the_server_room_and_nothing_more(self):
+        code, raw = self.request(live.OFFICE_SERVERS_PATH, OFFICE_TOKEN)
+        self.assertEqual(code, 200, raw)
+        v = json.loads(raw)
+        self.assertEqual(set(v), {"version", "generated_at", "hosts", "s1"})
+        self.assertEqual(set(v["s1"]), set(live._SERVER_S1_KEYS) | {"errors"})
+        self.assertEqual(self.request(live.OFFICE_SERVERS_PATH, TOKEN)[0], 200)          # the owner
+        self.assertEqual(self.request(live.OFFICE_SERVERS_PATH, LIVE_TOKEN)[0], 403)     # live:read is not office:read
+        for tok in (None, "wrong-token-000000000000"):
+            self.assertEqual(self.request(live.OFFICE_SERVERS_PATH, tok)[0], 401)
+        for q in ("?x=1", "?"):
+            self.assertEqual(self.request(live.OFFICE_SERVERS_PATH + q, OFFICE_TOKEN)[0], 400, q)
+        self.assertEqual(self.request(live.OFFICE_SERVERS_PATH + "/x", OFFICE_TOKEN)[0], 403)
+        # only GET: a POST with the office token is refused by the scope
+        req = urllib.request.Request(self.url + live.OFFICE_SERVERS_PATH, data=b"{}", method="POST",
+                                     headers={"authorization": f"Bearer {OFFICE_TOKEN}"})
+        try:
+            urllib.request.urlopen(req, timeout=30)
+            self.fail("POST accepted")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
 
     def test_office_read_opens_the_tree_and_not_the_live_view(self):
         code, raw = self.request(live.OFFICE_TREE_PATH, OFFICE_TOKEN)
@@ -297,6 +463,13 @@ class TreeEndpoint(EndpointHarness):
         self.assertEqual(self.request(live.OFFICE_TREE_PATH, LIVE_TOKEN)[0], 403)      # live:read is not office:read
         for tok in (None, "wrong-token-000000000000"):
             self.assertEqual(self.request(live.OFFICE_TREE_PATH, tok)[0], 401)
+
+    def test_a_failed_server_room_is_a_500_without_the_error_text(self):
+        # first request of this server: nothing memoised yet (live.Memo, MEMO_S)
+        with mock.patch.object(self.httpd, "live_view", side_effect=RuntimeError(ot.SECRET)):
+            code, raw = self.request(live.OFFICE_SERVERS_PATH, TOKEN)
+        self.assertEqual(code, 500)
+        self.assertNotIn(ot.SECRET, raw)
 
     def test_no_query_and_a_failure_is_a_500_not_an_empty_tree(self):
         for q in ("?session=" + ot.MINE, "?x=1", "?"):

@@ -1,0 +1,50 @@
+{
+ "version": 1,
+ "generated_at": 1800000000.0,
+ "hosts": {
+  "as_of": 1800000000.0,
+  "status": "ok",
+  "errors": [],
+  "truncated": false,
+  "items": [
+   {
+    "name": "air",
+    "state": "up",
+    "as_of": 1800000000.0,
+    "provider": true
+   },
+   {
+    "name": "studio",
+    "state": "up",
+    "as_of": 1799999992.0,
+    "provider": false
+   },
+   {
+    "name": "pro",
+    "state": "unknown",
+    "as_of": null,
+    "provider": false
+   },
+   {
+    "name": "pc",
+    "state": "down",
+    "as_of": 1799998200.0,
+    "provider": false
+   }
+  ]
+ },
+ "s1": {
+  "status": "up",
+  "health": "up",
+  "model": "s1-qwen3-4b-sft-v7",
+  "as_of": 1800000000.0,
+  "probe_ms": 23.4,
+  "p50_ms": 181.2,
+  "p90_ms": 420.0,
+  "calls_1h": 96,
+  "scored_1h": 90,
+  "degraded_pct_1h": 6.2,
+  "degraded": false,
+  "errors": []
+ }
+}

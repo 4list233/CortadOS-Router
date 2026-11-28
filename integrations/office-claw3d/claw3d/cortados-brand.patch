@@ -37,10 +37,10 @@ index 8c9bbf8..e977218 100644
        <section className="pointer-events-auto rounded-2xl border border-white/10 bg-black/68 px-3 py-2 shadow-xl backdrop-blur">
          <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-white/45">
 diff --git a/src/features/office/screens/OfficeScreen.tsx b/src/features/office/screens/OfficeScreen.tsx
-index 195922b..ea59813 100644
+index 195922b..95d8e48 100644
 --- a/src/features/office/screens/OfficeScreen.tsx
 +++ b/src/features/office/screens/OfficeScreen.tsx
-@@ -266,6 +266,12 @@ const MAX_OPENCLAW_AGENT_OUTPUT_LINES = 12;
+@@ -266,6 +266,15 @@ const MAX_OPENCLAW_AGENT_OUTPUT_LINES = 12;
  const OFFICE_DANCE_MS = 60_000;
  const GATEWAY_LOADING_OVERLAY_DELAY_MS = 1_200;
  const GATEWAY_CONNECT_OVERLAY_DELAY_MS = 1_500;
@@ -50,10 +50,13 @@ index 195922b..ea59813 100644
 +// attach, mic, send, new session, remote handoff), the agent editor, add/delete agent, push-to-talk, the Claw3D
 +// onboarding wizard and the agent event console (shown upstream whenever DEBUG is unset).
 +const CORTADOS_OPENCLAW_UI = false;
++// [ESCALATE] B6 (OFFICE-CORTADOS-DESIGN.md C.4): the agent event console (the bridge's metadata events only) shows only
++// in a Studio built with NEXT_PUBLIC_CORTADOS_DEBUG=1, which Next inlines at build time; deploy-air.sh never sets it.
++const CORTADOS_DEBUG_CONSOLE = process.env.NEXT_PUBLIC_CORTADOS_DEBUG === "1";
  
  const getLatestUserRequestForAgent = (
    agent: AgentState,
-@@ -4117,7 +4123,7 @@ export function OfficeScreen({
+@@ -4117,7 +4126,7 @@ export function OfficeScreen({
      stop: stopMainVoiceRecording,
      clearError: clearMainVoiceError,
    } = useVoiceRecorder({
@@ -62,7 +65,7 @@ index 195922b..ea59813 100644
      onVoiceSend: async (payload) => {
        if (!mainAgent) {
          throw new Error("Main agent not found.");
-@@ -4813,13 +4819,13 @@ export function OfficeScreen({
+@@ -4813,13 +4822,13 @@ export function OfficeScreen({
            onAgentChatSelect={(agentId) => {
              handleOpenAgentChat(agentId);
            }}
@@ -81,7 +84,7 @@ index 195922b..ea59813 100644
            onDeskAssignmentChange={handleDeskAssignmentChange}
            onDeskAssignmentsReset={handleDeskAssignmentsReset}
            onGithubReviewDismiss={() => {
-@@ -4964,6 +4970,7 @@ export function OfficeScreen({
+@@ -4964,6 +4973,7 @@ export function OfficeScreen({
                  <p className="mt-1 text-sm text-amber-50">{emptyFleetMessage}</p>
                </div>
                <div className="flex shrink-0 items-center gap-2">
@@ -89,7 +92,7 @@ index 195922b..ea59813 100644
                  <button
                    type="button"
                    className="ui-btn-secondary px-3 py-2 text-xs font-semibold tracking-[0.05em] text-foreground"
-@@ -4982,6 +4989,7 @@ export function OfficeScreen({
+@@ -4982,6 +4992,7 @@ export function OfficeScreen({
                  >
                    Build Company
                  </button>
@@ -97,7 +100,7 @@ index 195922b..ea59813 100644
                  <button
                    type="button"
                    className="ui-btn-secondary px-3 py-2 text-xs font-semibold tracking-[0.05em] text-foreground"
-@@ -5008,7 +5016,8 @@ export function OfficeScreen({
+@@ -5008,7 +5019,8 @@ export function OfficeScreen({
          </div>
        ) : null}
  
@@ -107,7 +110,7 @@ index 195922b..ea59813 100644
          <HQSidebar
            open={sidebarOpen}
            activeTab={activeSidebarTab}
-@@ -5106,7 +5115,7 @@ export function OfficeScreen({
+@@ -5106,7 +5118,7 @@ export function OfficeScreen({
          }}
        />
  
@@ -116,16 +119,16 @@ index 195922b..ea59813 100644
          <OnboardingWizard
            key={companyCreatedSignal > 0 ? `onboarding-company-created-${companyCreatedSignal}` : "onboarding-default"}
            gatewayConnected={status === "connected"}
-@@ -5133,7 +5142,7 @@ export function OfficeScreen({
+@@ -5133,7 +5145,7 @@ export function OfficeScreen({
          />
        ) : null}
  
 -      {showOpenClawConsole ? (
-+      {showOpenClawConsole && CORTADOS_OPENCLAW_UI ? (
++      {showOpenClawConsole && (CORTADOS_OPENCLAW_UI || CORTADOS_DEBUG_CONSOLE) ? (
          <section className="pointer-events-auto fixed bottom-3 left-3 z-30 flex w-[520px] max-w-[calc(100vw-1.5rem)] flex-col overflow-hidden rounded border border-cyan-500/25 bg-black/78 shadow-2xl backdrop-blur">
            <div className="flex items-center justify-between border-b border-cyan-500/15 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.18em] text-cyan-200/80">
              <span>Agent Event Console</span>
-@@ -5347,10 +5356,10 @@ export function OfficeScreen({
+@@ -5347,10 +5359,10 @@ export function OfficeScreen({
  
        <div
          className={`fixed bottom-3 z-30 flex flex-col items-end gap-2 ${sidebarOpen ? "right-84" : "right-3"} ${
@@ -139,12 +142,12 @@ index 195922b..ea59813 100644
              className="flex overflow-hidden rounded border border-white/10 bg-[#0e0a04] shadow-2xl"
              style={{
 diff --git a/src/features/retro-office/RetroOffice3D.tsx b/src/features/retro-office/RetroOffice3D.tsx
-index cb7e257..0e02580 100644
+index c289fd6..c39e0df 100644
 --- a/src/features/retro-office/RetroOffice3D.tsx
 +++ b/src/features/retro-office/RetroOffice3D.tsx
-@@ -225,6 +225,10 @@ import type { OfficeCleaningCue } from "@/lib/office/janitorReset";
- // CortadOS rooms (CortadOS-Router claw3d/cortados-rooms.patch): off unless the CortadOS bridge is the gateway
+@@ -226,6 +226,10 @@ import type { OfficeCleaningCue } from "@/lib/office/janitorReset";
  import * as cortados from "@/features/retro-office/core/cortadosRooms";
+ import { CortadosRoomSigns } from "@/features/retro-office/objects/cortadosSigns";
  
 +// CortadOS (cortados-brand.patch): Studio settings (gateway, title, remote office, voice replies) and the layout
 +// editor do nothing for the read-only CortadOS bridge; hidden.
@@ -153,7 +156,7 @@ index cb7e257..0e02580 100644
  type OfficeDeskMonitorMap = Record<string, OfficeDeskMonitor>;
  type RenderAgentUiSnapshot = Pick<RenderAgent, "state" | "status">;
  type FeedEvent = {
-@@ -2267,7 +2271,7 @@ export function RetroOffice3D({
+@@ -2268,7 +2272,7 @@ export function RetroOffice3D({
    githubSkill = null,
    taskManagerEnabled = false,
    soundclawEnabled = false,
@@ -162,7 +165,7 @@ index cb7e257..0e02580 100644
    officeTitleLoaded = false,
    remoteOfficeEnabled = false,
    remoteOfficeSourceKind = "presence_endpoint",
-@@ -7009,9 +7013,10 @@ export function RetroOffice3D({
+@@ -7014,9 +7018,10 @@ export function RetroOffice3D({
                    ? "border-amber-400/25 bg-amber-500/10 text-amber-100"
                    : "border-rose-400/25 bg-rose-500/10 text-rose-100"
              }`}
@@ -175,7 +178,7 @@ index cb7e257..0e02580 100644
            </div>
            {/* New Idea 7: Heatmap toggle. */}
            <button
-@@ -7028,7 +7033,8 @@ export function RetroOffice3D({
+@@ -7033,7 +7038,8 @@ export function RetroOffice3D({
            >
              <Maximize size={12} />
            </button>
@@ -185,7 +188,7 @@ index cb7e257..0e02580 100644
            <button
              onClick={toggleEdit}
              title={editMode ? "Done editing" : "Edit office"}
-@@ -7047,6 +7053,7 @@ export function RetroOffice3D({
+@@ -7052,6 +7058,7 @@ export function RetroOffice3D({
            >
              <Settings2 size={12} />
            </button>

@@ -11,6 +11,7 @@
    {
     "origin": "aaaaaaaaaaaaaaa1",
     "kind": "session",
+    "name": null,
     "project": "CortadOS-Router",
     "device": "pro",
     "host": "pro",
@@ -196,6 +197,7 @@
    {
     "origin": "bbbbbbbbbbbbbbb2",
     "kind": "session",
+    "name": null,
     "project": "Grounds",
     "device": "studio",
     "host": "studio",
@@ -294,6 +296,7 @@
    {
     "origin": "grokbot",
     "kind": "bot",
+    "name": null,
     "project": null,
     "device": null,
     "host": null,
@@ -363,6 +366,7 @@
    {
     "origin": null,
     "kind": "unattributed",
+    "name": null,
     "project": null,
     "device": null,
     "host": null,

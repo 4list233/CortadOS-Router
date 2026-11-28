@@ -251,7 +251,126 @@ change of direction. Build steps for (a), when decided: the MCP tool and its rem
 (`--remote`), the hook script and its entry in the child's settings (`session.py`), a size cap and a test that the
 hook never runs a note as a command, and the tree flag.
 
+## C. Office round 2 (built 2026-11-27, branch `office-round-2`, not deployed)
+
+The owner answered B1-B4 and B6 on 2026-11-27. The office is read-only and stays so: steering (B4) is built separately
+as an orchestrator-only tool, and the Office gets **no** write path. What was built, per decision:
+
+### C.1 Orchestrator name = its Claude Code session name (B1)
+
+**Where the name comes from.** Claude Code keeps a session's name in the session's own transcript
+(`$.session.info().transcriptPath`, `~/.claude/projects/<project>/<session id>.jsonl`) as one-line records: a
+`custom-title` record (`customTitle`) each time the owner runs `/rename`, and an `ai-title` record with the short title
+Claude Code gives the session itself (what `/resume` and the terminal title show). The routed-subagents mod
+(`integrations/claude-mod/cortados-routed-subagents/hooks/register.ts`, `readOfficeSessionName`) reads only those
+records, with a fixed-string `grep -F -e '"type":"custom-title"' -e '"type":"ai-title"'` over that file at most once a
+minute, parses each matched line and checks its top-level `type` (inside a message the same words are JSON-escaped,
+`\"type\":\"…\"`, so the pattern cannot match message text). The newest custom title wins, else the newest AI title.
+It is cut to 64 printable ASCII characters and sent as the session heartbeat's new optional field `name`
+(`POST /v1/cortados/office/heartbeat`). Nothing else of the transcript is read or sent; the mod sends no name for a
+session that has none yet. The Claude Code mod API has no session-name accessor (`$.session` offers id, model, root,
+info…, checked against the 2.1.332 types), which is why the transcript is the source.
+
+**Provider.** `office.validate_heartbeat` accepts `name` (rule `office.SESSION_NAME_RE`: printable ASCII, 1-64 chars, no
+address-looking string; anything else refuses the heartbeat with 400 `name`). The floor's orchestrator carries it
+(`_orchestrator`), the conversations section's orchestrator item carries it (both the heartbeat-only and the routed
+main-loop case), and the tree's session group publishes it as `name` (`live._TREE_GROUP_KEYS`). A bot or unattributed
+group has `name: null`.
+
+**Office.** The room's name, door sign and the orchestrator's nameplate first line are the session name; unknown (an
+older mod, a session not named yet) they fall back to the current identifier, the project (`CortadOS-Router`), then
+"Orchestrator". Named, the plate's second line keeps the project: `CortadOS-Router · claude-opus-5 · Pro`. Every child
+(task, a task's helper, the orchestrator's routed helper) is named `<orchestrator name> › <task title>`
+(`adapter.CHILD_SEPARATOR`), the orchestrator part cut to 24 characters and the whole line to 64. The Grok Bot keeps its
+fixed label (and its tasks read `Grok Bot › …`); the unattributed and "No orchestrator" rooms have no prefix.
+
+### C.2 Personal touches (B2)
+
+- **Room colour.** Seven colours (`adapter.ROOM_COLORS`, the same list as `cortadosRooms.ts CORTADOS_ROOM_COLORS`, a test
+  keeps them equal), one per room by FNV-1a of the room's key (session tag or named origin), so a session keeps its
+  colour across polls, restarts and room moves. The rooms patch tints the room's floor and its door sign's stripe with
+  it; the room's people wear it as their trousers (the voxel profile's `bottomColor`; the family keeps the top). The
+  colours are Claw3D's own clothing list (`src/lib/avatars/profile.ts AGENT_AVATAR_CLOTHING_COLOR_OPTIONS`: sky, mint,
+  amber, rose, violet, cream, graphite), because `normalizeAgentAvatarProfile` replaces any other value with a random
+  one. The eighth, slate (`#64748b`), is the unattributed, "No orchestrator" and server rooms' grey.
+- **Door sign.** A plate on each room's back wall with the room's name (the orchestrator's name, else the room's
+  label), drawn by the rooms patch from the head-desk person's name.
+- **Avatars by model family** (Claude / GPT / local, plus Grok, Ollama, unknown): unchanged, already built.
+- **Host badge.** The existing `host` field, unchanged: the nameplate subtitle ends with `· Air` / `· Pro` / `· Studio`
+  for every person whose host is known (A.4).
+
+### C.3 Server room (B3)
+
+**Endpoint: `GET /v1/cortados/office/servers`**, under the existing `office:read` scope (`clients.SCOPES`; exact path,
+GET only, no query: `?…` is a 400), built by `live.office_servers` from the same memoised collect as the tree. Exact
+fields:
+
+```
+{ "version": 1, "generated_at": <epoch s>,
+  "hosts": { "as_of": <epoch s|null>, "status": "ok|partial|error", "errors": [{"source","error"}],
+             "truncated": <bool>, "items": [ { "name": "air|pro|studio|pc|<host slug>",
+                                               "state": "up|down|unknown", "as_of": <epoch s|null>,
+                                               "provider": <bool> } ] },          // at most 8, air/studio/pro first
+  "s1": { "status": "up|down|unknown",        // the provider's own probe
+          "health": "up|down|unknown|null",   // the S1 host's own heartbeat
+          "model": "<served model id, version in the name>|null", "as_of": <epoch s|null>,
+          "probe_ms", "p50_ms", "p90_ms",     // probe latency; S1 scoring time p50/p90 over the last hour
+          "calls_1h", "scored_1h",            // routed calls in the last hour; of those, scored by S1 (not degraded)
+          "degraded_pct_1h": <number|null>, "degraded": <bool>,   // degraded = the routing check warns (live.s1_routing)
+          "errors": [{"source","error"}] } }
+```
+
+A host is `up` when it is the provider host (it is answering) or its heartbeat is fresh, `down` when its heartbeat went
+stale, `unknown` when it never sent one since the provider started. Numbers and fixed words only: no hardware figure,
+job, flag, account, token, routed-call row or request text (`tests/test_office_tree.py ServerRoom`).
+
+**Bridge.** `adapter.POLL_PATHS` is the bridge's whole list of GETs (office, tree, servers); `pollServers` requests
+exactly `/v1/cortados/office/servers` beside the configured office URL with the same rules (no redirect, HTTPS off
+loopback, the office:read token from its file). The tree still decides the roster: a failed servers poll keeps the last
+good server room and says so on stderr; a provider without the endpoint draws every orchestrator room and an empty
+server room. `mapServers` validates the view whole before it replaces the last one.
+
+**Office mode.** Studio's server never serves the provider's path: the browser only ever talks to Studio, and the
+server room reaches it through the gateway socket as people (below). As the owner asked, `office-mode.cjs` lists
+`/v1/cortados/office/servers` among its exact entries as **GET only** (HEAD and every other method 403), with that
+reason; a GET there reaches Next, which has no such page (404), and the office:read token is never in Studio. The list
+test pins the entry and its one method.
+
+**The room.** A fixed room of the floor (see C.5 for where), with one `server_rack` per host slot (Air, Pro, Studio, PC)
+and an S1 console desk. Each host is a figure standing at its rack: name `Air`, subtitle `up · provider`, `up · 8 s ago`,
+`down · seen 30 min ago` or `no heartbeat`; status idle when up, error (red) when down. The S1 console figure is named
+`S1 · <served model>`, subtitle `up · p50 181 ms · p90 420 ms · 90 scored/h` (`· degraded` when the routing check warns);
+working while it scored in the last hour, error when down or degraded. Agent ids `office-servers-host-<host>` and
+`office-servers-s1`; a bot origin named `servers` is refused, so it can never be an orchestrator's room.
+
+### C.4 Event console (B6): still [ESCALATE], hidden by default
+
+No owner answer. Built default: the Agent Event Console stays hidden unless the Studio build sets
+`NEXT_PUBLIC_CORTADOS_DEBUG=1` (Next inlines it at build time; `deploy-air.sh` does not set it, so the Air's Studio never
+shows it). Onboarding stays hidden unconditionally.
+
 ## [ESCALATE] for the owner
+
+Decided 2026-11-27 and built in C: B1 (session name, prefix `<name> › <title>`), B2 (colour, door sign, family avatar,
+host badge), B3 (narrow `office:read` endpoint), B4 (steering outside the Office; the Office stays read-only). Still
+open, each with the default this branch builds:
+
+- **B5. Raw `device` in the tree.** Unchanged (see below). Default: kept in the tree, never forwarded to the browser.
+- **B6. Event console.** Default built: hidden unless `NEXT_PUBLIC_CORTADOS_DEBUG=1` at build (C.4).
+- **B7. Claude Code's own title as the name.** When the owner never ran `/rename`, the room takes Claude Code's own short
+  session title (`ai-title`). It summarises the session's first request, so it can say what the work is about (as the
+  task title header already does). Default built: use it. Alternative: `/rename` titles only (most rooms would then
+  show the project).
+- **B8. Where the server room sits.** See C.5. Default built: the floor's 8th room slot (bottom right), leaving 7
+  orchestrator rooms (E6 said 8); an 8th orchestrator waits unseated, as a 9th did before. Alternative: widen the floor
+  by a fifth column (a change to Claw3D's canvas constants, a wider camera).
+- **B9. A stale heartbeat is "down".** A host whose heartbeat went stale shows red `down · seen N min ago`; it may only
+  have stopped reporting. Default built: down. Alternative: a third, amber "stale" state.
+- **B10. Shared room colours.** Seven colours by hash (Claw3D has only eight clothing colours): two live rooms share one
+  about 1 time in 7 per pair; their door signs still differ. Default built: accept. Alternative: the allocator hands colours out like rooms (distinct, but a
+  session's colour then depends on who else is live).
+
+### Earlier list (2026-11-25), kept for the record
 
 - **B1. Orchestrator names.** Coffee codenames from the session tag (recommended; next free name on a collision,
   sticky while the room lives), project + host + short id, or owner-chosen names? And: tie children to their

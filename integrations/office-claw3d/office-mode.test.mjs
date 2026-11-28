@@ -72,6 +72,22 @@ test('every route on the allowlist carries its reason, methods and nothing writa
   assert.equal(WS_PATH, '/api/gateway/ws');
 });
 
+test('office round 2: the server room path is exact and GET only', () => {
+  const entry = EXACT.find(([p]) => p === '/v1/cortados/office/servers');
+  assert.ok(entry, 'listed');
+  assert.deepEqual(entry[1], ['GET']);
+  assert.equal(allowHttp('GET', '/v1/cortados/office/servers'), true);
+  for (const m of ['HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+    assert.equal(allowHttp(m, '/v1/cortados/office/servers'), false, m);
+  }
+  for (const url of ['/v1/cortados/office/servers/', '/v1/cortados/office/tree', '/v1/cortados/office',
+    '/v1/cortados/live', '/v1/cortados/office/%73ervers', '/V1/cortados/office/servers']) {
+    assert.equal(allowHttp('GET', url), false, url);
+  }
+  const v1 = EXACT.filter(([p]) => p.startsWith('/v1/')).map(([p]) => p);
+  assert.deepEqual(v1, ['/v1/cortados/office/servers'], 'no other provider path is listed');
+});
+
 test('the review list: each write, remote, runtime and voice route is refused', () => {
   for (const [method, path] of REVIEW_REFUSED) assert.equal(allowHttp(method, path), false, `${method} ${path}`);
 });

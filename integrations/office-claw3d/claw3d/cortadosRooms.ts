@@ -26,9 +26,54 @@ const DESK_X = [25, 165, 305]; // three 100 px desks per row inside a 430 px roo
 const ROW_DESK_Y = [50, 150, 250]; // head row, then two team rows
 export const CORTADOS_UID_PREFIX = "cortados_";
 
-type Slot = "head" | "report" | "desk";
+// ---- the server room (office round 2, owner 2026-11-27): a fixed room with a rack per host and the S1 console ----
+// It takes the floor's last room slot (bottom right), so 7 rooms are left for orchestrators ([ESCALATE] B8 in
+// OFFICE-CORTADOS-DESIGN.md: the alternative is a wider floor). Its people are the bridge's server-room figures
+// (adapter.mjs mapServers): office-servers-host-<host> at a rack, office-servers-s1 at the console.
+export const CORTADOS_SERVER_ROOM = 7;
+export const CORTADOS_ORCHESTRATOR_ROOMS = CORTADOS_SERVER_ROOM;
+export const CORTADOS_SERVERS_GROUP = "servers";
+export const CORTADOS_RACKS = 4; // Air, Pro, Studio, PC: the fleet; a fifth host waits unseated
+// Four 100 px bays along the back wall (core/geometry.ts ITEM_FOOTPRINT: desk_cubicle 100 x 55, server_rack 45 x 90).
+// The server room is in the bottom row, so its back wall is the bottom one and every chair (deskWithChair: 10 px north
+// of its desk) faces its rack from the open corridor side, where nothing blocks the way to it.
+const RACK_X = [10, 110, 210, 310];
+const RACK_INSET = 27; // a 45 px rack centred on its 100 px bay
+// distances from the back wall's outer edge: the racks against it, each host's desk in front of its rack, the S1
+// console between them and the corridor
+const RACK_BACK_DY = 100;
+const RACK_DESK_DY = 180;
+const CONSOLE_DESK_DY = 300;
+
+type Slot = "head" | "report" | "desk" | "rack" | "console";
 
 const deskUid = (room: number, slot: Slot, index: number) => `${CORTADOS_UID_PREFIX}r${room}_${slot}${index}`;
+
+// ---- room colours (office round 2): adapter.mjs ROOM_COLORS / roomHash, a test keeps the two equal ----
+// Claw3D's own clothing colours (src/lib/avatars/profile.ts AGENT_AVATAR_CLOTHING_COLOR_OPTIONS), so the room's people
+// can wear their room's colour: seven for the orchestrator rooms, slate for the rest.
+export const CORTADOS_ROOM_COLORS = ["#7090ff", "#34d399", "#f59e0b", "#f43f5e", "#8b5cf6", "#f5f5f4", "#2d3748"];
+export const CORTADOS_NEUTRAL_ROOM_COLOR = "#64748b";
+/** FNV-1a 32-bit of a room key (adapter.mjs roomHash). */
+export function cortadosRoomHash(key: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < key.length; i += 1) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+/** A room's colour from its group key: stable across polls and room moves; grey for the rooms nobody orchestrates. */
+export const cortadosRoomColor = (group: string): string =>
+  group === "unattributed" || group === "lobby" || group === CORTADOS_SERVERS_GROUP
+    ? CORTADOS_NEUTRAL_ROOM_COLOR
+    : CORTADOS_ROOM_COLORS[cortadosRoomHash(group) % CORTADOS_ROOM_COLORS.length];
+
+/** Where room `room` sits on the canvas (the same arithmetic the layout uses). */
+export function cortadosRoomRect(room: number): { x: number; y: number; w: number; h: number; top: boolean } {
+  const top = room < COLS;
+  return { x: 10 + (room % COLS) * COL_PITCH, y: ROW_Y[top ? 0 : 1], w: ROOM_W, h: ROOM_H, top };
+}
 
 const deskWithChair = (uid: string, x: number, y: number): FurnitureItem[] => [
   { _uid: uid, type: "desk_cubicle", x, y },
@@ -50,6 +95,18 @@ export function buildCortadosRoomsLayout(): FurnitureItem[] {
     items.push(wall("back", ox, top ? oy : oy + ROOM_H - WALL, ROOM_W, WALL));
     items.push(wall("left", ox, oy, WALL, ROOM_H));
     items.push(wall("right", ox + ROOM_W - WALL, oy, WALL, ROOM_H));
+    if (room === CORTADOS_SERVER_ROOM) {
+      // racks against the back wall, each host's figure at a desk in front of its rack, the S1 console nearer the
+      // corridor; the back wall is the far side from the corridor (bottom for the bottom row)
+      const back = (dy: number) => (top ? oy + dy : oy + ROOM_H - dy);
+      for (let r = 0; r < CORTADOS_RACKS; r += 1) {
+        items.push({ _uid: `${CORTADOS_UID_PREFIX}r${room}_server_rack${r}`, type: "server_rack",
+          x: ox + RACK_X[r] + RACK_INSET, y: back(RACK_BACK_DY) });
+        items.push(...deskWithChair(deskUid(room, "rack", r), ox + RACK_X[r], back(RACK_DESK_DY)));
+      }
+      items.push(...deskWithChair(deskUid(room, "console", 0), ox + DESK_X[1], back(CONSOLE_DESK_DY)));
+      continue;
+    }
     items.push(...deskWithChair(deskUid(room, "report", 0), ox + DESK_X[0], oy + ROW_DESK_Y[0]));
     items.push(...deskWithChair(deskUid(room, "head", 0), ox + DESK_X[1], oy + ROW_DESK_Y[0]));
     items.push(...deskWithChair(deskUid(room, "report", 1), ox + DESK_X[2], oy + ROW_DESK_Y[0]));
@@ -60,9 +117,12 @@ export function buildCortadosRoomsLayout(): FurnitureItem[] {
   return items;
 }
 
-/** Whether a layout is the CortadOS floor (it holds the fixed _uid scheme). */
+/** Whether a layout is the CURRENT CortadOS floor: it holds the fixed _uid scheme and the server room's console desk
+ * (office round 2). A floor saved by an earlier build (8 orchestrator rooms, no server room) is not, so it is rebuilt
+ * once: nobody can edit the rooms layout (the editor is hidden), so nothing of the owner's is lost. */
+export const CORTADOS_LAYOUT_MARK = deskUid(CORTADOS_SERVER_ROOM, "console", 0);
 export const isCortadosLayout = (items: FurnitureItem[] | null | undefined): boolean =>
-  Array.isArray(items) && items.some((item) => typeof item?._uid === "string" && item._uid.startsWith(CORTADOS_UID_PREFIX));
+  Array.isArray(items) && items.some((item) => item?._uid === CORTADOS_LAYOUT_MARK);
 
 // ---- the rooms' own storage (CortadOS #77 review round 1) ----
 // Claw3D saves the furniture under its storageNamespace (persistence.ts: the key itself for "default", else
@@ -88,18 +148,57 @@ export const cortadosInitialLayout = (saved: FurnitureItem[] | null): FurnitureI
 // (16-64 lowercase hex), a named origin (letters, at most 15: never a session tag) or "unattributed".
 const RUN = "[A-Za-z0-9_-]{8,64}";
 const CORTADOS_ID = new RegExp(`^office-([0-9a-f]{16,64}|[a-z]{2,15})-(orchestrator|task-${RUN}|sub-${RUN}|routed-${RUN})$`);
+// The server room's figures (adapter.mjs mapServers): a host at its rack, S1 at the console. "servers" is refused as a
+// bot origin by the adapter, so no orchestrator id can take this form.
+const CORTADOS_SERVER_ID = /^office-servers-(host-[a-z][a-z0-9-]{0,31}|s1)$/;
 // A finished child task's nameplate subtitle (adapter.mjs RETURN_LABEL): it reports at a desk beside its orchestrator.
 export const CORTADOS_RETURN_SUBTITLE = /^(done|failed|cancelled) · /;
 
-export const isCortadosAgentId = (id: string): boolean => CORTADOS_ID.test(id);
+export const isCortadosAgentId = (id: string): boolean => CORTADOS_ID.test(id) || CORTADOS_SERVER_ID.test(id);
 
 export function cortadosPlaceOf(agent: { id: string; subtitle?: string | null }):
   { group: string; slot: Slot } | null {
+  const s = CORTADOS_SERVER_ID.exec(agent.id);
+  if (s) return { group: CORTADOS_SERVERS_GROUP, slot: s[1] === "s1" ? "console" : "rack" };
   const m = CORTADOS_ID.exec(agent.id);
-  if (!m) return null;
+  if (!m || m[1] === CORTADOS_SERVERS_GROUP) return null;
   const slot: Slot = m[2] === "orchestrator" ? "head"
     : m[2].startsWith("task-") && CORTADOS_RETURN_SUBTITLE.test(agent.subtitle ?? "") ? "report" : "desk";
   return { group: m[1], slot };
+}
+
+// ---- door signs and floor tints (office round 2): one per room in use, plus the server room always ----
+export type CortadosRoomSign = { room: number; group: string | null; label: string; color: string;
+  x: number; y: number; w: number; h: number; top: boolean };
+const SIGN_MAX = 40; // characters on a door sign: the plate is 3/4 of a room wide
+const fixedLabel = (group: string): string | null =>
+  group === "unattributed" ? "Unattributed" : group === "lobby" ? "No orchestrator" : null;
+const signText = (s: string): string => (s.length > SIGN_MAX ? `${s.slice(0, SIGN_MAX - 1)}…` : s);
+
+/**
+ * The signs to draw: each room the allocator gave a group (state.roomByGroup), named after the group's orchestrator
+ * (the head-desk person's name: the session name, else the project) or the room's fixed label, in the room's colour;
+ * and the server room, always. `rect` is the room's floor on the canvas, for the tint.
+ */
+export function cortadosRoomSigns(agents: Array<{ id: string; name?: string | null }>, state: CortadosRoomState):
+  CortadosRoomSign[] {
+  const heads = new Map<string, string>();
+  for (const agent of agents) {
+    const m = CORTADOS_ID.exec(agent.id);
+    if (m && m[2] === "orchestrator" && typeof agent.name === "string" && agent.name.trim()) {
+      heads.set(m[1], agent.name.trim());
+    }
+  }
+  const out: CortadosRoomSign[] = [];
+  for (const [group, room] of state.roomByGroup) {
+    if (group === CORTADOS_SERVERS_GROUP) continue;
+    const label = heads.get(group) ?? fixedLabel(group);
+    if (label === null) continue;
+    out.push({ room, group, label: signText(label), color: cortadosRoomColor(group), ...cortadosRoomRect(room) });
+  }
+  out.push({ room: CORTADOS_SERVER_ROOM, group: CORTADOS_SERVERS_GROUP, label: "Server room",
+    color: CORTADOS_NEUTRAL_ROOM_COLOR, ...cortadosRoomRect(CORTADOS_SERVER_ROOM) });
+  return out.sort((a, b) => a.room - b.room);
 }
 
 /** On only while our bridge is the connected gateway: the hello's adapterType ("cortados-office") is normalised to
@@ -127,7 +226,7 @@ export function cortadosLayoutOn(
 export type CortadosRoomState = { roomByGroup: Map<string, number>; deskByAgent: Map<string, string> };
 export const createCortadosRoomState = (): CortadosRoomState => ({ roomByGroup: new Map(), deskByAgent: new Map() });
 
-const UID_RE = new RegExp(`^${CORTADOS_UID_PREFIX}r(\\d+)_(head|report|desk)(\\d+)$`);
+const UID_RE = new RegExp(`^${CORTADOS_UID_PREFIX}r(\\d+)_(head|report|desk|rack|console)(\\d+)$`);
 
 /**
  * Desks for the agents nobody placed by hand. `deskItems` are the layout's desk_cubicle items in Claw3D's index order
@@ -178,10 +277,17 @@ export function allocateCortadosDesks(
     if (!groups.includes(group) || !rooms.has(state.roomByGroup.get(group)!)) state.roomByGroup.delete(group);
   }
   for (const id of [...state.deskByAgent.keys()]) if (!places.has(id)) state.deskByAgent.delete(id);
+  // the server room's people always take the server room; every other group one of the orchestrator rooms
+  for (const [group, room] of [...state.roomByGroup]) {
+    if ((group === CORTADOS_SERVERS_GROUP) !== (room === CORTADOS_SERVER_ROOM)) state.roomByGroup.delete(group);
+  }
+  if (groups.includes(CORTADOS_SERVERS_GROUP) && rooms.has(CORTADOS_SERVER_ROOM)) {
+    state.roomByGroup.set(CORTADOS_SERVERS_GROUP, CORTADOS_SERVER_ROOM);
+  }
   const taken = new Set(state.roomByGroup.values());
   for (const group of groups) {
-    if (state.roomByGroup.has(group)) continue;
-    const room = [...rooms].sort((a, b) => a - b).find((r) => r < CORTADOS_ROOMS && !taken.has(r));
+    if (state.roomByGroup.has(group) || group === CORTADOS_SERVERS_GROUP) continue;
+    const room = [...rooms].sort((a, b) => a - b).find((r) => r < CORTADOS_ORCHESTRATOR_ROOMS && !taken.has(r));
     if (room === undefined) continue; // more orchestrators than rooms: this group's people stay unseated
     state.roomByGroup.set(group, room);
     taken.add(room);

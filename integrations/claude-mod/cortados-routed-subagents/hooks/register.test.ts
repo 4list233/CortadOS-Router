@@ -3,6 +3,32 @@ import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
 import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
+import { officeSessionName, sessionNameFromRecords, OFFICE_NAME_TYPES, OFFICE_SESSION_NAME_MAX } from './register'
+
+// Office round 2 (owner 2026-11-27): the session's name, from the transcript's title records only.
+test('session name: the newest /rename title wins, else the newest AI title, else none', () => {
+  const lines = [
+    '{"type":"ai-title","aiTitle":"Office brand round","sessionId":"s"}',
+    '{"type":"user","message":{"content":"{\\"type\\":\\"custom-title\\",\\"customTitle\\":\\"from a prompt\\"}"}}',
+    '{"type":"ai-title","aiTitle":"Office round 2","sessionId":"s"}',
+  ]
+  expect(sessionNameFromRecords(lines.join('\n'))).toBe('Office round 2')
+  expect(sessionNameFromRecords([...lines, '{"type":"custom-title","customTitle":"Rooms","sessionId":"s"}',
+    '{"type":"ai-title","aiTitle":"Later AI title","sessionId":"s"}'].join('\n'))).toBe('Rooms')
+  // a quoted record inside a message is never taken: only a line that is itself a title record counts
+  expect(sessionNameFromRecords(lines[1])).toBe(null)
+  expect(sessionNameFromRecords('')).toBe(null)
+  expect(sessionNameFromRecords('not json\n{"type":"custom-title","customTitle":7}')).toBe(null)
+  expect(OFFICE_NAME_TYPES).toEqual(['custom-title', 'ai-title'])
+})
+
+test('session name: printable ASCII, spaces collapsed, at most 64 characters', () => {
+  expect(officeSessionName('  Fix   the\trouter  ')).toBe('Fix the router')
+  expect(officeSessionName('café — rooms')).toBe('caf rooms')
+  expect(officeSessionName('x'.repeat(100))!.length).toBe(OFFICE_SESSION_NAME_MAX)
+  expect(officeSessionName('éé')).toBe(null)
+  expect(officeSessionName(undefined)).toBe(null)
+})
 import { routedChildSettings, BOUNDARY_HOOK_PY, BOUNDARY_HOOK_GUARD_HEAD, BOUNDARY_HOOK_GUARD_TAIL, ROUTED_CHILD_ENV, boundaryHookPython, boundaryHookCommand } from './register'
 import { MODEL_DIRECTIVE_RE, modelDirective, directiveModelId } from './register'
 import { lastJsonLine, parseResult, cleanCompletion, scrubToken, normalizeUsage, parseList, mainLoopAllows, validToolName, resolveAllowSet, resolveTimeoutMs, refusesAgent, isDelegationTool, AGENT_REFUSAL, ORCHESTRATOR_DIRECTIVE, isReview, headerSafeModel, excludeRefusalReason, register, newRunId, parseRunRecord, resetWorkerModels, trackedWorkerModels, trackWorkerModels, builderModelsOf, resolveMaxTurns, fmtSecs, isSessionUuid, FIND_TRANSCRIPT_SH, partialFromTranscript, newSessionId, STOP_ON_DEAD_TOOL, resolveBackgroundTimeoutMs, BG_LAUNCH_SH, BG_CLEANUP_SH, BACKGROUND_DATA_BOUNDARY, backgroundData, isBgDir } from './register'

@@ -2,8 +2,10 @@
 //
 // Claw3D Studio's server-side proxy (server/gateway-proxy.js upstream) opens ONE
 // WebSocket to an "upstream gateway"; this file is that gateway. It polls the
-// provider's metadata-only office view with an office:read token (adapter.mjs) and
-// serves the read-only frames OfficeGateway builds. It is NOT reachable from the
+// provider's metadata-only office views with an office:read token (adapter.mjs: GET
+// only, and only the exact paths of adapter.POLL_PATHS: the tree and, since office
+// round 2, the server room's /v1/cortados/office/servers) and serves the read-only
+// frames OfficeGateway builds. It is NOT reachable from the
 // browser directly: Studio connects to it server-side.
 //
 // Guarantees, each enforced here and tested in bridge.test.mjs:
@@ -124,12 +126,14 @@ export const sameSecret = (a, b) => typeof a === 'string' && typeof b === 'strin
 
 /** Fan-out target for runPolling: validates once, then updates every connected gateway. */
 export class OfficeHub {
-  constructor() { this.gateways = new Set(); this.last = null; }
-  update(tree) {
-    mapTree(tree);                         // throws on a malformed tree: nothing changes
+  constructor() { this.gateways = new Set(); this.last = null; this.lastServers = null; }
+  /** One poll: the tree and the server room's view (adapter.SERVERS_PATH, or null when it never answered). */
+  update(tree, servers = null) {
+    mapTree(tree, servers);                // throws on a malformed tree or server room: nothing changes
     this.last = tree;
+    this.lastServers = servers;
     for (const g of this.gateways) {
-      try { g.update(tree); } catch { /* one client's failure never stops the others */ }
+      try { g.update(tree, servers); } catch { /* one client's failure never stops the others */ }
     }
   }
 }
@@ -182,7 +186,7 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
       setTimeout(() => socket.destroy(), 1000).unref();
     };
     const gateway = new OfficeGateway(frame => write(encodeFrame(1, JSON.stringify(frame))));
-    if (hub.last) { try { gateway.update(hub.last); } catch { /* validated by the hub already */ } }
+    if (hub.last) { try { gateway.update(hub.last, hub.lastServers); } catch { /* validated by the hub already */ } }
     const deadline = setTimeout(() => { if (!client.authed) close(1008); }, connectDeadlineMs);
     deadline.unref();
     function cleanup() {

@@ -388,7 +388,8 @@ test('default reporter exposes failed polls safely and loop recovers', async t =
     gateway.update(tree());
     const previous = gateway.agents;
     let calls = 0;
-    await runPolling({ gateway, intervalMs: 1000, signal: controller.signal,
+    // the tree's recovery alone: the server room's own poll is round2.test.mjs's
+    await runPolling({ gateway, intervalMs: 1000, signal: controller.signal, pollRoom: null,
       url: 'http://localhost/v1/cortados/office', tokenFile,
       fetchImpl: async url => {
         calls++;

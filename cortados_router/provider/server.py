@@ -566,6 +566,8 @@ def endpoint_id(path: str | None) -> str:
         return "office"
     if p == clients.OFFICE_TREE_PATH:
         return "office_tree"
+    if p == clients.OFFICE_SERVERS_PATH:
+        return "office_servers"
     if p == OFFICE_HEARTBEAT_PATH:
         return "office_heartbeat"
     if p == live.LIVE_PATH:
@@ -2618,6 +2620,19 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.warning("office: tree failed: %s", type(exc).__name__)
                 return self._error(500, "api_error", "cortados: office tree unavailable (see provider log)")
+            return self._json(200, body, headers=VIEW_HEADERS)
+        if self.path.split("?")[0] == clients.OFFICE_SERVERS_PATH:
+            # The Office's server room (office round 2): per host up/down and S1's health and latency, numbers and fixed
+            # words only (live.office_servers). Same tokens as the tree; no query, the fleet's view only.
+            if not self._owner_or_session("GET"):
+                return self._refuse_auth()
+            if "?" in self.path:
+                return self._error(400, "invalid_request_error", "cortados: the office servers view takes no query")
+            try:
+                body = self.server.office_servers_body(self.server.registry)
+            except Exception as exc:
+                logger.warning("office: servers failed: %s", type(exc).__name__)
+                return self._error(500, "api_error", "cortados: office servers unavailable (see provider log)")
             return self._json(200, body, headers=VIEW_HEADERS)
         if self.path.split("?")[0] == live.LIVE_PATH:
             # Owner token, a scoped token with live:read, or a dashboard session. Metadata only (provider/live.py).
@@ -4675,6 +4690,14 @@ class ProviderServer(ThreadingHTTPServer):
         from cortados_router import paths
         key = (str(paths.state_dir()), id(registry), registry.live.generation, "office-tree")
         return self._live_memo.get(key, lambda: json.dumps(live.office_tree(self.live_view(registry)),
+                                                           allow_nan=False).encode())
+
+    def office_servers_body(self, registry: Registry) -> bytes:
+        """GET /v1/cortados/office/servers: the Office's server room (live.office_servers), from the same memoised
+        collect as the tree and the live view."""
+        from cortados_router import paths
+        key = (str(paths.state_dir()), id(registry), registry.live.generation, "office-servers")
+        return self._live_memo.get(key, lambda: json.dumps(live.office_servers(self.live_view(registry)),
                                                            allow_nan=False).encode())
 
     def live_view(self, registry: Registry, session: str | None = None, session_view: bool = False,

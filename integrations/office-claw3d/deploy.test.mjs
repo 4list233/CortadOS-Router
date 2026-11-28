@@ -1869,7 +1869,11 @@ test('cortados-brand.patch: the CortadOS router brand, no flags, the OpenClaw co
     /(?<![A-Za-z])OpenClaw(?![A-Za-z])|Headquarters|https?:\/\//, 'no OpenClaw brand string and nothing fetched is added');
   // the onboarding wizard and the event console (upstream shows it whenever DEBUG is unset) are hidden too
   assert.match(after, /\{showOnboardingWizard && CORTADOS_OPENCLAW_UI \? \(/);
-  assert.match(after, /\{showOpenClawConsole && CORTADOS_OPENCLAW_UI \? \(/);
+  // office round 2, B6 still [ESCALATE]: the console only in a build with NEXT_PUBLIC_CORTADOS_DEBUG=1 (default off)
+  assert.match(after, /\{showOpenClawConsole && \(CORTADOS_OPENCLAW_UI \|\| CORTADOS_DEBUG_CONSOLE\) \? \(/);
+  assert.match(added, /^const CORTADOS_DEBUG_CONSOLE = process\.env\.NEXT_PUBLIC_CORTADOS_DEBUG === "1";$/m);
+  assert.doesNotMatch(readFileSync(new URL('deploy-air.sh', import.meta.url), 'utf8'), /NEXT_PUBLIC_CORTADOS_DEBUG/,
+    'the deploy never turns the console on');
   // the US (and remote office's Brazil) flag poles: behind a constant that is false
   assert.match(added, /^const CORTADOS_FLAGS = false;$/m);
   assert.match(after, /\{CORTADOS_FLAGS \? \(\n\s*<>\n\s*<OfficeFlagPole\n[^]*?art=\{<UsaFlagArt \/>\}[^]*?art=\{<BrazilFlagArt \/>\}/);

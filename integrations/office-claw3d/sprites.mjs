@@ -324,16 +324,22 @@ const PROFILE_LOOK = {
   local: { top: '#34d399', hair: '#3e2723', hat: 'cap', headset: false, glasses: false },
   unknown: { top: '#64748b', hair: '#6b4f3a', hat: 'none', headset: false, glasses: false },
 };
-export function avatarProfile(family, outfit, seed) {
+// Office round 2 (owner 2026-11-27): a room's people wear its colour as their trousers (adapter.mjs roomColor), so a
+// glance ties a person to their room. Only a colour of ROOM_TROUSERS is used, else the outfit's default: it is Claw3D's
+// own clothing list (profile.ts AGENT_AVATAR_CLOTHING_COLOR_OPTIONS), the only values normalizeAgentAvatarProfile keeps.
+export const ROOM_TROUSERS = Object.freeze(['#2d3748', '#7090ff', '#34d399', '#f59e0b', '#f43f5e', '#8b5cf6', '#f5f5f4',
+  '#64748b']);
+export function avatarProfile(family, outfit, seed, { roomColor = null } = {}) {
   const look = PROFILE_LOOK[family];
   if (!look || !OUTFITS.includes(outfit)) throw new Error('unknown sprite');
   const suit = outfit === 'suit';
+  const trousers = ROOM_TROUSERS.includes(roomColor) ? roomColor : null;
   return {
     version: 1, seed,
     hair: { style: suit ? 'parted' : 'short', color: look.hair },
     clothing: {
       topStyle: suit ? 'jacket' : 'hoodie', topColor: look.top,
-      bottomStyle: 'pants', bottomColor: suit ? '#2d3748' : '#64748b',
+      bottomStyle: 'pants', bottomColor: trousers ?? (suit ? '#2d3748' : '#64748b'),
       shoesColor: suit ? '#1a1a1a' : '#7c4a2d',
     },
     accessories: { glasses: look.glasses, headset: look.headset, hatStyle: suit ? 'none' : look.hat, backpack: false },

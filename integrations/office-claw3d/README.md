@@ -18,7 +18,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `claw3d/proxy-auth.patch` | Studio's gateway proxy always sends its configured token to the bridge and drops the browser's device block and credentials (over HTTPS the stock proxy sent no token and the Office closed with 1012, 2026-11-25) |
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a plain `connect` and a browser-shaped one (signed device block, no token) through Studio's own proxy must each get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
-| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts` | rooms per orchestrator: the floor's 8 rooms x 6 desks and the desk allocation (the patch adds the `.ts` file and a 40-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8) |
+| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts`, `claw3d/cortadosSigns.tsx` | rooms per orchestrator: the floor's 7 orchestrator rooms x 6 desks, the server room, the desk allocation, the door signs and floor tints (the patch adds the two files and a 45-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8, [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) C) |
 | `claw3d/cortados-brand.patch` | brands the Office as the CortadOS router (title, floor card, connection badge), removes the flag poles and hides the OpenClaw controls the read-only bridge cannot serve, the chat composer included ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) part A) |
 | `claw3d/office-mode.patch`, `claw3d/office-mode.cjs` | "office mode": Studio's server answers only the Office's own routes and methods and 403 to the rest (`PUT /api/studio`, remote office, runtime, voice, every write), so the cookie opens a read-only view ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.5) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
@@ -51,6 +51,15 @@ orchestrator's session host (its device matched to a known host name by the prov
 tree's group `host`), a helper's task or session host. No badge when no known name matches; a raw hostname is never
 shown, and the group's raw `device` is not in `agents.list` at all. Branding, the removed props, the hidden controls and the design of what comes next (orchestrator names, server
 room, steering) are in [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md).
+
+Office round 2 (owner 2026-11-27, [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) part C): a room is named after
+its orchestrator's Claude Code session name (the tree group's `name`, from the session heartbeat; else the project), and
+its people read `<orchestrator name> › <task title>`. Each room has a stable colour (its floor tint, its door sign's
+stripe, its people's trousers) and a door sign with its name. The 8th room slot is the **server room**: a rack per host
+(Air, Pro, Studio, PC) with that host's figure (`up · provider`, `up · 8 s ago`, `down · seen 30 min ago`, `no heartbeat`)
+and the S1 console (`S1 · <model>`, `up · p50 181 ms · p90 420 ms · 90 scored/h`), from
+`GET /v1/cortados/office/servers` (office:read, numbers and fixed words only), which the bridge polls beside the tree.
+So 7 rooms are left for orchestrators ([ESCALATE] B8).
 
 ## Appearance (issue #77)
 

@@ -2170,11 +2170,73 @@ export async function readSharedSalt($: any): Promise<string | null> {
   }
 }
 
+// ---- the session's NAME (office round 2, owner 2026-11-27: an orchestrator's room is named as Claude Code names the
+// session). Claude Code keeps it in the session's own transcript (SessionInfo.transcriptPath) as one-line records: a
+// `custom-title` record each time the owner runs /rename, and an `ai-title` record with the short title Claude Code gives
+// the session itself (shown in /resume and the terminal title). The newest custom title wins, else the newest AI title,
+// else none (the Office then names the room after the project). Only those records are read, by a fixed-string grep for
+// their top-level type: a message, a tool result or a prompt is never read or sent (inside a message the same words are
+// JSON-escaped, `\"type\":\"…\"`, which the pattern cannot match; every matched line is parsed and its own type checked).
+/** The transcript's title record types, newest first by preference. */
+export const OFFICE_NAME_TYPES = ['custom-title', 'ai-title'] as const
+/** Re-read at most once a minute: a /rename shows in the Office within a minute, and a long session's grep stays rare. */
+export const OFFICE_NAME_REFRESH_MS = 60_000
+/** A room's door sign holds 64 characters (provider office.SESSION_NAME_RE): longer names are cut. */
+export const OFFICE_SESSION_NAME_MAX = 64
+/** At most this much grep output is read: title records are short, so more means something else matched. */
+const OFFICE_NAME_STDOUT_MAX = 256 * 1024
+
+/** A name the provider accepts: printable ASCII (anything else becomes a space), spaces collapsed, at most 64 chars. */
+export function officeSessionName(s: unknown): string | null {
+  const t = String(s ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/ +/g, ' ').trim().slice(0, OFFICE_SESSION_NAME_MAX).trim()
+  return t || null
+}
+
+/** The session's name from grep's matched lines: the last custom title, else the last AI title, else null. Each line is
+ * parsed; a line that is not one top-level title record of a known type is ignored. */
+export function sessionNameFromRecords(stdout: unknown): string | null {
+  const found: Record<string, string> = {}
+  for (const line of String(stdout ?? '').slice(0, OFFICE_NAME_STDOUT_MAX).split('\n')) {
+    if (!line.startsWith('{')) continue
+    let rec: any
+    try { rec = JSON.parse(line) } catch { continue }
+    if (!rec || typeof rec !== 'object' || !OFFICE_NAME_TYPES.includes(rec.type)) continue
+    const raw = rec.type === 'custom-title' ? rec.customTitle : (rec.aiTitle ?? rec.title)
+    const name = typeof raw === 'string' ? officeSessionName(raw) : null
+    if (name) found[rec.type] = name
+  }
+  return found['custom-title'] ?? found['ai-title'] ?? null
+}
+
+/** This session's name, refreshed at most every OFFICE_NAME_REFRESH_MS; null when unknown. Never throws (a failure is
+ * reported once and the last name kept). */
+async function readOfficeSessionName($: any, office: OfficeState, now: number): Promise<string | null> {
+  if (office.nameAt !== null && now - office.nameAt < OFFICE_NAME_REFRESH_MS) return office.name
+  office.nameAt = now
+  try {
+    const info = await $.session.info()
+    const path = typeof info?.transcriptPath === 'string' ? info.transcriptPath : ''
+    if (!path.startsWith('/')) return office.name
+    const args = ['/usr/bin/grep', '-h', '-F']
+    for (const t of OFFICE_NAME_TYPES) args.push('-e', `"type":"${t}"`)
+    args.push('--', path)
+    const r = await $.process.run(args)
+    // grep exits 1 when nothing matched: a session not named yet
+    office.name = sessionNameFromRecords(r?.stdout) ?? office.name
+  } catch (err) {
+    officeReport($, office, 'session name', err)
+  }
+  return office.name
+}
+
 type OfficeState = {
   salt: string | null                   // this install's own salt (the store's), made once and kept
   pin: { id: string; salt: Promise<string | null> } | null   // the salt chosen for session `id`, kept for that session
   device: string | null
   project: string | null
+  name: string | null                   // the session's name (readOfficeSessionName), sent in the heartbeat
+  nameAt: number | null                 // when it was last read
+  nameTag: string | null                // the session tag it was read for: /clear or resume is another session
   reported: Set<string>
   last: { status: string; tool: string | null; at: number } | null
   failures: number
@@ -2185,8 +2247,8 @@ type OfficeState = {
 }
 
 export function newOfficeState(): OfficeState {
-  return { salt: null, pin: null, device: null, project: null, reported: new Set(), last: null, failures: 0,
-    pending: null, running: null, wake: null, ended: false }
+  return { salt: null, pin: null, device: null, project: null, name: null, nameAt: null, nameTag: null,
+    reported: new Set(), last: null, failures: 0, pending: null, running: null, wake: null, ended: false }
 }
 
 /** Report one Office failure ONCE per kind as a dim transcript notice ($.ui.log is not sent to the model), with its
@@ -2360,10 +2422,20 @@ async function officeSend($: any, cfg: Cfg, office: OfficeState, { status, tool 
       // Model is optional metadata: send the lifecycle state with null instead of inventing a model or losing it.
       model = null
     }
+    // the session's name (office round 2): read for this session only; a new session id starts unnamed
+    if (office.nameTag !== id.session) {
+      office.nameTag = id.session
+      office.name = null
+      office.nameAt = null
+    }
+    let clock = Date.now()
+    try { const c = Number(await $.clock.now()); if (Number.isFinite(c)) clock = c } catch { /* Date.now() */ }
+    const name = await readOfficeSessionName($, office, clock)
     // client: this mod runs only inside Claude Code, so the main session's harness is Claude Code (the Office's
     // suit when its own main loop is not routed; #77 E10, owner 2026-11-24: "it should all be from Claude").
     const body = JSON.stringify({ session: id.session, project: id.project, device: id.device, model, status,
-                                  tool: tool && validToolName(tool) ? tool : null, client: 'claude-code' })
+                                  tool: tool && validToolName(tool) ? tool : null, client: 'claude-code',
+                                  ...(name ? { name } : {}) })
     const url = providerUrl + '/v1/cortados/office/heartbeat'
     timer = setTimeout(() => officeReport($, office, 'heartbeat', new Error('timeout')), OFFICE_BEAT_TIMEOUT_MS)
     const res: any = await $.http.fetch(url, { method: 'POST', body,

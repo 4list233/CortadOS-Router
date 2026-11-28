@@ -40,6 +40,10 @@ const EXACT = [
   ['/api/task-store', READ, "the Office polls the task board; it reads Studio's own local file, which nothing can write now"],
   ['/api/office/standup/config', READ, 'the Office reads the standup preference while it hydrates (read only; PUT refused)'],
   ['/api/office/standup/meeting', READ, 'the Office reads the active standup meeting while it hydrates (read only; PUT refused)'],
+  // Office round 2 (owner 2026-11-27): the server room's provider path, exact and GET only. Studio serves no such route
+  // (a GET reaches Next, which answers 404) and never holds the office:read token: the bridge polls the provider and
+  // the room reaches the browser over the gateway socket. Listed so that no other method can ever be served on it.
+  ['/v1/cortados/office/servers', ['GET'], "the server room's view path (the bridge's GET; nothing else is ever served on it)"],
 ];
 
 /** Static file prefixes, GET/HEAD only: [prefix, reason]. */

@@ -16,8 +16,10 @@ Inputs, all in memory except the child-task log:
     model and lane, and the NAMES of the tool_use blocks the backend hands the client;
   - $CORTADOS_HOME/child-tasks.jsonl (child_tasks.log_event): started / finished / cancelled, with title and tag;
   - heartbeats (POST /v1/cortados/office/heartbeat) from the cortados-routed-subagents mod, for the orchestrator
-    ({session, status, project?, device?, model?, tool?, client?}; `client` is one of CLIENTS, the session's harness,
-    which the Office tree uses for the orchestrator's suit when the provider did not observe it itself, #77 E7).
+    ({session, status, project?, device?, model?, tool?, client?, name?}; `client` is one of CLIENTS, the session's
+    harness, which the Office tree uses for the orchestrator's suit when the provider did not observe it itself, #77 E7;
+    `name` is the session's NAME as Claude Code shows it (its /rename title, else its own short title), which the Office
+    uses as the room's name: owner decision 2026-11-27, office round 2).
 
 The session tags and titles are client-asserted, inside the owner token's trust boundary (like x-cortados-run-id):
 cosmetic, never authorizing anything. A malformed tag header is DROPPED and counted (dropped_headers in the view); a
@@ -79,6 +81,11 @@ def read_via(headers) -> str | None:
 _MODEL_RE = re.compile(r"[A-Za-z0-9._/\[\]:-]{1,64}")
 _LANE_RE = re.compile(r"[A-Za-z0-9._#:/-]{1,64}")
 _TOOL_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+# A session's name (office round 2, owner 2026-11-27: an orchestrator is named as Claude Code names its session). The
+# title header's rule cut to 64 characters, the length of a room's door sign: printable ASCII only, and (clean) nothing
+# address-looking. It is the session's own label (the owner's /rename, else Claude Code's short session title), never
+# prompt text: the mod sends only the transcript's title records (integrations/claude-mod, officeSessionName).
+SESSION_NAME_RE = re.compile(r"[\x20-\x7e]{1,64}")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")       # server._RUN_ID_RE
 ORCHESTRATOR_STATUSES = ("working", "idle", "ended")   # what a heartbeat may say; `ended` removes it
 WORKER_STATUSES = ("working", "idle", "error", "done")
@@ -407,7 +414,7 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
     malformed: it is this endpoint's own request, and a 400 tells the mod its sender is broken."""
     if not isinstance(body, dict):
         return None, "body"
-    unknown = sorted(set(body) - {"session", "project", "device", "model", "status", "tool", "client"})
+    unknown = sorted(set(body) - {"session", "project", "device", "model", "status", "tool", "client", "name"})
     if unknown:
         return None, "(unknown field)"           # the key itself is not echoed: it is client text
     out: dict[str, Any] = {}
@@ -424,7 +431,7 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
         return None, "client"                    # the value is not echoed: it is client text
     out["client"] = client or None
     for field, rule in (("project", _HEADER_RULES[PROJECT_HEADER]), ("device", _HEADER_RULES[DEVICE_HEADER]),
-                        ("model", _MODEL_RE), ("tool", _TOOL_RE)):
+                        ("model", _MODEL_RE), ("tool", _TOOL_RE), ("name", SESSION_NAME_RE)):
         raw = body.get(field)
         if raw is None or raw == "":
             out[field] = None
@@ -509,13 +516,13 @@ def _orchestrator(hb: dict[str, Any] | None, main: dict[str, Any] | None) -> dic
         # the routed main loop's backend only describes the model it served
         backend = (main or {}).get("local_backend") if model == (main or {}).get("model") else None
         # the routed main loop's route pick: the desk's badge (doc §6), only for the model it routed
-        return {"model": model, "status": hb.get("status"),
+        return {"model": model, "status": hb.get("status"), "name": hb.get("name"),
                 "tool": hb.get("tool"), "last_seen": _ts(hb.get("seen")), "source": "heartbeat",
                 "local_backend": backend, "client": hb.get("client") if hb.get("client") in CLIENTS else None,
                 "pick": _pick((main or {}).get("pick")) if model == (main or {}).get("model") else None}
     if main:
         return {"model": main.get("model"), "status": "idle" if main.get("status") == "done" else main.get("status"),
-                "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed",
+                "name": None, "tool": main.get("tool"), "last_seen": _ts(main.get("updated")), "source": "routed",
                 "local_backend": main.get("local_backend"), "client": None, "pick": _pick(main.get("pick"))}
     return None
 
