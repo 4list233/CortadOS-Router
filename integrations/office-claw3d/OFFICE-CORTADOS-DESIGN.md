@@ -309,7 +309,7 @@ fields:
 { "version": 1, "generated_at": <epoch s>,
   "hosts": { "as_of": <epoch s|null>, "status": "ok|partial|error", "errors": [{"source","error"}],
              "truncated": <bool>, "items": [ { "name": "air|pro|studio|pc|<host slug>",
-                                               "state": "up|down|unknown", "as_of": <epoch s|null>,
+                                               "state": "up|stale|down|unknown", "as_of": <epoch s|null>,
                                                "provider": <bool> } ] },          // at most 8, air/studio/pro first
   "s1": { "status": "up|down|unknown",        // the provider's own probe
           "health": "up|down|unknown|null",   // the S1 host's own heartbeat
@@ -339,13 +339,13 @@ test pins the entry and its one method.
 **The room.** A fixed room of the floor (see C.5 for where). Hosts and S1 are not people (office round 2 fix, owner
 2026-11-27: as figures they walked the floor and filled the roster). The bridge sends the room as data,
 `snapshot.cortadosServers` in its hello and `payload.servers` in every `office.snapshot` event: `racks`, one per host
-(`{host, name "Air", state up|down|unknown, note}`, note `up · provider`, `up · 8 s ago`, `down · seen 30 min ago` or
-`no heartbeat`), and `s1` (`{name "S1 · <served model>", state, note "up · p50 181 ms · p90 420 ms · 90 scored/h"
+(`{host, name "Air", state up|stale|down|unknown, note}`, note `up · provider`, `up · 8 s ago`, `stale · seen 18 min ago`,
+`down · seen 30 min ago` or `no heartbeat`; `stale` for the first 10 minutes past the heartbeat's freshness limit, B9), and `s1` (`{name "S1 · <served model>", state, note "up · p50 181 ms · p90 420 ms · 90 scored/h"
 (· degraded when the routing check warns), alert (down or degraded), working (scored in the last hour)}`). One line in
 Studio's `GatewayBrowserClient.handleMessage` hands every frame to `cortadosRooms.ts cortadosNoteGatewayFrame`, which
 keeps only those two frames' room, validated field by field (a malformed one is dropped, the last good one stays).
 `objects/cortadosSigns.tsx` draws a rack per host along the room's open side, facing in, with a status strip and a
-sign (name over note, green / red / grey), and the S1 console in front of them with its sign; no desks or chairs. A
+sign (name over note, green / amber / red / grey), and the S1 console in front of them with its sign; no desks or chairs. A
 bot origin named `servers` is refused, so it can never be an orchestrator's room.
 
 ### C.4 Event console (B6): still [ESCALATE], hidden by default
@@ -357,23 +357,22 @@ shows it). Onboarding stays hidden unconditionally.
 ## [ESCALATE] for the owner
 
 Decided 2026-11-27 and built in C: B1 (session name, prefix `<name> › <title>`), B2 (colour, door sign, family avatar,
-host badge), B3 (narrow `office:read` endpoint), B4 (steering outside the Office; the Office stays read-only). Still
-open, each with the default this branch builds:
+host badge), B3 (narrow `office:read` endpoint), B4 (steering outside the Office; the Office stays read-only).
+Decided by the owner 2026-11-28, all as built except B9, which changed:
 
-- **B5. Raw `device` in the tree.** Unchanged (see below). Default: kept in the tree, never forwarded to the browser.
-- **B6. Event console.** Default built: hidden unless `NEXT_PUBLIC_CORTADOS_DEBUG=1` at build (C.4).
+- **B5. Raw `device` in the tree.** Kept in the provider's tree, never forwarded to the browser (the adapter drops it).
+- **B6. Event console.** Hidden unless the Studio build sets `NEXT_PUBLIC_CORTADOS_DEBUG=1` (C.4).
 - **B7. Claude Code's own title as the name.** When the owner never ran `/rename`, the room takes Claude Code's own short
-  session title (`ai-title`). It summarises the session's first request, so it can say what the work is about (as the
-  task title header already does). Default built: use it. Alternative: `/rename` titles only (most rooms would then
-  show the project).
-- **B8. Where the server room sits.** See C.5. Default built: the floor's 8th room slot (bottom right), leaving 7
-  orchestrator rooms (E6 said 8); an 8th orchestrator waits unseated, as a 9th did before. Alternative: widen the floor
-  by a fifth column (a change to Claw3D's canvas constants, a wider camera).
-- **B9. A stale heartbeat is "down".** A host whose heartbeat went stale shows red `down · seen N min ago`; it may only
-  have stopped reporting. Default built: down. Alternative: a third, amber "stale" state.
-- **B10. Shared room colours.** Seven colours by hash (Claw3D has only eight clothing colours): two live rooms share one
-  about 1 time in 7 per pair; their door signs still differ. Default built: accept. Alternative: the allocator hands colours out like rooms (distinct, but a
-  session's colour then depends on who else is live).
+  session title (`ai-title`).
+- **B8. Where the server room sits.** The floor's 8th room slot (bottom right), leaving 7 orchestrator rooms (C.5); an
+  8th orchestrator waits unseated.
+- **B9. A stopped heartbeat is amber "stale", then red "down".** A host whose heartbeat passed its freshness limit
+  (`ttl_s`) shows amber `stale · seen N min ago` for its first 10 minutes past it (`live.SERVER_STALE_WINDOW_S`: it may
+  only have missed a post or two), then red `down · seen N min ago`. Computed by the provider in `live._server_host`
+  (`GET /v1/cortados/office/servers`); the adapter writes the note and `cortadosRooms.ts CORTADOS_SERVER_STATE_COLOR`
+  colours the rack sign (green up, amber stale, red down, grey unknown).
+- **B10. Shared room colours.** Accepted: seven colours by hash, so two live rooms share one about 1 time in 7 per pair;
+  their door signs still differ.
 
 ### Earlier list (2026-11-25), kept for the record
 

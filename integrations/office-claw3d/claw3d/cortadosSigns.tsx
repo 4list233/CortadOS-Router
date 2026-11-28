@@ -1,7 +1,7 @@
 // CortadOS rooms: door signs, floor tints and the server room (office round 2, CortadOS-Router claw3d/cortados-rooms.patch).
 // Each room in use gets a tint of its colour on its floor and a sign above its back wall with its name (the
 // orchestrator's Claude Code session name, else the room's label), and the server room always has its sign. The server
-// room holds a rack per host (its sign: name, up / down / unknown, how long ago) and the S1 console (its sign: the
+// room holds a rack per host (its sign: name, up / stale / down / unknown, how long ago) and the S1 console (its sign: the
 // served model and its latency line), drawn from the bridge's server-room data (cortadosRooms.ts
 // cortadosNoteGatewayFrame); nobody sits there. Display only: no handler, nothing clickable, nothing sent anywhere.
 import { Billboard, Text } from "@react-three/drei";
@@ -9,12 +9,12 @@ import { memo, useSyncExternalStore } from "react";
 import { SCALE, WALL_THICKNESS } from "@/features/retro-office/core/constants";
 import { toWorld } from "@/features/retro-office/core/geometry";
 import {
+  CORTADOS_SERVER_STATE_COLOR as STATE_COLOR,
   cortadosServerRoomPlan,
   getCortadosServerRoom,
   subscribeCortadosServerRoom,
   type CortadosRoomSign,
   type CortadosServerRoom,
-  type CortadosServerState,
 } from "@/features/retro-office/core/cortadosRooms";
 
 // Heights in world units (the nameplates float at 1.05 above a figure): the sign reads above the back wall, over the
@@ -27,7 +27,6 @@ const RACK_H = 1.15;
 const RACK_SIGN_Y = 1.5;
 const CONSOLE_H = 0.42;
 const CONSOLE_SIGN_Y = 1.35;
-const STATE_COLOR: Record<CortadosServerState, string> = { up: "#22c55e", down: "#ef4444", unknown: "#94a3b8" };
 
 function Plate({ width, title, note, color, y }: { width: number; title: string; note: string; color: string; y: number }) {
   return (

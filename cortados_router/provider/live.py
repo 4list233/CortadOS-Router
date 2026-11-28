@@ -1503,16 +1503,21 @@ def _tree_lobby(conv: dict[str, Any], groups: list[dict[str, Any]]) -> dict[str,
 OFFICE_SERVERS_PATH = "/v1/cortados/office/servers"   # clients.OFFICE_SERVERS_PATH (a test keeps the two equal)
 # Racks the room draws: the fleet is three machines and a PC; 8 bounds a misconfigured host list, never a real fleet.
 SERVER_RACKS_MAX = 8
-SERVER_HOST_STATES = ("up", "down", "unknown")
+SERVER_HOST_STATES = ("up", "stale", "down", "unknown")
+# Owner decision B9 (2026-11-28, OFFICE-CORTADOS-DESIGN.md): a host whose heartbeat has just passed its ttl_s may only
+# have missed a post or two (a busy job loop, a short sleep), not be down, so the server room shows it amber `stale`
+# for this long past its freshness limit, and red `down` only after.
+SERVER_STALE_WINDOW_S = 600.0
 _SERVER_HOST_KEYS = ("name", "state", "as_of", "provider")
 _SERVER_S1_KEYS = ("status", "health", "model", "as_of", "probe_ms", "p50_ms", "p90_ms", "calls_1h", "scored_1h",
                    "degraded_pct_1h", "degraded")
 
 
 def _server_host(it: dict[str, Any], provider_host: str | None, now: float) -> dict[str, Any] | None:
-    """One rack: `up` for the provider host (it is answering this request) or a host whose heartbeat is fresh, `down`
-    for a host whose heartbeat went stale (it stopped reporting), `unknown` for a host that never sent one since the
-    provider started. `as_of`: when that was known (the heartbeat's receipt; now for the provider host)."""
+    """One rack: `up` for the provider host (it is answering this request) or a host whose heartbeat is fresh, `stale`
+    for a host whose heartbeat passed its ttl_s at most SERVER_STALE_WINDOW_S ago (B9), `down` for one stale longer
+    (it stopped reporting), `unknown` for a host that never sent one since the provider started. `as_of`: when that
+    was known (the heartbeat's receipt; now for the provider host)."""
     name = office.clean(it.get("name"), _HOST_RE)
     if name is None:
         return None
@@ -1523,7 +1528,10 @@ def _server_host(it: dict[str, Any], provider_host: str | None, now: float) -> d
     elif it.get("heartbeat_state") == "fresh":
         state = "up"
     elif it.get("heartbeat_state") == "stale":
-        state = "down"
+        ttl = hb.get("ttl_s") if hb and _num(hb.get("ttl_s")) else None
+        # past the window, or a heartbeat without a readable receipt or ttl: down (never shown better than known)
+        late = now - at - ttl if at is not None and ttl is not None else None
+        state = "stale" if late is not None and late <= SERVER_STALE_WINDOW_S else "down"
     else:
         state, at = "unknown", None
     return {"name": name, "state": state, "as_of": _r(at, 3), "provider": name == provider_host}

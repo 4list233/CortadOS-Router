@@ -224,11 +224,15 @@ export function cortadosRoomSigns(agents: Array<{ id: string; name?: string | nu
 // (adapter.mjs OfficeGateway). GatewayBrowserClient.handleMessage hands every frame to cortadosNoteGatewayFrame (one
 // line, cortados-rooms.patch); anything that is not one of those two frames is ignored. Validated field by field, fixed
 // words and short strings only; a malformed room is dropped (the last good one stays), never drawn as given.
-export type CortadosServerState = "up" | "down" | "unknown";
+export type CortadosServerState = "up" | "stale" | "down" | "unknown";
+// The rack sign's colour per state (objects/cortadosSigns.tsx). Owner decision B9 (2026-11-28): a host whose heartbeat
+// stopped is amber `stale` for its first 10 minutes past the freshness limit (live.SERVER_STALE_WINDOW_S), then red.
+export const CORTADOS_SERVER_STATE_COLOR: Record<CortadosServerState, string> =
+  { up: "#22c55e", stale: "#f59e0b", down: "#ef4444", unknown: "#94a3b8" };
 export type CortadosRack = { host: string; name: string; state: CortadosServerState; note: string };
 export type CortadosConsole = { name: string; state: CortadosServerState; alert: boolean; working: boolean; note: string };
 export type CortadosServerRoom = { racks: CortadosRack[]; s1: CortadosConsole | null };
-const SERVER_STATES = new Set(["up", "down", "unknown"]);
+const SERVER_STATES = new Set(["up", "stale", "down", "unknown"]);
 const HOST_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const TEXT_MAX = 80;
 const shortString = (v: unknown): string | null =>

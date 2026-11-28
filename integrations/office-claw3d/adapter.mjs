@@ -446,7 +446,7 @@ export function mapTree(tree) {
 }
 
 // ---- the server room (office round 2, owner 2026-11-27) ----
-const SERVER_HOST_STATES = new Set(['up', 'down', 'unknown']);
+const SERVER_HOST_STATES = new Set(['up', 'stale', 'down', 'unknown']);   // live.SERVER_HOST_STATES (B9: stale)
 const SERVER_S1_STATES = new Set(['up', 'down', 'unknown']);
 const SERVER_RACKS_MAX = 8;            // live.SERVER_RACKS_MAX
 const nonNegative = value => finite(value) && value >= 0;
@@ -462,8 +462,8 @@ function ago(now, at) {
  * (office round 2 fix, owner 2026-11-27: hosts and S1 walked the floor as figures and filled the roster): the bridge
  * sends it as data in its hello (`snapshot.cortadosServers`) and in every office.snapshot event (`payload.servers`),
  * and the rooms patch draws a rack per host and the S1 console, each with its sign (claw3d/cortadosSigns.tsx).
- * `racks`: one per host, in the view's order: { host, name "Air", state up|down|unknown, note "up · provider" /
- * "up · 8 s ago" / "down · seen 14 min ago" / "no heartbeat" }. `s1`: { name "S1 · <served model>", state, note
+ * `racks`: one per host, in the view's order: { host, name "Air", state up|stale|down|unknown, note "up · provider" /
+ * "up · 8 s ago" / "stale · seen 18 min ago" / "down · seen 30 min ago" / "no heartbeat" }. `s1`: { name "S1 · <served model>", state, note
  * "up · p50 180 ms · p90 420 ms · 96 scored/h" and "· degraded" when the routing check warns, alert (down or degraded),
  * working (scored in the last hour) }. Numbers and fixed words only; nothing else of the view is kept.
  */
@@ -482,7 +482,8 @@ export function mapServers(view) {
     }
     seen.add(h.name);
     const note = h.state === 'up' ? (h.provider ? 'up · provider' : h.as_of !== null ? 'up · ' + ago(now, h.as_of) + ' ago' : 'up')
-      : h.state === 'down' ? (h.as_of !== null ? 'down · seen ' + ago(now, h.as_of) + ' ago' : 'down') : 'no heartbeat';
+      : h.state === 'stale' || h.state === 'down'
+        ? (h.as_of !== null ? h.state + ' · seen ' + ago(now, h.as_of) + ' ago' : h.state) : 'no heartbeat';
     racks.push({ host: h.name, name: hostLabel(h.name), state: h.state, note });
   }
   const s = view.s1;

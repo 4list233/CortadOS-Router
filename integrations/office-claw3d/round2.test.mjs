@@ -120,6 +120,19 @@ test('the server room is not people: a rack per host and the S1 console, numbers
   for (const x of room.racks) assert.deepEqual(new Set(Object.keys(x)), keys);
 });
 
+test('B9: a host stale for its first 10 minutes is amber "stale · seen N min ago", then "down"', () => {
+  const v = servers();
+  const pc = v.hosts.items.find(h => h.host === 'pc' || h.name === 'pc');
+  pc.state = 'stale';
+  pc.as_of = v.generated_at - 1080;
+  const r = mapServers(v).racks.find(x => x.host === 'pc');
+  assert.deepEqual([r.state, r.note], ['stale', 'stale · seen 18 min ago']);
+  pc.as_of = null;
+  assert.equal(mapServers(v).racks.find(x => x.host === 'pc').note, 'stale');
+  pc.state = 'late';
+  assert.throws(() => mapServers(v), /invalid office servers host/);
+});
+
 test('S1 down or degraded is an alert; nothing scored is not working', () => {
   const s = servers();
   s.s1.degraded = true;

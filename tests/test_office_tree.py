@@ -359,6 +359,29 @@ class ServerRoom(unittest.TestCase):
                          [("air", "up", NOW, True), ("studio", "up", NOW - 8, False),
                           ("pro", "unknown", None, False), ("pc", "down", NOW - 1800, False)])
 
+    def test_stale_then_down_b9(self):
+        """Owner B9 (2026-11-28): amber `stale` for SERVER_STALE_WINDOW_S past the heartbeat's ttl_s, then red `down`."""
+        self.assertEqual(live.SERVER_STALE_WINDOW_S, 600.0)
+
+        def pc_state(age, heartbeat_state):
+            snap = self.snap()
+            pc = next(it for it in snap["hosts"]["items"] if it["name"] == "pc")
+            pc["heartbeat_state"] = heartbeat_state
+            pc["heartbeat"].update(received_at=NOW - age, age_s=age, stale=heartbeat_state == "stale")
+            hosts = live.office_servers(snap)["hosts"]["items"]
+            return next((h["state"], h["as_of"]) for h in hosts if h["name"] == "pc")
+        self.assertEqual(pc_state(60, "fresh"), ("up", NOW - 60))                    # fresh
+        self.assertEqual(pc_state(901, "stale"), ("stale", NOW - 901))               # just past ttl_s 900
+        self.assertEqual(pc_state(900 + 600, "stale"), ("stale", NOW - 1500))        # 10 min past it: still amber
+        self.assertEqual(pc_state(900 + 601, "stale"), ("down", NOW - 1501))         # older: red
+        self.assertEqual(pc_state(1800, "stale"), ("down", NOW - 1800))
+        # a stale heartbeat without a readable ttl is never shown better than down
+        snap = self.snap()
+        next(it for it in snap["hosts"]["items"] if it["name"] == "pc")["heartbeat"].update(received_at=NOW - 901,
+                                                                                            ttl_s=None)
+        self.assertEqual(next(h["state"] for h in live.office_servers(snap)["hosts"]["items"] if h["name"] == "pc"),
+                         "down")
+
     def test_s1_numbers(self):
         s1 = live.office_servers(self.snap())["s1"]
         self.assertEqual(s1, {"status": "up", "health": "up", "model": "s1-qwen3-4b-sft-v7", "as_of": NOW,

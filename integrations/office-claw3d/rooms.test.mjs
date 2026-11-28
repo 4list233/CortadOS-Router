@@ -533,6 +533,21 @@ test('server room: nobody is seated there; it is never an orchestrator room', ne
   assert.equal(stale.roomByGroup.get(MINE), 0);
 });
 
+test('B9: the rack sign colour per state (green up, amber stale, red down, grey unknown), drawn from cortadosRooms.ts', needsTs, async () => {
+  assert.deepEqual(rooms.CORTADOS_SERVER_STATE_COLOR,
+    { up: '#22c55e', stale: '#f59e0b', down: '#ef4444', unknown: '#94a3b8' });
+  // the signs file has no palette of its own: every rack is coloured by state through that table
+  const signs = await readFile(new URL('claw3d/cortadosSigns.tsx', HERE), 'utf8');
+  assert.match(signs, /CORTADOS_SERVER_STATE_COLOR as STATE_COLOR/);
+  assert.match(signs, /const color = STATE_COLOR\[rack\.state\];/);
+  assert.doesNotMatch(signs, /const STATE_COLOR/);
+  // a stale rack is a room the gateway hook accepts, with its state kept
+  const room = mapServers(structuredClone(SERVERS));
+  room.racks[0] = { ...room.racks[0], state: 'stale', note: 'stale · seen 18 min ago' };
+  assert.equal(rooms.cortadosParseServerRoom(room).racks[0].state, 'stale');
+  assert.equal(rooms.cortadosParseServerRoom({ racks: [{ ...room.racks[0], state: 'late' }], s1: null }), null);
+});
+
 test('server room data: the gateway hook keeps our bridge\'s room and ignores anything else', needsTs, () => {
   const room = mapServers(structuredClone(SERVERS));
   assert.deepEqual(rooms.cortadosParseServerRoom(room), room);
