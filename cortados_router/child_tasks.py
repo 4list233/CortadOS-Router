@@ -72,7 +72,7 @@ if __name__ == "__main__" and not __package__:
     # environment (it would shadow `tests`, `s1`, `cortados_router` in unrelated repos); put the root on sys.path here.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cortados_router import exec_hosts, paths, redact, session, workspaces  # noqa: E402
+from cortados_router import exec_hosts, paths, redact, session, steer as steer_notes, workspaces  # noqa: E402
 from cortados_router.safe_text import escape_controls, quoted  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -158,6 +158,11 @@ ORCHESTRATOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,80}")
 MIN_TOKEN_LEN = 8                   # same floor as subagent_mcp.route_task: shorter is not a provider token, and a
                                     # shorter one could not be redacted without mangling ordinary words
 CHILD_MAX_S_DEFAULT = 3 * 3600      # an unattended child that never ends burns quota (override: CORTADOS_CHILD_MAX_S)
+# A sub-orchestrator (delegate: true) waits on 3 h workers and then verifies and merges them: 6 h (owner decision
+# 2026-11-27, docs/STEER-TASK.md "A"). Every other child, its workers included, keeps CHILD_MAX_S_DEFAULT.
+SUB_ORCHESTRATOR_MAX_S_DEFAULT = 6 * 3600
+MAX_S_ENV = "CORTADOS_CHILD_MAX_S"
+SUB_MAX_S_ENV = "CORTADOS_SUB_ORCHESTRATOR_MAX_S"
 # Recovery runs inside status/list/prune/wait calls, so its TERM->KILL wait is short: a full KILL_GRACE_S per crashed
 # task would stall every such call; a child that was going to exit cleanly on TERM does so within seconds.
 RECOVERY_GRACE_S = 5
@@ -332,8 +337,10 @@ OUTCOME_INCOMPLETE = "incomplete"
 # start handler marks a refusal that launched nothing (`failure.refused`), so the requester settles it at once.
 # cancel_many (review r6, P2): one request cancels several ids, each answered by id (list_tasks forwards a host's
 # pending cancels in one round trip).
+# steer (docs/STEER-TASK.md): the `steer` op, a steering note appended to the host's task dir; steer_task requires it
+# too, before it sends anything.
 REMOTE_CAPABILITIES = ("depth", "delegate", "start_id", "cancel_tombstone", "status_tombstone", "start_refusal",
-                       "cancel_many")
+                       "cancel_many", "steer")
 # The requester's cache of hosts that confirmed REMOTE_CAPABILITIES, in its tasks root: one handshake per host per
 # CAPABILITY_CACHE_S, so a plain start does not pay a second ssh round trip each time. Only a confirmation is cached
 # (a refused host is asked again next time: an updated checkout is picked up at once); an entry is keyed by the host's
@@ -403,7 +410,8 @@ SUB_ORCHESTRATOR_DIRECTIVE = (
     "task_status before treating a worker as ended; one still `running` is waited on again (or cancelled). Never end "
     "your turn while a worker you started is still running. When you end, every worker still running is cancelled "
     "and your task is marked incomplete, unless your final message names it on a line of its own as `HANDOFF: <task "
-    "id>` (a deliberate handoff to the main session). If you fail, are cancelled or hit your run-time cap, your "
+    "id>` (a deliberate handoff to the main session). If you fail, are cancelled or hit your run-time cap (6 h; "
+    "each worker has 3 h), your "
     "workers are cancelled. Your final message is returned to the main session: end with what was done and by which worker (task id and "
     "final state of EVERY child you started), what you verified, and anything left undone.")
 
@@ -975,16 +983,19 @@ def fetch_run(provider_url: str, token: str, run_id: str, timeout_s: float = RUN
     return {k: data[k] for k in ("model", "label", "provider", "models", "builder_models", "refusals") if k in data}
 
 
-def _max_s() -> int:
-    raw = os.environ.get("CORTADOS_CHILD_MAX_S")
+def _max_s(delegate: bool = False) -> int:
+    """The run-time cap of a new task: SUB_ORCHESTRATOR_MAX_S_DEFAULT (override SUB_MAX_S_ENV) for a sub-orchestrator,
+    else CHILD_MAX_S_DEFAULT (override MAX_S_ENV). A bad override is refused, never replaced by the default."""
+    var, default = (SUB_MAX_S_ENV, SUB_ORCHESTRATOR_MAX_S_DEFAULT) if delegate else (MAX_S_ENV, CHILD_MAX_S_DEFAULT)
+    raw = os.environ.get(var)
     if raw is None or raw.strip() == "":
-        return CHILD_MAX_S_DEFAULT
+        return default
     try:
         v = int(raw)
     except ValueError:
-        raise TaskError(f"CORTADOS_CHILD_MAX_S={raw!r} is not a whole number of seconds") from None
+        raise TaskError(f"{var}={raw!r} is not a whole number of seconds") from None
     if v <= 0:
-        raise TaskError(f"CORTADOS_CHILD_MAX_S={raw!r} must be positive")
+        raise TaskError(f"{var}={raw!r} must be positive")
     return v
 
 
@@ -1483,7 +1494,7 @@ def _tombstoned(d: str) -> bool:
     return isinstance(res, dict) and res.get("tombstone") is True
 
 
-def _require_capabilities(root: str, target) -> None:
+def _require_capabilities(root: str, target, what: str = "start_task") -> None:
     """Refuse ANY remote start on a host that does not speak the current remote-start protocol (fix round 4: older
     hosts are not supported), BEFORE anything is sent or recorded. Confirmed hosts are cached for CAPABILITY_CACHE_S
     (_cached_capabilities), so only the first start in that window pays the handshake's ssh round trip."""
@@ -1495,12 +1506,12 @@ def _require_capabilities(root: str, target) -> None:
     try:
         caps = _remote(target.name, "capabilities", {})
     except TaskError as exc:
-        raise TaskError(f"start_task refused: execution host {target.describe()} did not confirm the current "
+        raise TaskError(f"{what} refused: execution host {target.describe()} did not confirm the current "
                         f"remote-start protocol ({exc}); nothing was sent. If the host is reachable, {update}") from None
     have = caps.get("capabilities") if isinstance(caps, dict) else None
     missing = [c for c in REMOTE_CAPABILITIES if not (isinstance(have, list) and c in have)]
     if missing:
-        raise TaskError(f"start_task refused: execution host {target.describe()} lacks {', '.join(missing)} (an older "
+        raise TaskError(f"{what} refused: execution host {target.describe()} lacks {', '.join(missing)} (an older "
                         f"cortados-router checkout there); nothing was sent: {update}")
     _update_capabilities(root, target, have, seen)
 
@@ -2076,7 +2087,7 @@ def _start_task(progress, task, cwd, orchestrator, permission_mode, allowed_tool
             provider_url = session.resolve_provider_url()
         except session.ProviderURLError as exc:
             raise TaskError(f"start_task is not configured: {exc}") from None
-    max_s = _max_s()
+    max_s = _max_s(delegate)
     exe = claude_bin(target.claude)
     root = _private_root()
     prune_errors: list = []
@@ -2368,7 +2379,8 @@ def _abort_runner(runner, d: str) -> bool:
 
 def _run_spec(cwd, max_s, meta, workspace=None, ws_root=None, launchd=False, chrome=False) -> dict:
     """cmd.json: what the runner needs. cwd is None until the runner prepares the workspace (it then fills it in)."""
-    return {"cwd": cwd, "max_s": max_s, "grace_s": KILL_GRACE_S, "event": _event_fields(meta),
+    return {"cwd": cwd, "max_s": max_s, "max_s_env": SUB_MAX_S_ENV if meta.get("delegate") else MAX_S_ENV,
+            "grace_s": KILL_GRACE_S, "event": _event_fields(meta),
             "started_at": meta["started_at"], "workspace": workspace, "workspace_root": ws_root,
             "launchd": launchd, "chrome": chrome,
             "chrome_lock": os.path.join(tasks_dir(), CHROME_LOCK) if chrome else None}
@@ -2389,7 +2401,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
     # `--orchestrator-band any`: a child's main loop keeps S1's free routing (the launcher's default R3 window is for
     # the owner's own routed session; windowing child tasks would be a separate decision).
     launch = ["--orchestrator", orchestrator, "--orchestrator-band", "any", "--provider-url", provider_url,
-              "--settings-dir", d, "--run-id", task_id]
+              "--settings-dir", d, "--run-id", task_id, "--steer-dir", d]   # steering hook (docs/STEER-TASK.md)
     if token_file:
         launch += ["--token-file", token_file]
     for k, v in (office or {}).items():         # validated by office_tags; session.py checks them again
@@ -2470,6 +2482,7 @@ def _prepare(d, task_id, task, cwd, orchestrator, permission_mode, tools, provid
             "started_at": time.time(), "connectors": sorted(selected) if selected else [],
             "chrome": chrome, "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps,
             "host": host_name, "launch": "launchd" if launchd else "spawn", "depth": depth, "delegate": bool(delegate),
+            "steer": True,                      # its settings carry the steering hook: steer() may queue notes for it
             "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None,
             # argv carries only the model, settings path and flags; the token lives in the 0600 settings file and env.
             "argv": cmd[1:], **({"office": office} if office else {})}
@@ -2536,8 +2549,12 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
     # provider, which a login session neither has nor should reach).
     # named session-*.json so _remove_settings deletes it like the routed child's file when the child exits
     settings = os.path.join(d, "session-login.json")
+    try:
+        steer_hooks = session.steer_hook_entries(d, cwd)    # the steering hook, as a routed child's (docs/STEER-TASK.md)
+    except session.SessionError as exc:
+        raise TaskError(f"cannot prepare the child session: {exc}") from None
     with open(os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
-        json.dump({"enabledPlugins": {session.PLUGIN_ID: False}}, f)
+        json.dump({"enabledPlugins": {session.PLUGIN_ID: False}, "hooks": steer_hooks}, f)
     cmd += ["--settings", settings, "--disallowedTools", ",".join(CHROME_DISALLOWED_TOOLS), "--chrome",
             "--append-system-prompt", CHILD_DIRECTIVE + "\n\n" + CHROME_DIRECTIVE]
     env = login_env(os.environ)
@@ -2553,6 +2570,7 @@ def _prepare_login(d, task_id, task, cwd, orchestrator, permission_mode, tools, 
             # Login-mode children never route through CortadOS, so carry no Office identity into lifecycle events.
             "max_s": max_s, "runner_pid": None, "cred_fingerprints": launch_fps, "argv": cmd[1:],
             "host": host_name, "launch": "launchd" if launchd else "spawn", "depth": depth, "delegate": False,
+            "steer": True,
             "workspace": {"kind": workspace["kind"], "repo": workspace.get("name"), "branch": workspace.get("branch")} if workspace else None}
     _write_json(os.path.join(d, "cmd.json"), {"argv": cmd, **_run_spec(cwd, max_s, meta, workspace, ws_root, launchd, True)})
     _write_json(os.path.join(d, "meta.json"), meta)
@@ -2886,6 +2904,11 @@ def status(task_id, red=None, provider_url="", token="", deadline=None) -> dict:
         out["delegate"] = True
     if meta.get("parent_task_id"):
         out["parent_task_id"] = meta["parent_task_id"]
+    if meta.get("steer") is True:
+        try:
+            out["steer"] = steer_notes.counts(d)        # counts only: the note text never leaves the task dir here
+        except (OSError, steer_notes.SteerError) as exc:
+            out["steer"] = {"error": f"steering notes unreadable: {type(exc).__name__}"}
     kids = children_of(d)
     if kids:
         # ids while it runs; with states once the runner recorded its end-of-run report (_children_report). Shown
@@ -3567,6 +3590,90 @@ def list_recent(n=20, ids=None) -> list:
     for row in rows:
         row.pop("origin_machine", None)         # a capability (ORIGIN_KEYS), never in a tool result
     return rows
+
+
+STEER_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _refuse_steer(msg: str, **fields):
+    """A steering refusal by scope: counted (a `refused` event, reason steer_scope; metadata only), then raised."""
+    log_event("refused", reason="steer_scope", **{k: v for k, v in fields.items() if v is not None})
+    raise TaskError(msg)
+
+
+def steer(task_id, text) -> dict:
+    """Queue a steering note for a RUNNING child task (docs/STEER-TASK.md). Allowed to the main session (depth 0) for
+    any task this machine knows, and to a sub-orchestrator for its own workers (caller_identity, the same ancestry rule
+    as start_task); refused for anyone else, for an ended task and for a task without the steering hook. A remote task
+    is forwarded to its host by id (`steer` op, after the capability check). The child gets the note at its next tool
+    boundary, once. Events carry ids only, never the text."""
+    try:
+        note = steer_notes.check_text(text)
+    except steer_notes.SteerError as exc:
+        raise TaskError(f"steer_task refused: {exc}") from None
+    if not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id):
+        task_path(task_id)                      # raises the usual "invalid task_id" error
+    try:
+        caller = caller_identity()
+    except TaskError as exc:
+        _refuse_steer(f"steer_task refused: cannot tell who is calling ({exc})", task_id=task_id)
+    who = caller["task_id"] if caller else None
+    if caller is not None:
+        if caller["depth"] >= MAX_DEPTH or not caller["delegate"]:
+            _refuse_steer("steer_task refused: only the main session, or a sub-orchestrator for its own workers, may "
+                          f"steer a task; this is a {'worker' if caller['depth'] >= MAX_DEPTH else 'plain child'} "
+                          "task", task_id=task_id, caller_task_id=who, caller_depth=caller["depth"])
+        if task_id not in children_of(caller["dir"]):
+            _refuse_steer(f"steer_task refused: {task_id} is not one of this sub-orchestrator's workers; a "
+                          "sub-orchestrator steers only the tasks it started", task_id=task_id, caller_task_id=who)
+    d = task_path(task_id)
+    stub = _stub(d)
+    if stub:
+        return _steer_remote(d, task_id, stub, note, who)
+    state, meta, _ = _state(d)
+    if state != "running":
+        raise TaskError(f"steer_task refused: task {task_id} has ended ({state}); a steering note reaches only a "
+                        "running task")
+    if meta.get("steer") is not True:
+        raise TaskError(f"steer_task refused: task {task_id} was started before steering existed (its session has no "
+                        "steering hook), so a note could never reach it")
+    try:
+        sid, pending = steer_notes.add(d, note)
+    except steer_notes.SteerError as exc:
+        raise TaskError(f"steer_task refused: {exc}") from None
+    log_event("steer_sent", task_id=task_id, steer_id=sid,
+              **({"host": meta["host"]} if meta.get("host") else {}), **({"caller_task_id": who} if who else {}))
+    return {"task_id": task_id, "steer_id": sid, "state": "queued", "pending": pending,
+            "note": "delivered to the child's main loop at its next tool call, once; task_status shows the counts"}
+
+
+def _steer_remote(d: str, task_id: str, stub: dict, note: str, who) -> dict:
+    """A steering note for a task on another host: refused unless its start is confirmed and no cancel is owed, then
+    one `steer` op on the host after the cached capability check (nothing is sent to a host without `steer`)."""
+    host = stub["host"]
+    if _REMOTE_SERVING:                         # a stub on the host itself: forwarding again would be a loop
+        raise TaskError(f"steer_task refused: task {task_id} does not run on this execution host either (it is "
+                        f"recorded for {host})")
+    if stub.get(START_FAILED):
+        raise TaskError(f"steer_task refused: task {task_id} is {START_FAILED} (never started on {host})")
+    if stub.get(START_UNCONFIRMED):
+        raise TaskError(f"steer_task refused: task {task_id}'s start on {host} is not confirmed yet; call task_status "
+                        "first")
+    if _cancel_pending(d) or os.path.exists(os.path.join(d, "cancelled")):
+        raise TaskError(f"steer_task refused: task {task_id} is being cancelled")
+    _require_capabilities(os.path.dirname(d), _resolve_host(host), "steer_task")
+    try:
+        out = _remote(host, "steer", {"task_id": task_id, "text": note})
+    except NoSuchRemoteTask:
+        raise TaskError(f"steer_task refused: execution host {host} has no task {task_id} (pruned there)") from None
+    if not (isinstance(out, dict) and out.get("task_id") == task_id and isinstance(out.get("steer_id"), str)
+            and STEER_ID_RE.fullmatch(out["steer_id"])):
+        raise TaskError(f"execution host {host} answered steer without the note's id; it may or may not be queued: "
+                        f"task_status {task_id} shows the pending count")
+    log_event("steer_sent", task_id=task_id, steer_id=out["steer_id"], host=host,
+              **({"caller_task_id": who} if who else {}))
+    out["host"] = host
+    return out
 
 
 def cancel(task_id) -> dict:
@@ -5321,6 +5428,21 @@ def _prepare_run(d: str, spec: dict) -> None:
         check_login_settings(spec["cwd"])
 
 
+STEER_POLL_S = 1.0          # how often the runner looks for notes the child's hook marked delivered
+
+
+def _log_deliveries(d: str, seen: set) -> None:
+    """A `steer_delivered` event (metadata only: task id and note id) for each id the steering hook newly marked."""
+    try:
+        ids = steer_notes.delivered_ids(d)
+    except (OSError, steer_notes.SteerError):
+        return                                  # unreadable now: the next pass (or the final one) tries again
+    for sid in ids:
+        if sid not in seen and STEER_ID_RE.fullmatch(sid):
+            seen.add(sid)
+            log_event("steer_delivered", task_id=os.path.basename(d), steer_id=sid)
+
+
 def _run(d: str, lock_fd=None) -> int:
     flag = {"term": False, "pre": False}
     holder = {"proc": None}
@@ -5362,6 +5484,7 @@ def _run(d: str, lock_fd=None) -> int:
                                     start_new_session=True, preexec_fn=_child_record_writer(d))
             holder["proc"] = proc
             pgid = proc.pid
+            steer_seen, steer_next = set(), 0.0     # before the try: the final _log_deliveries below always has them
             try:
                 if flag["pre"]:
                     flag["term"] = True         # the SIGTERM landed while Popen ran: stop the child now
@@ -5369,12 +5492,16 @@ def _run(d: str, lock_fd=None) -> int:
                 deadline = time.monotonic() + max_s
                 cancelled_marker = os.path.join(d, "cancelled")
                 while proc.poll() is None:
+                    if time.monotonic() >= steer_next:
+                        steer_next = time.monotonic() + STEER_POLL_S
+                        _log_deliveries(d, steer_seen)
                     if not flag["term"] and os.path.exists(cancelled_marker):
                         flag["term"] = True     # marked without a signal (a cancel while the task was starting)
                     if flag["term"] or time.monotonic() >= deadline:
                         if not flag["term"]:
                             result["timed_out"] = True
-                            result["error"] = f"child exceeded {max_s} s (CORTADOS_CHILD_MAX_S) and was terminated"
+                            result["error"] = (f"child exceeded {max_s} s ({spec.get('max_s_env') or MAX_S_ENV}) "
+                                               "and was terminated")
                         _stop_group(proc, pgid, grace)
                         break
                     time.sleep(0.1)
@@ -5387,6 +5514,7 @@ def _run(d: str, lock_fd=None) -> int:
                 _stop_group(proc, pgid, grace)
             result["exit_code"] = proc.returncode
             result["cancelled"] = flag["term"]
+            _log_deliveries(d, steer_seen)     # a note the child took in its last moments
     except _CancelledBeforeSpawn:
         result["cancelled"] = True
         result["error"] = "cancelled before the child was started"
@@ -5586,6 +5714,11 @@ def serve_remote(stdin=None, stdout=None) -> int:
                         depth=args.get("depth"), task_id=args.get("task_id"))
         elif op == "capabilities":
             out = {"capabilities": list(REMOTE_CAPABILITIES)}
+        elif op == "steer" and _absent_here(args):
+            tid = args["task_id"]
+            return reply(False, f"no such task {tid}", {"absent": True, "task_id": tid})
+        elif op == "steer":
+            out = steer(args.get("task_id"), args.get("text"))
         elif op in ("status", "wait", "cancel") and _absent_here(args):
             # The authoritative "no such task id" a requester's start_unconfirmed intent waits for (review r3, P1):
             # a structured answer, so the requester never infers it from free text or from ssh.

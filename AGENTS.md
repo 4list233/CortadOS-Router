@@ -46,7 +46,11 @@ is the long form.
   self-contained subtask to the `cortados` provider endpoint and returns the routed model's text; stdlib, runs standalone),
   `child_tasks.py` (whole tasks as headless Claude Code children; `--run` runner, `--remote` host side, `--cleanup-archive`;
   the runner appends each finished run, redacted, to the append-only `$CORTADOS_HOME/exports/task-runs.jsonl` for
-  Grounds (#91, README "Task run export"); a task dir whose export failed is never pruned),
+  Grounds (#91, README "Task run export"); a task dir whose export failed is never pruned; `steer()` queues a steering
+  note for a running child, main session any task, a sub-orchestrator its own workers, remote by the `steer` op;
+  sub-orchestrators have a 6 h cap, every other child 3 h; docs/STEER-TASK.md),
+  `steer.py` (standalone: a task's `steer.jsonl` note store and the child's PostToolUse/PostToolUseFailure hook that
+  hands pending notes to its main loop as `additionalContext`, once; installed by `session.py --steer-dir`),
   `orchestrator_usage.py` (the owner's main Claude Code sessions' own tokens from local transcripts, direct-model
   subagents included as a sub-total; child-task transcripts, the provider's bridge/search-lane scratch-dir transcripts
   and provider-served messages excluded; sent in the heartbeat's `orchestrator` block, README "Work split"),

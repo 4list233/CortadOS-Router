@@ -74,7 +74,7 @@ reads as depth 1, no delegate). The new task's depth is that + 1 (0 + 1 when the
   itself still finds that child's runner) and applies the same rules.
 - **Every remote start needs the current protocol (fix round 4; all hosts deploy from the same main).** Any start on
   another host, plain or nested, first needs the host's `capabilities` (`REMOTE_CAPABILITIES`: `depth`, `delegate`,
-  `start_id`, `cancel_tombstone`, `status_tombstone`, `start_refusal`, `cancel_many`). A host on an older checkout (it answers "unknown
+  `start_id`, `cancel_tombstone`, `status_tombstone`, `start_refusal`, `cancel_many`, `steer` (docs/STEER-TASK.md)). A host on an older checkout (it answers "unknown
   remote operation", or lacks one) is refused BEFORE anything is recorded or sent, with "update this host's
   cortados-router checkout". **The capability cache:** a confirmation is kept in the requester's tasks root
   (`host-capabilities.json`, per host name + ssh destination + router path) for `CAPABILITY_CACHE_S` (10 min), so only
@@ -209,9 +209,11 @@ not see that child's runner as the caller of every in-process start. Not an env 
     every worker not ended is cancelled.
   - Workers that could not be cancelled (their host did not answer) are `children_unreachable`, with a warning
     (`task_status.warnings`, the watcher's `warnings` count) for follow-up.
-- **The run-time cap is unchanged** (`CORTADOS_CHILD_MAX_S`, 3 h, for sub-orchestrators too). A sub-orchestrator
-  waiting on 3 h workers can hit it first, which now cancels those workers. A larger cap for `delegate` tasks is an
-  owner decision still pending ([ESCALATE] 2 below).
+- **The run-time cap** (owner decision 2026-11-27, docs/STEER-TASK.md "A"): a sub-orchestrator has 6 h
+  (`SUB_ORCHESTRATOR_MAX_S_DEFAULT`, override `CORTADOS_SUB_ORCHESTRATOR_MAX_S`); its workers and every other child keep
+  3 h (`CORTADOS_CHILD_MAX_S`). Hitting it still cancels the sub-orchestrator's workers.
+- **Steering** (docs/STEER-TASK.md): the main session may steer any running task it knows, a sub-orchestrator only its
+  own workers (`steer_task`, the same ancestry rule as start_task); workers and plain children are refused.
 
 ### Waiting (the reliable blocking wait)
 
@@ -255,8 +257,8 @@ outside the child-task boundary, stated plainly rather than closed:
    orchestrator, the owner may adjust): workers not named on a HANDOFF line are cancelled and the outcome is
    `incomplete` (state `failed`). See "Lifecycle".
 2. **A sub-orchestrator that fails or hits its time cap.** Default implemented: its workers are cancelled, unreachable
-   ones listed for follow-up. **Still pending:** its cap is the children's (`CORTADOS_CHILD_MAX_S`, 3 h, unchanged); a
-   larger cap for `delegate` tasks would be a new user-visible default.
+   ones listed for follow-up. **Decided 2026-11-27:** a sub-orchestrator's cap is 6 h, every other child's 3 h
+   (docs/STEER-TASK.md "A").
 3. **No delegation gate in a sub-orchestrator.** Children run with `--no-gate`; "act directly only for trivial steps"
    is an instruction, not enforced by `orchestrator_gate.py`'s budget.
 4. **The refusal counter.** The task named "the existing depth_limit / concurrency_limit / budget counters"; no such

@@ -440,7 +440,7 @@ class ProcessTreeTests(NestedBase):
     def test_a_sub_orchestrator_at_its_run_time_cap_cancels_its_workers(self):
         gc = self.folder("gc")
         out, w, w1 = self.run_child("suborch-sleep", delegate=True, FAKE_GC_MODE="sleep", FAKE_GC_CWD=gc,
-                                    CORTADOS_CHILD_MAX_S="6", FAKE_GC_MAX_S="600")
+                                    CORTADOS_SUB_ORCHESTRATOR_MAX_S="6", FAKE_GC_MAX_S="600")
         gid = _load(os.path.join(w1, "start-result.json"))["out"]["task_id"]
         self.assertEqual(w["state"], "failed", w)
         self.assertTrue(w.get("timed_out"), w)

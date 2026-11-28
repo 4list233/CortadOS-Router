@@ -3083,7 +3083,10 @@ class ChildTaskTests(ChildTaskBase):
         self.assertEqual(meta["cred_fingerprints"], [])
         sp = a[a.index("--settings") + 1]
         self.assertEqual(os.path.basename(sp), "session-login.json")
-        self.assertEqual(seen["settings"], {"mode": 0o600, "body": {"enabledPlugins": {ct.session.PLUGIN_ID: False}}})
+        # the plugin switch, and the steering hook only (docs/STEER-TASK.md): no env, no secret
+        self.assertEqual(seen["settings"], {"mode": 0o600, "body": {
+            "enabledPlugins": {ct.session.PLUGIN_ID: False},
+            "hooks": ct.session.steer_hook_entries(os.path.dirname(sp), meta.get("cwd"))}})
         self.assertFalse(os.path.exists(sp))   # removed with the child, like the routed child's settings file
         self.assertEqual(a[a.index("--model") + 1], "claude-sonnet-5-5")
         self.assertIn("--chrome", a)

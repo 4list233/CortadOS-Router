@@ -9,9 +9,11 @@ provider's GET /v1/cortados/local and POST /v1/cortados/local/switch (owner toke
 inside a CortadOS child task: it routes nothing and spends no quota, and the owner may hand a child the job of turning
 local models on or off; it works wherever this server has the provider URL and the owner token.
 
-It also serves the child-task tools (start_task, task_status, wait_task, list_tasks, cancel_task): whole tasks run as
-separate headless Claude Code sessions on this machine (see cortados_router/child_tasks.py, imported lazily because it
-needs the package; route_task does not).
+It also serves the child-task tools (start_task, task_status, wait_task, list_tasks, cancel_task, steer_task): whole
+tasks run as separate headless Claude Code sessions on this machine (see cortados_router/child_tasks.py, imported lazily
+because it needs the package; route_task does not). steer_task (docs/STEER-TASK.md) queues a short note for a RUNNING
+child, delivered at its next tool call; only the main session, or a sub-orchestrator for its own workers, may call it,
+and the bot gateway does not expose it.
 
 Stdlib only; runs standalone (the MCP client launches it as a subprocess over stdio); route_task imports nothing from the
 package. It forwards to the provider — it does NOT need to sit next to S1 or the provider; it only needs to reach the
@@ -194,8 +196,8 @@ CHILD_TOOLS = [
                       "a SUB-ORCHESTRATOR that plans the task, starts its own worker tasks (one more layer: its "
                       "workers can never start tasks), verifies them and reports with every worker's id and state. "
                       "It gets start_task/route_task and the other task tools; cancelling it cancels its workers. "
-                      "Use it for a big task that splits into several independent pieces. Refused from inside a "
-                      "child task and with chrome: true."},
+                      "It may run 6 h (every other child: 3 h). Use it for a big task that splits into several "
+                      "independent pieces. Refused from inside a child task and with chrome: true."},
          "chrome": {"type": "boolean", "description": "Opt-in (default false): LOGIN MODE. The child runs directly on "
                     "the user's claude.ai login (NOT routed by S1; spends the main Claude subscription) so Claude in "
                     "Chrome loads; it acts in the user's real signed-in Chrome in its own tab group. Model: cortados -> "
@@ -228,6 +230,19 @@ CHILD_TOOLS = [
     {"name": "cancel_task",
      "description": "Terminate a running child task (its own process group only, on whichever execution host runs it).",
      "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]}},
+    {"name": "steer_task",
+     "description": ("Send a short steering note to a RUNNING child task (on whichever execution host runs it). The "
+                     "child sees it once, after its next tool call, as \"Steering note from the owner's orchestrator: "
+                     "<text>\". Use it to correct course (a wrong file, a changed requirement, stop after step 2); "
+                     "it is guidance text only and changes none of the child's tools or permissions. Main session: "
+                     "any task; a sub-orchestrator: only its own workers; refused for workers, plain children, "
+                     "ended tasks and tasks started before steering existed. task_status shows pending/delivered "
+                     "counts."),
+     "inputSchema": {"type": "object", "properties": {
+         "task_id": {"type": "string", "description": "The id start_task returned."},
+         "message": {"type": "string", "description": "The note: 1-2000 printable characters (newlines and tabs "
+                     "allowed). Never secrets: it is kept in the task's folder and in the child's conversation."}},
+         "required": ["task_id", "message"]}},
 ]
 _CHILD_NAMES = {t["name"] for t in CHILD_TOOLS}
 
@@ -453,6 +468,8 @@ def call_child_tool(name: str, a: dict, cfg: dict) -> dict:
         elif name == "list_tasks":
             ids = a.get("ids")                  # internal (bot gateway): not advertised in the schema
             out = {"tasks": ct.list_recent(a.get("limit", 20), ids if isinstance(ids, list) else None)}
+        elif name == "steer_task":
+            out = ct.steer(a.get("task_id"), a.get("message"))
         else:
             out = ct.cancel(a.get("task_id"))
     except ct.TaskError as exc:

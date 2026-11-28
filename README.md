@@ -779,7 +779,7 @@ older checkout that does not confirm it adds a warning to the result; `docs/LOCA
   was not for that long (a vanished task record or a host that stopped answering counts as unreadable; when every
   failed read in that window was a local error — a corrupt record on this machine, a permission — the line says so,
   `unwatchable`, exit 2: the watcher cannot read it, which says nothing about the task). Thirty minutes is above any
-  single tool call seen on a child and far below the child's 3 h cap, so a hung child surfaces hours earlier. A task
+  single tool call seen on a child and far below the child's 3 h cap (6 h for a sub-orchestrator), so a hung child surfaces hours earlier. A task
   with a `phase` (`queued` for the host's Chrome lock) writes nothing while it waits, so it gets a longer window: the
   runner's own 6 h queue cap (`CHROME_QUEUE_MAX_S`: a third chrome task legitimately waits behind two) plus the 30 min
   (`WATCH_QUEUED_STALL_S`), after which a lock that never changed hands is reported as stalled too. Stalled is a
@@ -1075,8 +1075,15 @@ export succeeded (see "Task run export" below). A task record that
   are checked, so a reused pid is never signalled) and shows the unredacted logs only when the current credentials match
   the launch ones by sha256 fingerprint; otherwise it withholds them.
 - Limits: no cap on parallel children (capacity is the router's job: S1 and the quota gates refuse or redirect a spent
-  lane); 3 h per child (`CORTADOS_CHILD_MAX_S`), after which claude's process group gets SIGTERM, then SIGKILL 30 s
-  later (cancel does the same); a child cannot start children.
+  lane); 3 h per child (`CORTADOS_CHILD_MAX_S`) and 6 h per sub-orchestrator (`delegate: true`,
+  `CORTADOS_SUB_ORCHESTRATOR_MAX_S`; owner 2026-11-27), after which claude's process group gets SIGTERM, then SIGKILL
+  30 s later (cancel does the same); only a sub-orchestrator starts children (docs/NESTED-TASKS.md).
+- Steering (`steer_task(task_id, message)`, docs/STEER-TASK.md): the main session (any task), or a sub-orchestrator
+  (its own workers), sends a note of at most 2000 printable characters to a RUNNING child; the child's PostToolUse hook
+  (`cortados_router/steer.py`, installed in its settings file) hands it to the child's main loop after its next tool
+  call, once, as `additionalContext` ("Steering note from the owner's orchestrator: …"). Remote tasks: forwarded to the
+  host by id (remote op `steer`, a required host capability). `task_status` shows `steer: {pending, delivered}`;
+  `child-tasks.jsonl` gets `steer_sent` / `steer_delivered` with ids only, never the text. The Office stays read-only.
 - The token is read from `~/.config/cortados/provider-token` (or `CORTADOS_PROVIDER_TOKEN_FILE`). Both it and
   `CORTADOS_PROVIDER_TOKEN` are redacted from everything the tools return; a token shorter than 8 characters is refused
   (it could not be redacted safely). The desktop app

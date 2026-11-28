@@ -122,15 +122,23 @@ RECOVERABLE_MAX = 128
 # active conversation is not made to pay a rebuild.
 PRESSURE_MIN_IDLE_S = 120.0
 # The longest a conversation's x-cortados-run-id earns it the tool-wait idle limit, counted from its first request
-# carrying that id: a child task's own maximum run time (child_tasks.CHILD_MAX_S_DEFAULT, CORTADOS_CHILD_MAX_S). A run
-# this host's log never records ending (a task on another host, or any syntactically valid header) cannot hold a
-# conversation past it; after it the conversation is reaped at the normal IDLE_S.
-try:
-    CHILD_RUN_MAX_S = float(int(getenv("CORTADOS_CHILD_MAX_S") or 3 * 3600))
-    if CHILD_RUN_MAX_S <= 0:
-        raise ValueError
-except ValueError:
-    CHILD_RUN_MAX_S = 3 * 3600.0
+# carrying that id: the longest maximum run time a child task can have. That is a sub-orchestrator's
+# (child_tasks.SUB_ORCHESTRATOR_MAX_S_DEFAULT, 6 h, CORTADOS_SUB_ORCHESTRATOR_MAX_S) or a plain child's
+# (CHILD_MAX_S_DEFAULT, 3 h, CORTADOS_CHILD_MAX_S), whichever is larger: the provider cannot tell the two run ids apart
+# (docs/STEER-TASK.md, [ESCALATE] 1). A run this host's log never records ending (a task on another host, or any
+# syntactically valid header) cannot hold a conversation past it; after it the conversation is reaped at the normal
+# IDLE_S.
+def _cap_s(var: str, default: int) -> float:
+    try:
+        v = float(int(getenv(var) or default))
+        if v <= 0:
+            raise ValueError
+        return v
+    except ValueError:
+        return float(default)
+
+
+CHILD_RUN_MAX_S = max(_cap_s("CORTADOS_CHILD_MAX_S", 3 * 3600), _cap_s("CORTADOS_SUB_ORCHESTRATOR_MAX_S", 6 * 3600))
 
 
 def recover_ttl_s() -> float:

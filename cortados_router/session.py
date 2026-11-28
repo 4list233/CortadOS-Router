@@ -242,6 +242,29 @@ def boundary_hook_entry(project: str | None = None, python: str | None = None, l
             "hooks": [{"type": "command", "command": command, "timeout": 30}]}
 
 
+STEER_HOOK_FILE = Path(__file__).resolve().with_name("steer.py")
+# docs/STEER-TASK.md: after each tool call (also a failed one) of a child's main loop, steer.py hands the model the
+# owner's pending steering notes as additionalContext. 10 s: the hook only reads and appends two small files.
+STEER_HOOK_EVENTS = ("PostToolUse", "PostToolUseFailure")
+STEER_HOOK_TIMEOUT_S = 10
+
+
+def steer_hook_entries(steer_dir: str, project: str | None = None, python: str | None = None) -> dict:
+    """{event: [entry]} running `<absolute python3> -I -S -B <absolute steer.py> --hook <task dir>` (shell-quoted) for
+    every STEER_HOOK_EVENTS event, matcher `*`. Like the boundary hook, the script and interpreter must lie outside the
+    project folder (the child may write there). Not guarded: the hook always exits 0, and a hook that cannot start is a
+    non-blocking error, so the tool result stands and the note waits."""
+    if not (isinstance(steer_dir, str) and os.path.isabs(steer_dir)):
+        raise SessionError("--steer-dir must be an absolute path")
+    if _inside_project(str(STEER_HOOK_FILE), project):
+        raise SessionError(BOUNDARY_HOOK_INSIDE_PROJECT)
+    python = python or boundary_hook_python(project)
+    command = (shlex.quote(python) + " -I -S -B " + shlex.quote(str(STEER_HOOK_FILE)) + " --hook "
+               + shlex.quote(steer_dir))
+    entry = {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": STEER_HOOK_TIMEOUT_S}]}
+    return {ev: [entry] for ev in STEER_HOOK_EVENTS}
+
+
 def custom_headers(run_id: str | None = None, office_headers=None, local: str | None = None) -> str:
     """ANTHROPIC_CUSTOM_HEADERS (newline-separated `name: value` lines). With a run id, every request of the session is
     recorded by the provider under it (GET /v1/cortados/runs/<id>); office headers (`name: value` items, OFFICE_HEADERS
@@ -329,10 +352,10 @@ def build_env(base: dict, provider_url: str, token: str, delegate_budget: int = 
 def settings_content(provider_url: str, token: str, delegate_budget: int = 3, gate: bool = True,
                      run_id: str | None = None, office_headers=None, local: str | None = None,
                      project: str | None = None, eager_tools: bool = False, local_pick: bool = False,
-                     watch_prefix: str | None = None) -> dict:
+                     watch_prefix: str | None = None, steer_dir: str | None = None) -> dict:
     """project: the session's project folder when known (child tasks: --project-dir); the boundary hook's interpreter
     and script must lie outside it. local_pick / watch_prefix: boundary_hook_entry's (a session launched with a local
-    pick)."""
+    pick). steer_dir: a child task's dir; its steering hook (steer_hook_entries) is installed."""
     # disableAllHooks false: a user settings file cannot switch the boundary hook off while the header says it runs.
     content = {"env": launcher_env(provider_url, token, delegate_budget, run_id, office_headers, local,
                                    eager_tools=eager_tools),
@@ -344,6 +367,8 @@ def settings_content(provider_url: str, token: str, delegate_budget: int = 3, ga
         command = "python3 -B " + shlex.quote(str(Path(__file__).resolve().with_name("orchestrator_gate.py")))
         pre.append({"matcher": "*", "hooks": [{"type": "command", "command": command}]})
     content["hooks"] = {"PreToolUse": pre}
+    if steer_dir is not None:
+        content["hooks"].update(steer_hook_entries(steer_dir, project))
     return content
 
 
@@ -975,6 +1000,8 @@ def parse(argv: list):
     ap.add_argument("--project-dir", default=None, help=argparse.SUPPRESS)
     # child tasks only (child_tasks.start, after its connector budget check): tool search off, TOOL_SEARCH_OFF
     ap.add_argument("--eager-tools", action="store_true", help=argparse.SUPPRESS)
+    # child tasks only: the task dir whose steering notes the child's PostToolUse hook delivers (docs/STEER-TASK.md)
+    ap.add_argument("--steer-dir", default=None, help=argparse.SUPPRESS)
     return ap.parse_args(argv), extra
 
 
@@ -1007,6 +1034,7 @@ def pick_route(args, url: str, token: str, *, home: str | None, stdin, out, fetc
                 local = None                     # offline: as typed; the provider checks them
         return canonical_route(args.route, served, local)
     if (explicit or args.no_route_prompt or args.print_env or args.run_id or args.project_dir or args.eager_tools
+            or args.steer_dir
             or not (_tty(stdin) and _tty(out))):
         return None
     err_saved = None
@@ -1095,7 +1123,8 @@ def prepare(argv: list, base_env: dict, managed_dirs=MANAGED_SETTINGS_DIRS, home
                                                     office, args.local, args.project_dir, eager_tools=eager,
                                                     local_pick=is_local_route(route),
                                                     watch_prefix=(local_watch_prefix(base_env)
-                                                                  if is_local_route(route) else None)),
+                                                                  if is_local_route(route) else None),
+                                                    steer_dir=args.steer_dir),
                                    home)
     return (args, build_env(base_env, url, token, args.delegate_budget, args.run_id, office, args.local,
                             eager_tools=eager),
