@@ -140,12 +140,31 @@ into the handback / PR. Codex and Cursor: read that file and follow it the same 
   the tracker for five days in November 2026).
 - The top-level orchestrator is the only writer of #60. It updates the section when a branch merges, a review lands,
   a decision is made or a session pauses. Delegates and child tasks report back; they do not edit it.
+- Everything is tracked in issues (owner 2026-11-28): every action item and every open owner decision has an issue on
+  4list233/CortadOS-Router, and an open owner decision carries the label `needs-owner` until Forest decides it.
+  #60's "Live status" is the index that links them, not a place for untracked items. A delegate that finds a new
+  item or an open decision reports it; the top-level orchestrator files the issue and links it from #60.
 - The drift check runs at session start and before any merge:
   `python3 -B scripts/tracker_check.py`
   It is read-only (`gh issue list` / `gh issue view` and local git refs) and reports open issues whose branch is
   already merged, unmerged local branches that no open issue mentions, and the age of the Live status date (warning
   past 2 days). Exit 0 clean, 1 drift, 2 the check could not run; a failed check is never a clean result. Tests:
   `tests/test_tracker_check.py` (fakes only, no GitHub call).
+
+## Standards for every task
+Owner rule 2026-11-28: every build task follows the owner's engineering standard
+(4list233/Ai-Coding-std-workflow: `standards/00-ENGINEERING-STANDARD.md`, `standards/01-QA-GATES.md`) and the
+CortadOS Stack lifecycle (4list233/cortados-stack: `cstack/LIFECYCLE.md`). Read them; this section only says what a
+delegated build brief must contain, so a child that cannot see the chat still works to them (reason: a brief that
+leaves the gates out gets work without them).
+- Goal, context (paths, branch, prior decisions; the child sees no chat), scope and difficulty stated plainly, and
+  every outward effect (push, post, send, deploy, issue edits) named.
+- An acceptance check with a runnable command.
+- The standard's gates, named in the brief: spec with that acceptance check → focused tests → the full suite
+  (`python3 -B -m unittest discover -s tests -t .`) → review by a different task than the builder (any model;
+  task identity is what must differ, LIFECYCLE.md REVIEW). The builder never approves its own work.
+- The task's Stack role (LIFECYCLE.md §2: worker, verifier, reviewer, ...). Once Stack stage 1 (#133) is live, build
+  tasks are started with a Stack profile/role through `start_task`; until then the role is stated in the brief.
 
 ## Delegating subtasks through the router (route_task)
 
