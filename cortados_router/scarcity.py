@@ -213,7 +213,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     The boot window starts when the CLI first paints (its own start-up is waited for separately, up to boot_s); the read
     after a trust answer (answer_trust only) gets a fresh boot_s, as on main (#144 fix round 6 restored it).
     `settling` is (kind, still_settling, allowance_s): when the boot read ends with `ready` not on screen and
-    `still_settling(screen)` true (the CLI shows only a progress notice, e.g. agy's "Signing in..." while it refreshes
+    `still_settling(raw screen)` true (the raw screen: decoded, escapes kept; the CLI shows only a progress notice, e.g. agy's "Signing in..." while it refreshes
     its saved login), the read goes on, still typing nothing, until `ready` appears, the screen stops settling (a
     prompt that `refuse` refuses mid-read, or anything else, judged as usual) or `allowance_s` seconds have passed since
     the CLI first painted; then it refuses `kind` (check "settling"). `refuse` keeps being checked on every read.
@@ -357,13 +357,16 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
             # nothing is typed while waiting, and every read is still checked against `refuse` (pump)
             settle_kind, still_settling, allowance_s = settling
 
-            def settled(shown: str) -> bool:
-                return bool(ready and _screen_has(ready, shown)) or not still_settling(shown)
-            if not settled(_plain(buf)):
+            def settled(_shown: str = "") -> bool:
+                # still_settling gets the RAW screen (escapes kept, decoded): _plain drops cursor movement, so a
+                # question repainted below a spinner by cursor-up would read as one line ending "Signing in..."
+                return (bool(ready and _screen_has(ready, _plain(buf)))
+                        or not still_settling(buf.decode("utf-8", "replace")))
+            if not settled():
                 settle_end = painted_at + allowance_s
-                while not eof and time.time() < settle_end and not settled(_plain(buf)):
+                while not eof and time.time() < settle_end and not settled():
                     pump(settle_end - time.time(), until=settled)
-                if not eof and not settled(_plain(buf)):
+                if not eof and not settled():
                     exc = refusal(settle_kind, stage, "settling", True, _plain(buf))
                     exc.facts["allowance_s"] = allowance_s
                     raise exc
@@ -801,16 +804,36 @@ _AGY_PROMPT_MARKERS = (r"https?://|www\.|browser|\bcode\b|\bpress\b(?!\s+(?:ctrl
                        r"|^\s*[>›❯]?\s*\d+[.)]\s|\?\s*$")
 
 
+# Where one screen FRAGMENT ends (review r1, 2026-11-27): a newline, a carriage return, and every CSI sequence that moves
+# the cursor or erases (cursor up/down/forward/back, next/previous line, column, position, vertical position, erase in
+# display/line, scroll, scroll region). _plain drops cursor-up, so "Continue?\x1b[1A\r\x1b[2K Signing in..." flattened to
+# one line ending "Signing in..." although "Continue?" stays on screen below the spinner; split here, each piece that
+# was ever painted is checked on its own.
+_AGY_FRAGMENT_BREAK = re.compile(rb"\r|\n|\x1b\[[0-9;?]*[A-HJKSTdfr]")
+
+
+def _agy_fragments(raw: str) -> str:
+    """The screen text with one fragment per line (see _AGY_FRAGMENT_BREAK); other escapes removed as by _plain."""
+    return _plain(_AGY_FRAGMENT_BREAK.sub(b"\n", raw.encode("utf-8", "replace")))
+
+
 def agy_signing_in(shown: str) -> bool:
     """True while agy shows only its sign-in PROGRESS notice: the last "not signed in" notice has no account line after
-    it, a "Signing in" spinner follows it, and nothing after it asks for anything (no sign-in rule, no prompt marker)."""
-    hits = list(re.finditer(_AGY_NOT_SIGNED_IN, shown, re.I))
+    it, a "Signing in" spinner follows it, and nothing after it asks for anything (no sign-in rule, no prompt marker).
+    `shown` is the raw screen (escapes kept). The prompt markers are tested against every FRAGMENT after the last notice
+    (split at newlines, carriage returns and cursor-movement / erase sequences), so a question or menu repainted under
+    or over the spinner still counts as a prompt; the other checks read the plain text."""
+    plain = _plain(shown.encode("utf-8", "replace"))
+    hits = list(re.finditer(_AGY_NOT_SIGNED_IN, plain, re.I))
     if not hits:
         return False
-    after = shown[hits[-1].end():]
+    after = plain[hits[-1].end():]
     if _agy_iso.banner_tier(after) is not None or not re.search(_AGY_SIGNING_IN, after, re.I):
         return False
-    if re.search(_AGY_PROMPT_MARKERS, after, re.I | re.M):
+    frags = _agy_fragments(shown)
+    frag_hits = list(re.finditer(_AGY_NOT_SIGNED_IN, frags, re.I))
+    frag_after = frags[frag_hits[-1].end():] if frag_hits else frags      # the notice itself split: judge all of it
+    if any(re.search(_AGY_PROMPT_MARKERS, piece, re.I) for piece in frag_after.split("\n")):
         return False
     return not any(re.search(rule, after, re.I) for name, rule in _AGY_SIGN_IN_RULES if name != "not-signed-in-notice")
 

@@ -284,6 +284,28 @@ class ProbeHonesty(AgyBase):
             with self.subTest(prompt=prompt[-40:]):
                 self.assertFalse(sc.agy_signing_in(prompt))
 
+    def test_a_question_repainted_around_the_spinner_is_a_prompt(self):
+        # review r1: _plain drops cursor movement, so a question left on screen by a cursor-up repaint flattened into
+        # the spinner's line and read as progress; every fragment after the notice is checked on its own now
+        for prompt in (SIGNING_IN + "Continue?\x1b[1A\r\x1b[2K Signing in...",                  # the reviewer's repro
+                       SIGNING_IN + "\x1b[1A\r\x1b[2K ⣯ Signing in...\x1b[1BRetry sign-in?\x1b[1A\r ⣟ Signing in...",
+                       SIGNING_IN + "\x1b[2B\x1b[1G1) Retry\x1b[1G2) Quit\x1b[3A\r\x1b[2K ⣯ Signing in..."):
+            with self.subTest(prompt=prompt[-50:]):
+                self.assertFalse(sc.agy_signing_in(prompt))
+        # cursor movement alone, with no question, is still progress
+        self.assertTrue(sc.agy_signing_in(SIGNING_IN + "\x1b[1A\r\x1b[2K ⣯ Signing in...\x1b[1B\x1b[1A\r ⣟ Signing in..."))
+
+    def test_a_repainted_question_is_refused_not_logged_in_at_once(self):
+        binary, log = self.fake({"boot": SIGNING_IN + "Continue?\x1b[1A\r\x1b[2K Signing in...", "spin_s": 30,
+                                 "boot_later": [BANNER], "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "not-logged-in")
+        self.assertLess(time.time() - t0, 20)                   # judged at once, not after the allowance
+        self.assertEqual(self.keys(log), b"")
+
     def test_progress_notice_then_account_line_after_20_s_is_read(self):
         binary, log = self.fake({"boot": SIGNING_IN, "spin_s": 20, "boot_later": [BANNER],
                                  "usage": FIXTURE.read_text()})
