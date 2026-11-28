@@ -395,6 +395,19 @@ class HeartbeatTests(OfficeHarness):
         self.beat({"session": SESSION, "status": "ended"})
         self.assertIsNone(self.view()[0]["floors"][0]["orchestrator"])
 
+    def test_an_address_like_name_is_dropped_and_every_heartbeat_still_lands(self):
+        # Reviewer 2026-11-28: the session title is free text; one holding an address made each heartbeat a 400, so the
+        # session's status and its final `ended` never reached the Office. The provider drops the name instead.
+        self.post({"model": "cortados", "messages": [{"role": "user", "content": "hello"}]},
+                  headers={**TAGS, "x-cortados-run-id": "run-hb-0002"})
+        code, body = self.beat({"session": SESSION, "status": "working", "tool": "Bash", "name": "Debug 192.168.1.10"})
+        self.assertEqual(code, 200)
+        o = self.view()[0]["floors"][0]["orchestrator"]
+        self.assertEqual((o["status"], o["tool"], o["name"]), ("working", "Bash", None))
+        self.assertNotIn("192.168", json.dumps(self.view()[0]))
+        self.assertEqual(self.beat({"session": SESSION, "status": "ended", "name": "Debug 192.168.1.10"})[0], 200)
+        self.assertIsNone(self.view()[0]["floors"][0]["orchestrator"])
+
     def test_heartbeat_ttl_expiry(self):
         b = office.OfficeBoard()
         t0 = 1_000_000.0
@@ -494,6 +507,23 @@ class ChildTaskViewTests(OfficeHarness):
         self.assertEqual((w["status"], w["tool"]), ("error", None))
         self.assertIsNotNone(w["ended_at"])
 
+    def test_a_record_slightly_in_the_future_still_counts(self):
+        # #154: log_event rounded ts to the millisecond, up to 0.5 ms ahead of the reader's clock, and the office
+        # dropped every ts > now, so a record written just before a view was read flickered out. Now ts is floored
+        # and the reader allows office.CHILD_TS_SKEW_S of skew; further ahead is still not real activity.
+        now, tid = 1_800_000_000.0, "t20261104120000-0a1b2c40"
+        ev = lambda ts: [{"event": "started", "task_id": tid, "ts": ts, "title": "just now"}]
+        for ahead in (0.0005, 0.001, office.CHILD_TS_SKEW_S):
+            self.assertEqual(len(office.recent_child_events(ev(now + ahead), now)), 1, ahead)
+            w = office.OfficeBoard().view(office.recent_child_events(ev(now + ahead), now), now=now)["lobby"]["workers"]
+            self.assertEqual([x["run_id"] for x in w], [tid], ahead)
+        self.assertEqual(office.recent_child_events(ev(now + office.CHILD_TS_SKEW_S + 0.001), now), [])
+        # and the writer never writes a ts ahead of its own clock
+        with mock.patch.object(child_tasks.time, "time", return_value=1_800_000_000.0009):
+            child_tasks.log_event("started", task_id=tid)
+        rec = json.loads((Path(os.environ["CORTADOS_HOME"]) / child_tasks.EVENT_LOG).read_text().splitlines()[-1])
+        self.assertEqual(rec["ts"], 1_800_000_000.0)
+
     def test_a_long_queued_child_stays_open_until_its_end_event(self):
         # Review (2026-11-11): the Office read only 4 h of the child log, so a child that waited hours for the Chrome
         # lock lost its start event and its idle worker turned "done" 11 min after its last turn.
@@ -532,9 +562,10 @@ class ChildTaskViewTests(OfficeHarness):
     def test_child_timestamp_window_is_two_sided_and_inclusive(self):
         now = 100_000.0
         make = lambda ts: {"event": "started", "task_id": "run-window-001", "ts": ts}
-        for ts in (now, now - office.CHILD_WINDOW_S):
+        # the future side allows office.CHILD_TS_SKEW_S of clock skew (#154)
+        for ts in (now, now + office.CHILD_TS_SKEW_S, now - office.CHILD_WINDOW_S):
             self.assertEqual(set(office._children([make(ts)], now)), {"run-window-001"})
-        for ts in (now + .001, now - office.CHILD_WINDOW_S - .001):
+        for ts in (now + office.CHILD_TS_SKEW_S + .001, now - office.CHILD_WINDOW_S - .001):
             self.assertEqual(office._children([make(ts)], now), {})
 
     def test_login_mode_events_do_not_create_floors_or_lobby_workers(self):

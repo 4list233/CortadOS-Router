@@ -40,8 +40,23 @@ OFFICE_VECTORS_TS = (Path(__file__).resolve().parents[1]
                      / "integrations/claude-mod/cortados-routed-subagents/hooks/office-vectors.fixture.ts")
 
 
+# The session name (office round 2; reviewer 2026-11-28): [title as Claude Code holds it, what the mod's
+# officeSessionName sends (None = omitted)]. Every sent value must be one the provider keeps (office.session_name) and
+# every address-holding title is omitted, so the mod's own filter and the provider's cannot drift into a 400 or a leak.
+# The provider's two address patterns ride along: the mod's OFFICE_IPV4_RE / OFFICE_IPV6_RE must have the same source.
+SESSION_NAME_VECTORS = [
+    ["Office round 2", "Office round 2"], ["  Fix   the\trouter  ", "Fix the router"], ["caf\u00e9 rooms", "caf rooms"],
+    ["x" * 70, "x" * 64], ["\u00e9\u00e9", None], ["", None], [None, None],
+    ["Debug 192.168.1.10", None], ["ssh 10.0.0.7 slow", None], ["tailnet fd7a:115c:a1e0::1", None],
+    ["MAC aa:bb:cc:dd:ee:ff", None], ["a::b", None], ["x" * 60 + " 10.0.0.7", None],
+    ["qwen2.5:7b at 04:00:00", "qwen2.5:7b at 04:00:00"], ["v1.2.3 release", "v1.2.3 release"],
+]
+
+
 def office_vectors():
-    return {"office_name": OFFICE_NAME_VECTORS, "session_tag": HASH_VECTOR}
+    from cortados_router.provider import usage
+    return {"office_name": OFFICE_NAME_VECTORS, "session_tag": HASH_VECTOR, "session_name": SESSION_NAME_VECTORS,
+            "address_patterns": {"ipv4": usage._IPV4_RE.pattern, "ipv6": usage._IPV6_RE.pattern}}
 
 
 def write_office_vectors():
@@ -2071,6 +2086,16 @@ class ChildTaskTests(ChildTaskBase):
     def test_office_vectors_fixture(self):
         text = OFFICE_VECTORS_TS.read_text()
         self.assertEqual(json.loads(text.split("export default ", 1)[1]), office_vectors())
+
+    def test_session_name_vectors_match_the_provider_rule(self):
+        # the mod's answers (pinned in the vectors, checked against officeSessionName by register.test.ts) are the
+        # provider's: a sent name is kept as is, and an omitted one is one the provider would drop
+        from cortados_router.provider import office
+        for raw, sent in SESSION_NAME_VECTORS:
+            if sent is not None:
+                self.assertEqual(office.session_name(sent), (sent, None), raw)
+            elif isinstance(raw, str) and raw.strip():
+                self.assertIsNone(office.session_name(raw)[0], raw)
 
     def test_the_bot_origin_is_written_once(self):
         from cortados_router import bot_gateway

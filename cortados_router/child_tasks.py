@@ -47,6 +47,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import plistlib
 import re
@@ -942,7 +943,9 @@ def _remove_settings(d: str) -> list:
 def log_event(event: str, **fields):
     """Append one JSON line to $CORTADOS_HOME/child-tasks.jsonl. Only ids, settings, status and timings: never the prompt
     or a secret. Returns None, or the error text (the caller records it; a log failure must not kill a task)."""
-    rec = {"ts": round(time.time(), 3), "event": event, **fields}
+    # floored, not rounded (#154): a rounded ts can be up to 0.5 ms in the future, and a reader dropping future events
+    # (office._child_timestamp) then missed a record written just before it looked
+    rec = {"ts": math.floor(time.time() * 1000) / 1000, "event": event, **fields}
     try:
         d = paths.state_dir()
         d.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,7 @@ routed request is never refused over one, because routing must not depend on a c
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import threading
@@ -86,6 +87,30 @@ _TOOL_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 # address-looking. It is the session's own label (the owner's /rename, else Claude Code's short session title), never
 # prompt text: the mod sends only the transcript's title records (integrations/claude-mod, officeSessionName).
 SESSION_NAME_RE = re.compile(r"[\x20-\x7e]{1,64}")
+# A heartbeat's `name` that breaks the rule is DROPPED, never a 400 (reviewer 2026-11-28: a title such as
+# "Debug 192.168.1.10" made every heartbeat of its session, `ended` included, a 400). Counted per reason and logged by
+# reason only: the text is the client's and may hold the very address the rule keeps out. The mod applies the same
+# rule first (integrations/claude-mod officeSessionName; kept equal by the office-vectors fixture).
+NAME_DROP_REASONS = ("type", "format", "address")
+NAME_DROPS: dict[str, int] = {r: 0 for r in NAME_DROP_REASONS}
+_NAME_DROPS_LOCK = threading.Lock()
+logger = logging.getLogger("cortados.provider.office")
+
+
+def session_name(raw: Any) -> tuple[str | None, str | None]:
+    """(name, None) for an absent or valid heartbeat `name`, else (None, the reason in NAME_DROP_REASONS)."""
+    if raw is None or raw == "":
+        return None, None
+    if not isinstance(raw, str):
+        return None, "type"
+    v = raw.strip()
+    if not v or not SESSION_NAME_RE.fullmatch(v):
+        return None, "format"
+    if _has_address(v):
+        return None, "address"
+    return v, None
+
+
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")       # server._RUN_ID_RE
 ORCHESTRATOR_STATUSES = ("working", "idle", "ended")   # what a heartbeat may say; `ended` removes it
 WORKER_STATUSES = ("working", "idle", "error", "done")
@@ -411,7 +436,8 @@ class OfficeBoard:
 
 def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
     """(heartbeat, None) or (None, the name of the bad field). Unlike the routed headers a heartbeat is refused when
-    malformed: it is this endpoint's own request, and a 400 tells the mod its sender is broken."""
+    malformed: it is this endpoint's own request, and a 400 tells the mod its sender is broken. The one exception is
+    `name`, free text from the owner's session title: a bad one is dropped (session_name, NAME_DROPS), never a 400."""
     if not isinstance(body, dict):
         return None, "body"
     unknown = sorted(set(body) - {"session", "project", "device", "model", "status", "tool", "client", "name"})
@@ -431,7 +457,7 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
         return None, "client"                    # the value is not echoed: it is client text
     out["client"] = client or None
     for field, rule in (("project", _HEADER_RULES[PROJECT_HEADER]), ("device", _HEADER_RULES[DEVICE_HEADER]),
-                        ("model", _MODEL_RE), ("tool", _TOOL_RE), ("name", SESSION_NAME_RE)):
+                        ("model", _MODEL_RE), ("tool", _TOOL_RE)):
         raw = body.get(field)
         if raw is None or raw == "":
             out[field] = None
@@ -440,6 +466,11 @@ def validate_heartbeat(body: Any) -> tuple[dict[str, Any] | None, str | None]:
         if v is None:
             return None, field
         out[field] = v
+    out["name"], dropped = session_name(body.get("name"))
+    if dropped is not None:
+        with _NAME_DROPS_LOCK:
+            NAME_DROPS[dropped] += 1
+        logger.info("office: heartbeat name dropped (%s)", dropped)
     return out, None
 
 
@@ -468,9 +499,15 @@ def recent_child_events(events: list[dict[str, Any]], now: float) -> list[dict[s
     return [e for e in events if isinstance(e, dict) and _child_timestamp(e.get("ts"), now)]
 
 
+# How far in the future a child-task record may be and still count (#154): the writer floors its ts to the millisecond,
+# but its clock reading and the reader's `now` can still differ by a little (two processes, a coarse clock). One second
+# allows that and nothing more: a record further ahead is not real activity.
+CHILD_TS_SKEW_S = 1.0
+
+
 def _child_timestamp(ts: Any, now: float, window_s: float = CHILD_WINDOW_S) -> bool:
     # The log is local: future events are not real activity. Bound both sides before converting even huge integers.
-    return (type(ts) in (int, float) and now - window_s <= ts <= now and math.isfinite(ts))
+    return (type(ts) in (int, float) and now - window_s <= ts <= now + CHILD_TS_SKEW_S and math.isfinite(ts))
 
 
 def _children(events: list[dict[str, Any]], now: float) -> dict[str, dict[str, Any]]:

@@ -3,7 +3,7 @@ import { SHARED_SALT_TRIES, SHARED_SALT_RETRY_MS } from './register'
 import officeVectors from './office-vectors.fixture'
 import { resolveProviderUrl, officeTitle, officeName, baseName, sessionTag, officeHeaderLines, OFFICE_SALT_KEY, OFFICE_BEAT_MIN_MS, OFFICE_BEAT_REFRESH_MS, OFFICE_BEAT_TIMEOUT_MS } from './register'
 import { BG_SWEEP_SH, BG_SWEEP_MS, sweepBackgroundRuns } from './register'
-import { officeSessionName, sessionNameFromRecords, OFFICE_NAME_TYPES, OFFICE_SESSION_NAME_MAX } from './register'
+import { officeSessionName, sessionNameFromRecords, OFFICE_NAME_TYPES, OFFICE_SESSION_NAME_MAX, OFFICE_IPV4_RE, OFFICE_IPV6_RE, hasAddress } from './register'
 
 // Office round 2 (owner 2026-11-27): the session's name, from the transcript's title records only.
 test('session name: the newest /rename title wins, else the newest AI title, else none', () => {
@@ -20,6 +20,26 @@ test('session name: the newest /rename title wins, else the newest AI title, els
   expect(sessionNameFromRecords('')).toBe(null)
   expect(sessionNameFromRecords('not json\n{"type":"custom-title","customTitle":7}')).toBe(null)
   expect(OFFICE_NAME_TYPES).toEqual(['custom-title', 'ai-title'])
+})
+
+test('session name: the provider\'s rule, address filter included (vectors from tests.test_child_tasks)', () => {
+  // the provider's own pattern sources, written into the fixture by Python: a change on either side fails here
+  const p = (officeVectors as any).address_patterns
+  expect(OFFICE_IPV4_RE.source).toBe(p.ipv4)
+  expect(OFFICE_IPV6_RE.source).toBe(p.ipv6)
+  for (const [raw, want] of (officeVectors as any).session_name) expect(officeSessionName(raw)).toBe(want)
+  expect(hasAddress('Debug 192.168.1.10')).toBe(true)
+  expect(hasAddress('qwen2.5:7b')).toBe(false)
+})
+
+test('session name: an address-like newest title is omitted, and an older title does not come back', () => {
+  const lines = [
+    '{"type":"custom-title","customTitle":"Rooms"}',
+    '{"type":"custom-title","customTitle":"Debug 192.168.1.10"}',
+    '{"type":"ai-title","aiTitle":"Office round 2"}',
+  ]
+  expect(sessionNameFromRecords(lines.join('\n'))).toBe('Office round 2')
+  expect(sessionNameFromRecords(lines.slice(0, 2).join('\n'))).toBe(null)
 })
 
 test('session name: printable ASCII, spaces collapsed, at most 64 characters', () => {
@@ -1483,6 +1503,21 @@ test('the heartbeat carries the session name from the transcript title records, 
   await g.settle()
   expect('name' in g.beats[0].body).toBe(false)
   expect(g.logs).toEqual([])
+})
+
+test('an address-like session title is left out of every heartbeat, and the ended heartbeat still lands', async () => {
+  // Reviewer 2026-11-28: the provider refused the whole heartbeat for such a name (it now drops it); the mod omits it.
+  const h = officeHarness({ titles: '{"type":"custom-title","customTitle":"Debug 192.168.1.10"}\n' })
+  const next = async (e: any) => e
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, next)
+  await h.settle()
+  await h.handlers['session.end'](h.$, {}, next)
+  expect(h.beats.map((b) => b.body.status)).toEqual(['working', 'ended'])
+  for (const b of h.beats) {
+    expect('name' in b.body).toBe(false)
+    expect(b.init.body).not.toContain('192.168')
+  }
+  expect(h.logs).toEqual([])
 })
 
 test('routed requests carry the office tags before the run id, never the raw session id', async () => {

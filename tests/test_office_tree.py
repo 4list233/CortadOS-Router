@@ -294,9 +294,19 @@ class SessionName(unittest.TestCase):
         for none in (None, ""):
             self.assertIsNone(office.validate_heartbeat({**base, "name": none})[0]["name"])
         self.assertIsNone(office.validate_heartbeat(base)[0]["name"])
-        # too long, control characters, non-ASCII, an address, not a string: the heartbeat is refused, never cut here
-        for bad in ("a" * 65, "line\nbreak", "café", "ssh 10.0.0.7", 7, ["x"]):
-            self.assertEqual(office.validate_heartbeat({**base, "name": bad}), (None, "name"), bad)
+        # too long, control characters, non-ASCII, an address, not a string: the NAME is dropped, never cut here, and the
+        # heartbeat itself is accepted (reviewer 2026-11-28: "Debug 192.168.1.10" made every heartbeat a 400)
+        for bad, reason in (("a" * 65, "format"), ("line\nbreak", "format"), ("café", "format"),
+                            ("ssh 10.0.0.7", "address"), ("Debug 192.168.1.10", "address"), ("fd7a:115c::1", "address"),
+                            ("aa:bb:cc:dd:ee:ff", "address"), (7, "type"), (["x"], "type")):
+            before = dict(office.NAME_DROPS)
+            with self.assertLogs("cortados.provider.office", "INFO") as logs:
+                hb, err = office.validate_heartbeat({**base, "name": bad})
+            self.assertIsNone(err, bad)
+            self.assertEqual((hb["session"], hb["status"], hb["name"]), (ot.MINE, "working", None), bad)
+            self.assertEqual(office.NAME_DROPS[reason], before[reason] + 1, bad)
+            self.assertEqual(logs.output, [f"INFO:cortados.provider.office:office: heartbeat name dropped ({reason})"])
+            self.assertNotIn(str(bad), "".join(logs.output) if isinstance(bad, str) and len(bad) > 3 else "")
 
 
 class ServerRoom(unittest.TestCase):

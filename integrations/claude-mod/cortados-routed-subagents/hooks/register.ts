@@ -2186,16 +2186,33 @@ export const OFFICE_SESSION_NAME_MAX = 64
 /** At most this much grep output is read: title records are short, so more means something else matched. */
 const OFFICE_NAME_STDOUT_MAX = 256 * 1024
 
-/** A name the provider accepts: printable ASCII (anything else becomes a space), spaces collapsed, at most 64 chars. */
+/** The provider's address-looking rule (cortados_router/provider/usage.py _IPV4_RE / _IPV6_RE, applied to a name by
+ * office.clean): an IPv4, or '::' / 3+ colon-separated hex groups (IPv6, MAC). Mirrored, not shared (the mod cannot
+ * import Python): tests.test_child_tasks writes the provider's two pattern sources and the session-name vectors into
+ * office-vectors.fixture.ts and checks the file is current; register.test.ts checks these sources equal the fixture's
+ * and that officeSessionName gives every vector's answer. Change one side and a test fails until the other follows. */
+export const OFFICE_IPV4_RE = /[0-9]{1,3}(?:\.[0-9]{1,3}){3}/
+export const OFFICE_IPV6_RE = /::|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){3,}/
+/** Whether `s` holds an address-looking string (the provider's usage._has_address). */
+export function hasAddress(s: string): boolean {
+  return OFFICE_IPV4_RE.test(s) || OFFICE_IPV6_RE.test(s)
+}
+
+/** A name the provider accepts (office.SESSION_NAME_RE through office.clean): printable ASCII (anything else becomes a
+ * space), spaces collapsed, at most 64 chars, and nothing address-looking; null when nothing is left or it holds an
+ * address (reviewer 2026-11-28: a title such as "Debug 192.168.1.10" made every heartbeat a 400). The address check
+ * runs on the whole title too, so a cut cannot send part of an address the full title held. */
 export function officeSessionName(s: unknown): string | null {
-  const t = String(s ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/ +/g, ' ').trim().slice(0, OFFICE_SESSION_NAME_MAX).trim()
-  return t || null
+  const full = String(s ?? '').replace(/[^\x20-\x7e]+/g, ' ').replace(/ +/g, ' ').trim()
+  const t = full.slice(0, OFFICE_SESSION_NAME_MAX).trim()
+  if (!t || hasAddress(full) || hasAddress(t)) return null
+  return t
 }
 
 /** The session's name from grep's matched lines: the last custom title, else the last AI title, else null. Each line is
  * parsed; a line that is not one top-level title record of a known type is ignored. */
 export function sessionNameFromRecords(stdout: unknown): string | null {
-  const found: Record<string, string> = {}
+  const found: Record<string, string | null> = {}
   for (const line of String(stdout ?? '').slice(0, OFFICE_NAME_STDOUT_MAX).split('\n')) {
     if (!line.startsWith('{')) continue
     let rec: any
@@ -2203,7 +2220,8 @@ export function sessionNameFromRecords(stdout: unknown): string | null {
     if (!rec || typeof rec !== 'object' || !OFFICE_NAME_TYPES.includes(rec.type)) continue
     const raw = rec.type === 'custom-title' ? rec.customTitle : (rec.aiTitle ?? rec.title)
     const name = typeof raw === 'string' ? officeSessionName(raw) : null
-    if (name) found[rec.type] = name
+    // the newest record of its type decides, also when it is refused: an older title must not come back in its place
+    found[rec.type] = name
   }
   return found['custom-title'] ?? found['ai-title'] ?? null
 }

@@ -81,5 +81,71 @@ export default {
     "salt": "0123456789abcdef0123456789abcdef",
     "session_id": "792b087a-1983-4baf-b701-77792e4b77e4",
     "tag": "ea4383005613c21c"
+  },
+  "session_name": [
+    [
+      "Office round 2",
+      "Office round 2"
+    ],
+    [
+      "  Fix   the\trouter  ",
+      "Fix the router"
+    ],
+    [
+      "caf\u00e9 rooms",
+      "caf rooms"
+    ],
+    [
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    ],
+    [
+      "\u00e9\u00e9",
+      null
+    ],
+    [
+      "",
+      null
+    ],
+    [
+      null,
+      null
+    ],
+    [
+      "Debug 192.168.1.10",
+      null
+    ],
+    [
+      "ssh 10.0.0.7 slow",
+      null
+    ],
+    [
+      "tailnet fd7a:115c:a1e0::1",
+      null
+    ],
+    [
+      "MAC aa:bb:cc:dd:ee:ff",
+      null
+    ],
+    [
+      "a::b",
+      null
+    ],
+    [
+      "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 10.0.0.7",
+      null
+    ],
+    [
+      "qwen2.5:7b at 04:00:00",
+      "qwen2.5:7b at 04:00:00"
+    ],
+    [
+      "v1.2.3 release",
+      "v1.2.3 release"
+    ]
+  ],
+  "address_patterns": {
+    "ipv4": "[0-9]{1,3}(?:\\.[0-9]{1,3}){3}",
+    "ipv6": "::|[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){3,}"
   }
 }
