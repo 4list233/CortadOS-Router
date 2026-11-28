@@ -1415,7 +1415,7 @@ test('officeName and sessionTag agree with the Python copies (tests/test_child_t
 })
 
 /** The mod registered with a full host stand-in: the store, session id/root/model, hostname, clock and fetch. */
-function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string; sharedSalt?: string | null } = {}) {
+function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileUrl?: string; sharedSalt?: string | null; titles?: string } = {}) {
   const handlers: Record<string, any> = {}
   const on = (event: string, filterOrHandler: any, maybeHandler?: any) => {
     const key = maybeHandler ? `${event}:${filterOrHandler?.tool ?? filterOrHandler?.command ?? ''}` : event
@@ -1434,7 +1434,8 @@ function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileU
   let onSleep: (() => void) | null = null
   const $ = {
     store: { get: async (k: string) => store[k], set: async (k: string, v: unknown) => { store[k] = v } },
-    session: { id: async () => sid, root: async () => '/Users/someone/Ai/CortadOS-Router', model: async () => 'claude-opus-5-5' },
+    session: { id: async () => sid, root: async () => '/Users/someone/Ai/CortadOS-Router', model: async () => 'claude-opus-5-5',
+      info: async () => ({ transcriptPath: '/tmp/test-transcript.jsonl' }) },
     // only the salt retry's sleep returns: the background sweep session.start begins sleeps for good (an instant
     // sleep would spin its loop without ever yielding)
     clock: { now: async () => now, sleep: (ms: number) => ms === SHARED_SALT_RETRY_MS
@@ -1443,6 +1444,8 @@ function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileU
       run: async (argv: string[], o: any) => {
         if (argv[0] === 'hostname') return { exitCode: 0, stdout: 'pro\n', stderr: '' }
         if (argv[0] === 'sh') return { exitCode: 0, stdout: '\0\0/tmp/test-home', stderr: '' }
+        // the session name's title records (office round 2): grep exits 1 when the session is not named yet
+        if (argv[0] === '/usr/bin/grep') return { exitCode: opts.titles ? 0 : 1, stdout: opts.titles ?? '', stderr: '' }
         childHeaders.push(String(o.env.ANTHROPIC_CUSTOM_HEADERS))
         return { exitCode: 0, stdout: JSON.stringify({ result: 'done', model: 'cortados' }), stderr: '', isStdoutTruncated: false }
       },
@@ -1468,6 +1471,19 @@ function officeHarness(opts: { officeView?: boolean; providerUrl?: string; fileU
     setShared(v: string | null) { shared = v }, setSessionId(v: string) { sid = v },
     onSleep(f: (() => void) | null) { onSleep = f } }
 }
+
+test('the heartbeat carries the session name from the transcript title records, and none when it is unnamed', async () => {
+  const h = officeHarness({ titles: '{"type":"ai-title","aiTitle":"Office round 2"}\n{"type":"custom-title","customTitle":"Rooms"}\n' })
+  await h.handlers['tool.call'](h.$, { tool: 'Bash' }, async (e: any) => e)
+  await h.settle()
+  expect(h.beats[0].body.name).toBe('Rooms')
+  expect(h.logs).toEqual([])
+  const g = officeHarness()
+  await g.handlers['tool.call'](g.$, { tool: 'Bash' }, async (e: any) => e)
+  await g.settle()
+  expect('name' in g.beats[0].body).toBe(false)
+  expect(g.logs).toEqual([])
+})
 
 test('routed requests carry the office tags before the run id, never the raw session id', async () => {
   const h = officeHarness()
