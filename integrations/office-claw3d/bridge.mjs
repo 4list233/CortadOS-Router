@@ -24,7 +24,7 @@
 import http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
-import { OfficeGateway, isMainModule, mapTree, runPolling } from './adapter.mjs';
+import { OfficeGateway, isMainModule, mapServers, mapTree, runPolling } from './adapter.mjs';
 
 export const LOOPBACK_BIND = Object.freeze(['127.0.0.1', '::1']);
 const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -35,7 +35,15 @@ export const MAX_FRAME_BYTES = 64 * 1024;
 export const MAX_CLIENTS = 8;                  // one Studio proxy per open browser tab
 export const CONNECT_DEADLINE_MS = 10000;
 export const RATE_WINDOW_MS = 10000;
-export const RATE_MAX_FRAMES = 200;            // Studio's hydration burst is ~20 requests
+// Frames a client may send per window: a base plus an allowance per person on the floor, capped. Reason (office round
+// 2 fix): Studio's requests on every (re)connect scale with the roster (per person: sessions.list twice, config.get,
+// skills.status; measured 2026-11-27 with the sample tree, README "Frame budget"), so the old flat 200 closed the
+// connection (1008) at about 20 people and Studio showed "ROUTER • DISCONNECTED". The cap keeps the bound.
+export const RATE_BASE_FRAMES = 200;
+export const RATE_FRAMES_PER_PERSON = 10;
+export const RATE_MAX_FRAMES = 2000;
+export const rateCap = people => Math.min(RATE_MAX_FRAMES,
+  RATE_BASE_FRAMES + RATE_FRAMES_PER_PERSON * (Number.isInteger(people) && people > 0 ? people : 0));
 const MAX_PENDING_WRITE = 1024 * 1024;         // a reader this far behind is dropped
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const TOKEN_MIN_CHARS = 16;
@@ -129,7 +137,8 @@ export class OfficeHub {
   constructor() { this.gateways = new Set(); this.last = null; this.lastServers = null; }
   /** One poll: the tree and the server room's view (adapter.SERVERS_PATH, or null when it never answered). */
   update(tree, servers = null) {
-    mapTree(tree, servers);                // throws on a malformed tree or server room: nothing changes
+    mapTree(tree);                         // throws on a malformed tree or server room: nothing changes
+    if (servers !== null) mapServers(servers);
     this.last = tree;
     this.lastServers = servers;
     for (const g of this.gateways) {
@@ -228,7 +237,7 @@ export function createBridge({ port = DEFAULT_PORT, origins = defaultOrigins(por
         if (client.closed) return;
         const now = Date.now();
         if (now - windowStart > RATE_WINDOW_MS) { windowStart = now; frames = 0; }
-        if (++frames > RATE_MAX_FRAMES) return close(1008);
+        if (++frames > rateCap(gateway.agents.length)) return close(1008);
         if (opcode === 8) return close(1000);
         if (opcode === 9) { write(encodeFrame(10, payload)); continue; }
         if (opcode === 10) continue;

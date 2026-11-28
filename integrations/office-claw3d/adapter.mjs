@@ -194,10 +194,9 @@ const NAME_MAX = 64;
 // so the key can never be two rooms.
 const LOBBY_KEY = 'lobby';
 const LOBBY_LABEL = 'No orchestrator';
-// The server room (office round 2): racks per host and the S1 console, from GET /v1/cortados/office/servers. Its key
-// is refused as a bot origin too (groupKey), so it can never be an orchestrator's room.
+// The server room (office round 2): racks per host and the S1 console, from GET /v1/cortados/office/servers (mapServers).
+// Its key is refused as a bot origin too (groupKey), so it can never be an orchestrator's room.
 export const SERVERS_KEY = 'servers';
-const SERVERS_LABEL = 'Server room';
 // A child's name line (owner decision 2026-11-27): "<orchestrator name> › <task title>". The orchestrator part is cut
 // to ORCH_PREFIX_MAX so the task title, the part that differs between a room's people, keeps most of the 64 characters.
 export const CHILD_SEPARATOR = ' › ';
@@ -298,9 +297,9 @@ function treeUsable(section) {
  *
  * Office round 2 (owner 2026-11-27): a room is named after its orchestrator's Claude Code session (the group's `name`,
  * else its project), each of its people's name line starts "<that name> › "; every room carries a stable colour
- * (roomColor); `servers` (GET /v1/cortados/office/servers, mapServers) adds the server room last, or nothing when null.
+ * (roomColor). The server room is not people (office round 2 fix): see mapServers.
  */
-export function mapTree(tree, servers = null) {
+export function mapTree(tree) {
   if (!object(tree) || tree.version !== 1 || !finite(tree.generated_at) || !object(tree.orchestrators) ||
       !Array.isArray(tree.orchestrators.items)) throw new Error('invalid office tree');
   // An unavailable tree is a failed poll, never an empty floor (#77 review round 1: an HTTP 200 carrying
@@ -443,16 +442,6 @@ export function mapTree(tree, servers = null) {
   }
   const last = key => (key === 'unattributed') + 2 * (key === LOBBY_KEY);
   rooms.sort((a, b) => last(a.key) - last(b.key));   // stable: tree order otherwise
-  // The server room (office round 2) comes last: it is a fixed room of the floor (the rooms patch seats it), never one
-  // of the orchestrator rooms. No servers view (an older provider, a failed first poll): no one in it.
-  if (servers !== null) {
-    const people = mapServers(servers);
-    for (const p of people) {
-      if (ids.has(p.id)) throw new Error('duplicate office identity');
-      ids.add(p.id);
-    }
-    rooms.push({ key: SERVERS_KEY, people });
-  }
   return rooms.flatMap((room, index) => room.people.map(p => toAgent(p, index)));
 }
 
@@ -469,11 +458,14 @@ function ago(now, at) {
 }
 
 /**
- * GET /v1/cortados/office/servers -> the server room's people, validated field by field (live.office_servers):
- * one figure per host standing at its rack (name "Air", subtitle "up · provider" / "up · 8 s ago" / "down · seen 14 min
- * ago" / "no heartbeat"; status idle when up, error when down) and the S1 console (name "S1 · <served model>", subtitle
- * "up · p50 180 ms · p90 420 ms · 96 scored/h" and "· degraded" when the routing check warns; status working while it
- * scored in the last hour, error when down or degraded). Numbers and fixed words only; nothing else of the view is kept.
+ * GET /v1/cortados/office/servers -> the server room, validated field by field (live.office_servers). Not people
+ * (office round 2 fix, owner 2026-11-27: hosts and S1 walked the floor as figures and filled the roster): the bridge
+ * sends it as data in its hello (`snapshot.cortadosServers`) and in every office.snapshot event (`payload.servers`),
+ * and the rooms patch draws a rack per host and the S1 console, each with its sign (claw3d/cortadosSigns.tsx).
+ * `racks`: one per host, in the view's order: { host, name "Air", state up|down|unknown, note "up · provider" /
+ * "up · 8 s ago" / "down · seen 14 min ago" / "no heartbeat" }. `s1`: { name "S1 · <served model>", state, note
+ * "up · p50 180 ms · p90 420 ms · 96 scored/h" and "· degraded" when the routing check warns, alert (down or degraded),
+ * working (scored in the last hour) }. Numbers and fixed words only; nothing else of the view is kept.
  */
 export function mapServers(view) {
   if (!object(view) || view.version !== 1 || !finite(view.generated_at) || !object(view.hosts) ||
@@ -481,10 +473,7 @@ export function mapServers(view) {
     throw new Error('invalid office servers');
   }
   const now = view.generated_at;
-  const base = (id, kind) => ({ id, kind, parent: null, depth: 1, group: SERVERS_KEY, groupLabel: SERVERS_LABEL,
-    roomColor: roomColor(SERVERS_KEY), project: null, returning: false, provider: null, lane: null, localBackend: null,
-    tool: null, title: null, outfit: 'worker' });
-  const people = [];
+  const racks = [];
   const seen = new Set();
   for (const h of view.hosts.items) {
     if (!object(h) || hostName(h.name) === null || !SERVER_HOST_STATES.has(h.state) || seen.has(h.name) ||
@@ -492,10 +481,9 @@ export function mapServers(view) {
       throw new Error('invalid office servers host');
     }
     seen.add(h.name);
-    const role = h.state === 'up' ? (h.provider ? 'up · provider' : h.as_of !== null ? 'up · ' + ago(now, h.as_of) + ' ago' : 'up')
+    const note = h.state === 'up' ? (h.provider ? 'up · provider' : h.as_of !== null ? 'up · ' + ago(now, h.as_of) + ' ago' : 'up')
       : h.state === 'down' ? (h.as_of !== null ? 'down · seen ' + ago(now, h.as_of) + ' ago' : 'down') : 'no heartbeat';
-    people.push({ ...base('office-servers-host-' + h.name, 'host'), name: hostLabel(h.name), role, host: h.name,
-      status: h.state === 'down' ? 'error' : 'idle', taskStatus: h.state, model: null, family: 'unknown' });
+    racks.push({ host: h.name, name: hostLabel(h.name), state: h.state, note });
   }
   const s = view.s1;
   if (!SERVER_S1_STATES.has(s.status) || (s.health !== null && !SERVER_S1_STATES.has(s.health)) ||
@@ -509,17 +497,15 @@ export function mapServers(view) {
   if (nonNegative(s.p90_ms)) parts.push('p90 ' + ms(s.p90_ms));
   if (nonNegative(s.scored_1h)) parts.push(Math.round(s.scored_1h) + ' scored/h');
   if (s.degraded) parts.push('degraded');
-  people.push({ ...base('office-servers-s1', 's1'), name: shortText('S1 · ' + (shortText(s.model, 40) ?? 'scorer')),
-    role: parts.join(RETURN_SEPARATOR), host: null, taskStatus: s.status, model: text(s.model), family: 'local',
-    status: s.status === 'down' || s.degraded ? 'error' : nonNegative(s.scored_1h) && s.scored_1h > 0 ? 'working' : 'idle' });
-  return people;
+  const alert = s.status === 'down' || s.degraded;
+  return { racks, s1: { name: shortText('S1 · ' + (shortText(s.model, 40) ?? 'scorer')), state: s.status, alert,
+    working: !alert && nonNegative(s.scored_1h) && s.scored_1h > 0, note: parts.join(RETURN_SEPARATOR) } };
 }
 
 /** One person as a Claw3D agent: the stock fields Studio reads (name; role = the nameplate subtitle, E5) and the
  * CortadOS `office` extension. Allowlisted: nothing of the tree is spread into the output. */
 function toAgent(p, roomIndex) {
-  const emoji = p.kind === 'orchestrator' ? '👔' : p.kind === 'helper' ? '🛠️' : p.kind === 'host' ? '🗄️'
-    : p.kind === 's1' ? '🧮' : '🤖';
+  const emoji = p.kind === 'orchestrator' ? '👔' : p.kind === 'helper' ? '🛠️' : '🤖';
   return {
     id: p.id, name: p.name, role: p.role,
     identity: { name: p.name, emoji, avatarUrl: avatarDataUrl(p.family, p.outfit),
@@ -557,6 +543,7 @@ const NEUTRAL_READS = {
   'cron.list': () => ({ jobs: [] }),
 };
 export const READ_METHODS = Object.freeze([...methods, ...Object.keys(NEUTRAL_READS)]);
+const RESYNC_POLLS = 2;
 
 /** Transport seam: send(object) emits a JSON frame to one authenticated client.
  * The WS host (bridge.mjs) owns localhost bind, Origin/auth checks, frame limits and clients.
@@ -566,6 +553,13 @@ export class OfficeGateway {
   constructor(send) {
     this.send = send;
     this.agents = [];
+    this.servers = null;        // the server room (mapServers), or null before the servers view first answered
+    this.sentPresence = null;   // the last presence payload sent, as JSON (presence goes out only when it changes)
+    // Polls left on which every working or failed person's status is announced again. Reason (office round 2 fix,
+    // seen 2026-11-27 once the connection stayed up): after each fleet load (it starts with agents.list) Studio infers
+    // every person idle from their (empty) sessions (OfficeScreen inferRunningFromAgentSessions) and so overwrites the
+    // lifecycle events this gateway sent; announcing again on the next two polls puts the statuses back.
+    this.resync = 0;
     this.connected = false;
     this.generation = 0;
     this.runs = new Map();
@@ -596,7 +590,7 @@ export class OfficeGateway {
         type: 'hello-ok', protocol: 3, adapterType: 'cortados-office',
         features: { methods: [...READ_METHODS], events: ['agent', 'presence', 'office.snapshot'] },
         snapshot: { health: { agents: this.agents, defaultAgentId: this.agents[0]?.id ?? null },
-          sessionDefaults: { mainKey: 'main' } },
+          sessionDefaults: { mainKey: 'main' }, cortadosServers: this.servers },
         auth: { role: 'operator', scopes: ['operator.read'] },
         policy: { tickIntervalMs: 30000 },
       });
@@ -604,23 +598,28 @@ export class OfficeGateway {
       this.send({ type: 'res', id: frame.id, ok: false,
         error: { code: 'NOT_CONNECTED', message: 'Connect first' } });
     } else if (frame.method === 'agents.list') {
+      this.resync = RESYNC_POLLS;
       reply({ defaultId: this.agents[0]?.id ?? null, mainKey: 'main', agents: this.agents });
-    } else if (frame.method === 'sessions.list') reply({ sessions: this.sessions() });
+    } else if (frame.method === 'sessions.list') reply({ sessions: [] });
     else if (frame.method === 'status') reply(this.presence());
     else if (Object.hasOwn(NEUTRAL_READS, frame.method)) reply(NEUTRAL_READS[frame.method](frame.params));
     else this.send({ type: 'res', id: frame.id, ok: false,
       error: { code: 'READ_ONLY', message: 'Office adapter is read-only' } });
   }
   /** One poll's tree (GET /v1/cortados/office/tree) and server room (GET /v1/cortados/office/servers, or null):
-   * mapTree validates both before the last good roster is replaced. */
+   * both validated (mapTree, mapServers) before the last good roster and room are replaced. */
   update(tree, servers = null) {
-    const next = mapTree(tree, servers); // validate before replacing the last good state
+    const next = mapTree(tree);          // validate before replacing the last good state
+    const room = servers === null ? null : mapServers(servers);
     const old = new Map(this.agents.map(a => [a.id, a]));
     this.agents = next;
+    this.servers = room;
     if (!this.connected) return;
     const lifecycle = (a, phase, runId) => this.send(event('agent', {
       agentId: a.id, sessionKey: key(a), runId, stream: 'lifecycle', data: { phase },
     }));
+    const resync = this.resync > 0;
+    if (resync) this.resync -= 1;
     for (const a of next) {
       const before = old.get(a.id);
       if (a.office.status === 'working') {
@@ -629,6 +628,8 @@ export class OfficeGateway {
           runId = a.id + ':' + (++this.generation);
           this.runs.set(a.id, runId);
           lifecycle(a, 'start', runId);
+        } else if (resync) {
+          lifecycle(a, 'start', runId);   // the same run, announced again after Studio's reload
         }
         if (a.office.tool && a.office.tool !== before?.office.tool) {
           this.send(event('agent', { agentId: a.id, sessionKey: key(a), runId,
@@ -638,7 +639,7 @@ export class OfficeGateway {
         lifecycle(a, a.office.status === 'error' ? 'error' : 'end', this.runs.get(a.id));
         this.runs.delete(a.id);
         if (a.office.status === 'error') this.errored.add(a.id);
-      } else if (a.office.status === 'error' && !this.errored.has(a.id)) {
+      } else if (a.office.status === 'error' && (!this.errored.has(a.id) || resync)) {
         // an error this gateway never saw running (a failed task first seen as it reports back, or a bridge that
         // restarted): Claw3D shows an error only after a run's error event, so the run is opened and failed at once
         const runId = a.id + ':' + (++this.generation);
@@ -657,9 +658,19 @@ export class OfficeGateway {
         }
       }
     }
-    this.send(event('presence', this.presence()));
-    // Extension for room/appearance/status and roster removal; stock UI may ignore.
-    this.send(event('office.snapshot', { agents: next }));
+    // Presence only when it changed (a person came or left, or a name changed), as a gateway announces presence. Reason
+    // (office round 2 fix, measured 2026-11-27): Studio reloads its whole fleet on every presence event (OfficeScreen
+    // loadSummarySnapshot -> loadAgents: agents.list and two sessions.list per person), so one per 5 s poll sent
+    // ~32 frames every 5 s with 15 people.
+    const presence = this.presence();
+    const presenceKey = JSON.stringify(presence);
+    if (presenceKey !== this.sentPresence) {
+      this.sentPresence = presenceKey;
+      this.send(event('presence', presence));
+    }
+    // Extension for room/appearance/status and roster removal, and the server room (the rooms patch draws it); stock
+    // UI may ignore.
+    this.send(event('office.snapshot', { agents: next, servers: room }));
   }
 }
 

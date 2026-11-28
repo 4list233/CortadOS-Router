@@ -331,17 +331,22 @@ good server room and says so on stderr; a provider without the endpoint draws ev
 server room. `mapServers` validates the view whole before it replaces the last one.
 
 **Office mode.** Studio's server never serves the provider's path: the browser only ever talks to Studio, and the
-server room reaches it through the gateway socket as people (below). As the owner asked, `office-mode.cjs` lists
+server room reaches it through the gateway socket as data (below). As the owner asked, `office-mode.cjs` lists
 `/v1/cortados/office/servers` among its exact entries as **GET only** (HEAD and every other method 403), with that
 reason; a GET there reaches Next, which has no such page (404), and the office:read token is never in Studio. The list
 test pins the entry and its one method.
 
-**The room.** A fixed room of the floor (see C.5 for where), with one `server_rack` per host slot (Air, Pro, Studio, PC)
-and an S1 console desk. Each host is a figure standing at its rack: name `Air`, subtitle `up · provider`, `up · 8 s ago`,
-`down · seen 30 min ago` or `no heartbeat`; status idle when up, error (red) when down. The S1 console figure is named
-`S1 · <served model>`, subtitle `up · p50 181 ms · p90 420 ms · 90 scored/h` (`· degraded` when the routing check warns);
-working while it scored in the last hour, error when down or degraded. Agent ids `office-servers-host-<host>` and
-`office-servers-s1`; a bot origin named `servers` is refused, so it can never be an orchestrator's room.
+**The room.** A fixed room of the floor (see C.5 for where). Hosts and S1 are not people (office round 2 fix, owner
+2026-11-27: as figures they walked the floor and filled the roster). The bridge sends the room as data,
+`snapshot.cortadosServers` in its hello and `payload.servers` in every `office.snapshot` event: `racks`, one per host
+(`{host, name "Air", state up|down|unknown, note}`, note `up · provider`, `up · 8 s ago`, `down · seen 30 min ago` or
+`no heartbeat`), and `s1` (`{name "S1 · <served model>", state, note "up · p50 181 ms · p90 420 ms · 90 scored/h"
+(· degraded when the routing check warns), alert (down or degraded), working (scored in the last hour)}`). One line in
+Studio's `GatewayBrowserClient.handleMessage` hands every frame to `cortadosRooms.ts cortadosNoteGatewayFrame`, which
+keeps only those two frames' room, validated field by field (a malformed one is dropped, the last good one stays).
+`objects/cortadosSigns.tsx` draws a rack per host along the room's open side, facing in, with a status strip and a
+sign (name over note, green / red / grey), and the S1 console in front of them with its sign; no desks or chairs. A
+bot origin named `servers` is refused, so it can never be an orchestrator's room.
 
 ### C.4 Event console (B6): still [ESCALATE], hidden by default
 

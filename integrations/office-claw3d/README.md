@@ -18,7 +18,7 @@ protocol, how it renders people and floors, and the remaining gaps.
 | `claw3d/proxy-auth.patch` | Studio's gateway proxy always sends its configured token to the bridge and drops the browser's device block and credentials (over HTTPS the stock proxy sent no token and the Office closed with 1012, 2026-11-25) |
 | `gateway-check.mjs` | deploy-air.sh's end-to-end health probe: a plain `connect` and a browser-shaped one (signed device block, no token) through Studio's own proxy must each get the bridge's hello |
 | `studio-settings.py` | builds Studio's gateway settings file (`<state dir>/claw3d/settings.json`: the bridge URL and secret), the only upstream config Claw3D's proxy reads |
-| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts`, `claw3d/cortadosSigns.tsx` | rooms per orchestrator: the floor's 7 orchestrator rooms x 6 desks, the server room, the desk allocation, the door signs and floor tints (the patch adds the two files and a 45-line hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8, [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) C) |
+| `claw3d/cortados-rooms.patch`, `claw3d/cortadosRooms.ts`, `claw3d/cortadosSigns.tsx` | rooms per orchestrator: the floor's 7 orchestrator rooms x 6 desks, the server room's racks and console, the desk allocation, the door signs and floor tints, our nameplates (the patch adds the two files, a 45-line hook, the nameplate rule in `objects/agents.tsx` and a one-line gateway hook; [FLOORS-DESIGN.md](FLOORS-DESIGN.md) §8, [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) C) |
 | `claw3d/cortados-brand.patch` | brands the Office as the CortadOS router (title, floor card, connection badge), removes the flag poles and hides the OpenClaw controls the read-only bridge cannot serve, the chat composer included ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) part A) |
 | `claw3d/office-mode.patch`, `claw3d/office-mode.cjs` | "office mode": Studio's server answers only the Office's own routes and methods and 403 to the rest (`PUT /api/studio`, remote office, runtime, voice, every write), so the cookie opens a read-only view ([OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DESIGN.md) A.5) |
 | `DEPLOY.md`, `deploy-air.sh`, `deploy-lib.sh` | Air runbook, script (install / upgrade / tailnet publish) and its pure checks, written and **not run** |
@@ -56,10 +56,29 @@ Office round 2 (owner 2026-11-27, [OFFICE-CORTADOS-DESIGN.md](OFFICE-CORTADOS-DE
 its orchestrator's Claude Code session name (the tree group's `name`, from the session heartbeat; else the project), and
 its people read `<orchestrator name> › <task title>`. Each room has a stable colour (its floor tint, its door sign's
 stripe, its people's trousers) and a door sign with its name. The 8th room slot is the **server room**: a rack per host
-(Air, Pro, Studio, PC) with that host's figure (`up · provider`, `up · 8 s ago`, `down · seen 30 min ago`, `no heartbeat`)
-and the S1 console (`S1 · <model>`, `up · p50 181 ms · p90 420 ms · 90 scored/h`), from
-`GET /v1/cortados/office/servers` (office:read, numbers and fixed words only), which the bridge polls beside the tree.
-So 7 rooms are left for orchestrators ([ESCALATE] B8).
+with a sign (`Air`, `up · provider` / `up · 8 s ago` / `down · seen 30 min ago` / `no heartbeat`) and the S1 console with
+its sign (`S1 · <model>`, `up · p50 181 ms · p90 420 ms · 90 scored/h`), from `GET /v1/cortados/office/servers`
+(office:read, numbers and fixed words only), which the bridge polls beside the tree. Hosts and S1 are not people: the
+bridge sends the room as data (`snapshot.cortadosServers` in its hello, `payload.servers` in every `office.snapshot`),
+and the rooms patch draws it. So 7 rooms are left for orchestrators ([ESCALATE] B8).
+
+Nameplates (office round 2 fix): a room's head and the person under the pointer get the full two-line plate (the name
+cut to 26 characters with "…", over the subtitle); everyone else a one-line label, the task part of the name (after
+`›`) cut to 12 characters. Stock Claw3D cut every name over 10 characters to its first word ("Office").
+
+### Frame budget
+
+Studio's proxy (Claw3D 51337f7 `server/gateway-proxy.js`, not patched) closes a browser that sends more than a 120-frame
+burst (60/s sustained), and the bridge closes a client over `bridge.rateCap(people)` frames in 10 s (200 plus 10 per
+person, at most 2000). Measured 2026-11-27 with the sample tree (20 people, harness: fake provider, this bridge, the
+patched Studio, headless Chrome): ~265 browser frames per (re)connect, the first connection closed by the bridge's old
+flat 200 (1008) and the next ones by the proxy, every 20-30 s, so the badge read `ROUTER • DISCONNECTED`. Three causes,
+all fixed here: `sessions.list` listed every person's session (ignoring `agentId`), so Studio fetched previews and
+history for each; a `presence` event every poll made Studio reload the whole fleet; and the flat cap. Now
+`sessions.list` lists none (the Office has no chat sessions), presence goes out only when it changes, and the cap grows
+with the roster: 169 frames in 70 s with 15 people, one connection, peak 55 in a second. After each fleet reload Studio
+marks everyone idle from their empty sessions, so the next two polls after an `agents.list` announce the working and
+failed people again.
 
 ## Appearance (issue #77)
 

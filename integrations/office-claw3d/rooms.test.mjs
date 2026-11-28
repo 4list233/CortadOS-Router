@@ -8,8 +8,8 @@ import * as nodeModule from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { mapTree, orchestratorFamily, OfficeGateway, runPolling, RETURN_KEEP_S, RETURN_LABEL, RETURN_SEPARATOR,
-  hostName, hostLabel, roomColor, roomHash, ROOM_COLORS, NEUTRAL_ROOM_COLOR } from './adapter.mjs';
+import { mapTree, mapServers, orchestratorFamily, OfficeGateway, runPolling, RETURN_KEEP_S, RETURN_LABEL,
+  RETURN_SEPARATOR, hostName, hostLabel, roomColor, roomHash, ROOM_COLORS, NEUTRAL_ROOM_COLOR } from './adapter.mjs';
 
 const HERE = new URL('.', import.meta.url);
 const SAMPLE = JSON.parse(await readFile(new URL('fixtures/sample-tree.json', HERE), 'utf8'));
@@ -354,32 +354,43 @@ test('the patch file embeds claw3d/cortadosRooms.ts byte for byte and stays a sm
   assert.ok(signs && /^new file mode/m.test(signs));
   const signLines = signs.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
   assert.equal(signLines.join('\n') + '\n', await readFile(new URL('claw3d/cortadosSigns.tsx', HERE), 'utf8'));
-  assert.equal(parts.length, 3);
+  // office round 2 fix: the nameplate rule in the stock agent model, and the one-line gateway hook for the server room
+  const plates = parts.find(p => p.startsWith('a/src/features/retro-office/objects/agents.tsx'));
+  const plateLines = plates.split('\n').filter(l => /^[+-](?![+-])/.test(l));
+  assert.ok(plateLines.length <= 32, 'agents.tsx hook is ' + plateLines.length + ' changed lines');
+  assert.match(plates, /^\+.*cortadosNameplate\(agentId, name, subtitle, hovered\)/m);
+  const client = parts.find(p => p.startsWith('a/src/lib/gateway/openclaw/GatewayBrowserClient.ts'));
+  const clientLines = client.split('\n').filter(l => /^[+-](?![+-])/.test(l));
+  assert.deepEqual(clientLines.map(l => l[0]), ['+', '+'], 'an import and one call, nothing removed');
+  assert.match(client, /^\+ {4}cortadosNoteGatewayFrame\(parsed\);/m);
+  assert.equal(parts.length, 5);
 });
 
 test('layout: 7 orchestrator rooms (a head desk, 2 report desks, 6 team desks) and the server room, in 1800 x 720', needsTs, () => {
   const layout = rooms.buildCortadosRoomsLayout();
   assert.ok(rooms.isCortadosLayout(layout));
   assert.equal(rooms.isCortadosLayout([{ _uid: 'office_0', type: 'desk_cubicle', x: 0, y: 0 }]), false);
-  // a floor saved by the round-1 build (no server room) is not the current floor: it is rebuilt once
-  assert.equal(rooms.isCortadosLayout(layout.filter(i => !i._uid.startsWith('cortados_r7_'))), false);
+  // a floor saved by an earlier build (round 2: closed side walls, desks in the server room) is rebuilt once
+  const round2 = [{ _uid: 'cortados_r7_console0', type: 'desk_cubicle', x: 0, y: 0 },
+    { _uid: 'cortados_r7_wall_back', type: 'wall', x: 0, y: 0, w: 430, h: 8 }];
+  assert.equal(rooms.isCortadosLayout(round2), false);
   const desks = deskItemsOf(layout);
   assert.equal(desks.length, rooms.CORTADOS_ORCHESTRATOR_ROOMS * (1 + rooms.CORTADOS_REPORT_DESKS +
-    rooms.CORTADOS_TEAM_DESKS) + rooms.CORTADOS_RACKS + 1);
+    rooms.CORTADOS_TEAM_DESKS));
   assert.equal(rooms.CORTADOS_ROOMS, 8);
   assert.equal(rooms.CORTADOS_ORCHESTRATOR_ROOMS, 7);
   assert.equal(rooms.CORTADOS_SERVER_ROOM, 7);
   assert.equal(rooms.CORTADOS_TEAM_DESKS, 6);
-  assert.equal(layout.filter(i => i.type === 'server_rack').length, rooms.CORTADOS_RACKS);
+  // the server room is walls only: its racks and console are drawn from the bridge's data, nobody sits there
+  assert.deepEqual([...new Set(layout.filter(i => i._uid.startsWith('cortados_r7_')).map(i => i.type))], ['wall']);
   assert.equal(new Set(layout.map(i => i._uid)).size, layout.length);
   for (const i of layout) {
-    const [w, h] = i.type === 'server_rack' ? [45, 90] : [i.w ?? 100, i.h ?? 55];
+    const [w, h] = [i.w ?? 100, i.h ?? 55];
     assert.ok(i.x >= 0 && i.y >= 0 && i.x + w <= 1800 && i.y + h <= 720, i._uid);
   }
-  // no desk overlaps a wall, a rack or another desk (footprints: geometry.ts ITEM_FOOTPRINT)
-  const box = i => i.type === 'wall' ? [i.x, i.y, i.w, i.h] : i.type === 'server_rack' ? [i.x, i.y, 45, 90]
-    : [i.x, i.y, 100, 55];
-  const solid = layout.filter(i => i.type === 'wall' || i.type === 'desk_cubicle' || i.type === 'server_rack');
+  // no desk overlaps a wall or another desk (footprints: geometry.ts ITEM_FOOTPRINT)
+  const box = i => i.type === 'wall' ? [i.x, i.y, i.w, i.h] : [i.x, i.y, 100, 55];
+  const solid = layout.filter(i => i.type === 'wall' || i.type === 'desk_cubicle');
   for (const a of desks) {
     for (const b of solid) {
       if (a === b) continue;
@@ -387,6 +398,53 @@ test('layout: 7 orchestrator rooms (a head desk, 2 report desks, 6 team desks) a
       assert.ok(ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay, a._uid + ' overlaps ' + b._uid);
     }
   }
+});
+
+test('the corridor is open: side walls stop short of it, the bottom row sits on the 25 px grid', needsTs, () => {
+  const layout = rooms.buildCortadosRoomsLayout();
+  for (let room = 0; room < rooms.CORTADOS_ROOMS; room += 1) {
+    const r = rooms.cortadosRoomRect(room);
+    const sides = layout.filter(i => i._uid.startsWith(`cortados_r${room}_wall_left`) ||
+      i._uid.startsWith(`cortados_r${room}_wall_right`));
+    assert.equal(sides.length, 2, String(room));
+    for (const w of sides) {
+      if (r.top) assert.equal(w.y + w.h, r.y + r.h - rooms.CORTADOS_CORRIDOR_GAP, w._uid);
+      else assert.equal(w.y, r.y + rooms.CORTADOS_CORRIDOR_GAP, w._uid);
+    }
+    assert.equal(r.y % 25 === 10 || r.y % 25 === 0, true, 'room ' + room + ' at y ' + r.y);
+  }
+  assert.equal(rooms.cortadosRoomRect(4).y % 25, 0);
+});
+
+// Claw3D's own navigation grid (core/navigation.ts buildNavGrid + astar), from a checkout with the patches applied:
+// every seat must be reachable from every spawn point Claw3D can pick (pickSpawnPoint: x 100..900, y 100..600) and
+// from every other seat. Before the office round 2 fix: 3119 of 12716 spawn-seat pairs and 1028 of 4556 seat pairs.
+test('every seat is reachable on Claw3D\'s own navigation grid (CORTADOS_CLAW3D_CHECKOUT)', needsTs, async t => {
+  const checkout = process.env.CORTADOS_CLAW3D_CHECKOUT;
+  if (!checkout) return t.skip('CORTADOS_CLAW3D_CHECKOUT is not set: no Claw3D 51337f7 checkout');
+  const src = join(checkout, 'src');
+  // Claw3D's "@/..." imports resolve to <checkout>/src/....ts for this module graph only
+  const loader = 'data:text/javascript,' + encodeURIComponent(`
+    import { existsSync } from 'node:fs'; import { pathToFileURL } from 'node:url';
+    let SRC; export function initialize(d) { SRC = d.src; }
+    export async function resolve(spec, ctx, next) {
+      if (spec.startsWith('@/')) for (const ext of ['.ts', '.tsx']) {
+        const f = SRC + '/' + spec.slice(2) + ext; if (existsSync(f)) return next(pathToFileURL(f).href, ctx); }
+      return next(spec, ctx); }`);
+  nodeModule.register(loader, { data: { src } });
+  const nav = await import(pathToFileURL(join(src, 'features/retro-office/core/navigation.ts')).href);
+  const layout = rooms.buildCortadosRoomsLayout();
+  const grid = nav.buildNavGrid(layout);
+  const seats = nav.getDeskLocations(layout);
+  assert.equal(seats.length, 63);
+  const failed = [];
+  for (let x = 100; x <= 900; x += 50) for (let y = 100; y <= 600; y += 50) for (const s of seats) {
+    if (!nav.astar(x, y, s.x, s.y, grid).length) failed.push(`${x},${y} -> ${s.x},${s.y}`);
+  }
+  for (const a of seats) for (const b of seats) {
+    if (a !== b && !nav.astar(a.x, a.y, b.x, b.y, grid).length) failed.push(`${a.x},${a.y} -> ${b.x},${b.y}`);
+  }
+  assert.deepEqual(failed.slice(0, 5), [], failed.length + ' unreachable');
 });
 
 test('allocation: orchestrator at the head desk, team in order, reporters beside it, everyone held', needsTs, () => {
@@ -456,25 +514,94 @@ test('sticky: rooms and seats never move while their people stay; a freed room i
 // ---- office round 2: the server room, door signs, room colours ----
 const SERVERS = JSON.parse(await readFile(new URL('fixtures/sample-servers.json', HERE), 'utf8'));
 
-test('server room: hosts at the racks, S1 at the console, always room 7, never an orchestrator room', needsTs, () => {
+test('server room: nobody is seated there; it is never an orchestrator room', needsTs, () => {
   const desks = deskItemsOf(rooms.buildCortadosRoomsLayout());
   const state = rooms.createCortadosRoomState();
-  const agents = mapTree(sample(), structuredClone(SERVERS)).map(a => ({ id: a.id, subtitle: a.role, name: a.name }));
-  for (const a of agents) assert.ok(rooms.isCortadosAgentId(a.id), a.id);
+  const agents = mapTree(sample()).map(a => ({ id: a.id, subtitle: a.role, name: a.name }));
   const { desks: seat } = rooms.allocateCortadosDesks(agents, desks, {}, state);
-  const uid = id => desks[seat[id]]?._uid;
-  assert.deepEqual(['air', 'studio', 'pro', 'pc'].map(h => uid('office-servers-host-' + h)),
-    ['cortados_r7_rack0', 'cortados_r7_rack1', 'cortados_r7_rack2', 'cortados_r7_rack3']);
-  assert.equal(uid('office-servers-s1'), 'cortados_r7_console0');
-  assert.equal(state.roomByGroup.get('servers'), 7);
-  assert.equal(uid(`office-${MINE}-orchestrator`), 'cortados_r0_head0');   // orchestrator rooms are unchanged
-  // a 5th host stands (4 racks); nothing but the server room's figures can take its form
-  const five = rooms.allocateCortadosDesks([...agents, { id: 'office-servers-host-lab' }], desks, {}, state);
-  assert.ok(!('office-servers-host-lab' in five.desks));
-  for (const bad of ['office-servers-orchestrator', 'office-servers-task-t20261124100000-a0000001',
-    'office-servers-host-Air', 'office-servers-host-', 'office-servers-s2']) {
-    assert.equal(rooms.cortadosPlaceOf({ id: bad }), null, bad);
+  assert.ok(!Object.values(seat).some(i => desks[i]._uid.startsWith('cortados_r7_')));
+  assert.ok(![...state.roomByGroup.values()].includes(7));
+  // the round-2 server-room figures (and anything else in the servers group) are not ours to place any more
+  for (const id of ['office-servers-host-air', 'office-servers-s1', 'office-servers-orchestrator',
+    'office-servers-task-t20261124100000-a0000001']) {
+    assert.equal(rooms.isCortadosAgentId(id), false, id);
+    assert.equal(rooms.cortadosPlaceOf({ id }), null, id);
   }
+  // a stale room 7 in the sticky state is dropped
+  const stale = { roomByGroup: new Map([[MINE, 7]]), deskByAgent: new Map() };
+  rooms.allocateCortadosDesks([{ id: `office-${MINE}-orchestrator` }], desks, {}, stale);
+  assert.equal(stale.roomByGroup.get(MINE), 0);
+});
+
+test('server room data: the gateway hook keeps our bridge\'s room and ignores anything else', needsTs, () => {
+  const room = mapServers(structuredClone(SERVERS));
+  assert.deepEqual(rooms.cortadosParseServerRoom(room), room);
+  const seen = [];
+  const off = rooms.subscribeCortadosServerRoom(() => seen.push(rooms.getCortadosServerRoom()));
+  rooms.cortadosNoteGatewayFrame({ type: 'res', id: 'c', ok: true, payload: { type: 'hello-ok', adapterType: 'cortados-office',
+    snapshot: { cortadosServers: room } } });
+  assert.deepEqual(rooms.getCortadosServerRoom(), room);
+  // another gateway's hello, other events, a malformed room: ignored, the last good room stays
+  for (const frame of [null, 'x', { type: 'res', payload: { type: 'hello-ok', adapterType: 'openclaw', snapshot: {
+    cortadosServers: { racks: [], s1: null } } } }, { type: 'event', event: 'presence', payload: { servers: null } },
+  { type: 'event', event: 'office.snapshot', payload: { servers: { racks: [{ host: 'Air!', name: 'x', state: 'up', note: 'n' }] } } },
+  { type: 'event', event: 'office.snapshot', payload: { servers: { racks: Array(9).fill(room.racks[0]), s1: null } } },
+  { type: 'event', event: 'office.snapshot', payload: { servers: { racks: [], s1: { ...room.s1, alert: 'no' } } } },
+  { type: 'event', event: 'office.snapshot', payload: { servers: { racks: [{ ...room.racks[0], note: 'x'.repeat(81) }], s1: null } } },
+  { type: 'event', event: 'office.snapshot', payload: { agents: [] } }]) {
+    rooms.cortadosNoteGatewayFrame(frame);
+    assert.deepEqual(rooms.getCortadosServerRoom(), room, JSON.stringify(frame)?.slice(0, 80));
+  }
+  // the next snapshot replaces it; null (no servers view) clears it
+  const next = { racks: room.racks.slice(0, 2), s1: null };
+  rooms.cortadosNoteGatewayFrame({ type: 'event', event: 'office.snapshot', payload: { agents: [], servers: next } });
+  assert.deepEqual(rooms.getCortadosServerRoom(), next);
+  rooms.cortadosNoteGatewayFrame({ type: 'event', event: 'office.snapshot', payload: { agents: [], servers: null } });
+  assert.equal(rooms.getCortadosServerRoom(), null);
+  off();
+  assert.equal(seen.length, 3);
+});
+
+test('server room plan: one rack per host along the open side, the console in front, all inside the room', needsTs, () => {
+  const r = rooms.cortadosRoomRect(rooms.CORTADOS_SERVER_ROOM);
+  for (const n of [0, 1, 4, 5, 8, 12]) {
+    const plan = rooms.cortadosServerRoomPlan(n);
+    assert.equal(plan.racks.length, Math.min(n, rooms.CORTADOS_RACKS_MAX));
+    const inside = s => s.x >= r.x + 8 && s.x + s.w <= r.x + r.w - 8 && s.y >= r.y && s.y + s.d <= r.y + r.h - 8;
+    for (const s of plan.racks) assert.ok(inside(s), JSON.stringify(s));
+    assert.ok(inside(plan.console));
+    for (let i = 1; i < plan.racks.length; i += 1) assert.ok(plan.racks[i].x >= plan.racks[i - 1].x + plan.racks[i - 1].w);
+    // racks along the open (corridor) side, facing into the room; the console between them and the back wall
+    for (const s of plan.racks) assert.ok(plan.console.y >= s.y + s.d, 'the console stands in front');
+    assert.equal(plan.front, 1);
+    for (const s of plan.racks) assert.ok(s.y <= r.y + rooms.CORTADOS_CORRIDOR_GAP, 'by the open side');
+  }
+});
+
+test('nameplates: heads and the hovered person in full, everyone else the short task part', needsTs, () => {
+  const tree = sample();
+  tree.orchestrators.items.find(g => g.origin === MINE).name = 'Office round 2 with a long session name';
+  const by = Object.fromEntries(mapTree(tree).map(a => [a.id, a]));
+  const plate = (id, hovered = false) => rooms.cortadosNameplate(id, by[id].name, by[id].role, hovered);
+  const head = plate(`office-${MINE}-orchestrator`);
+  assert.equal(head.full, true);
+  assert.equal(head.title, 'Office round 2 with a lon…');
+  assert.equal(head.title.length, rooms.CORTADOS_PLATE_FULL);
+  assert.equal(head.subtitle, 'CortadOS-Router · claude-opus-5 · Pro');
+  const task = plate(`office-${MINE}-task-${ROOT}`);
+  assert.deepEqual(task, { title: 'Build the t…', subtitle: null, full: false });
+  assert.ok(task.title.length <= rooms.CORTADOS_PLATE_SHORT);
+  const hovered = plate(`office-${MINE}-task-${ROOT}`, true);
+  assert.equal(hovered.full, true);
+  assert.ok(hovered.title.startsWith('Office round 2'), hovered.title);
+  assert.ok(hovered.title.endsWith('…') && hovered.title.length <= rooms.CORTADOS_PLATE_FULL);
+  assert.equal(hovered.subtitle, 'claude-sonnet-5 · Air');
+  // no "›" (the lobby's people): the whole name, short
+  assert.deepEqual(rooms.cortadosNameplate('office-lobby-routed-c-000000000012', 'Quick question', 'x', false),
+    { title: 'Quick quest…', subtitle: null, full: false });
+  // anyone else keeps the stock plate
+  assert.equal(rooms.cortadosNameplate('main', 'Main agent', 'x', false), null);
+  assert.equal(rooms.cortadosNameplate(`office-${MINE}-orchestrator`, 7, null, false).title, '');
 });
 
 test('door signs: each room in use named after its orchestrator, in its colour; the server room always', needsTs, () => {

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mapTree, mapServers, roomColor, roomHash, ROOM_COLORS, NEUTRAL_ROOM_COLOR, CHILD_SEPARATOR, SERVERS_KEY,
   SERVERS_PATH, POLL_PATHS, pollOffice, pollServers, runPolling, OfficeGateway } from './adapter.mjs';
-import { OfficeHub } from './bridge.mjs';
+import { OfficeHub, rateCap, RATE_BASE_FRAMES, RATE_FRAMES_PER_PERSON, RATE_MAX_FRAMES } from './bridge.mjs';
 import { avatarProfile, ROOM_TROUSERS } from './sprites.mjs';
 
 const HERE = new URL('.', import.meta.url);
@@ -103,40 +103,38 @@ test('each room has a stable colour from its key; its people wear it; neutral ro
   assert.equal(avatarProfile('claude', 'worker', 'x', { roomColor: 'red; x' }).clothing.bottomColor, '#64748b');
 });
 
-// ---- the server room ----
-test('the server room: one rack figure per host and the S1 console, last, numbers and fixed words only', () => {
-  const agents = mapTree(sample(), servers());
-  const room = agents.filter(a => a.office.group === SERVERS_KEY);
-  assert.deepEqual(room.map(a => a.id), ['office-servers-host-air', 'office-servers-host-studio',
-    'office-servers-host-pro', 'office-servers-host-pc', 'office-servers-s1']);
-  assert.equal(agents.at(-1).id, 'office-servers-s1');
-  const a = by(room);
-  assert.deepEqual([a['office-servers-host-air'].name, a['office-servers-host-air'].role], ['Air', 'up · provider']);
-  assert.equal(a['office-servers-host-studio'].role, 'up · 8 s ago');
-  assert.equal(a['office-servers-host-pro'].role, 'no heartbeat');
-  assert.equal(a['office-servers-host-pc'].role, 'down · seen 30 min ago');
-  assert.equal(a['office-servers-host-pc'].office.status, 'error');
-  assert.equal(a['office-servers-s1'].name, 'S1 · s1-qwen3-4b-sft-v7');
-  assert.equal(a['office-servers-s1'].role, 'up · p50 181 ms · p90 420 ms · 90 scored/h');
-  assert.equal(a['office-servers-s1'].office.status, 'working');
-  for (const p of room) assert.equal(p.office.groupLabel, 'Server room');
+// ---- the server room: data, not people (office round 2 fix, owner 2026-11-27) ----
+test('the server room is not people: a rack per host and the S1 console, numbers and fixed words only', () => {
+  const agents = mapTree(sample());
+  assert.ok(!agents.some(a => a.office.group === SERVERS_KEY || a.id.startsWith('office-servers-')));
+  const room = mapServers(servers());
+  assert.deepEqual(room.racks.map(r => r.host), ['air', 'studio', 'pro', 'pc']);
+  const r = Object.fromEntries(room.racks.map(x => [x.host, x]));
+  assert.deepEqual(r.air, { host: 'air', name: 'Air', state: 'up', note: 'up · provider' });
+  assert.equal(r.studio.note, 'up · 8 s ago');
+  assert.deepEqual([r.pro.state, r.pro.note], ['unknown', 'no heartbeat']);
+  assert.deepEqual([r.pc.state, r.pc.note], ['down', 'down · seen 30 min ago']);
+  assert.deepEqual(room.s1, { name: 'S1 · s1-qwen3-4b-sft-v7', state: 'up', alert: false, working: true,
+    note: 'up · p50 181 ms · p90 420 ms · 90 scored/h' });
+  const keys = new Set(['host', 'name', 'state', 'note']);
+  for (const x of room.racks) assert.deepEqual(new Set(Object.keys(x)), keys);
 });
 
-test('S1 down or degraded is an error; nothing scored is idle', () => {
+test('S1 down or degraded is an alert; nothing scored is not working', () => {
   const s = servers();
   s.s1.degraded = true;
-  assert.equal(by(mapServers(s).map(p => ({ ...p })))['office-servers-s1'].status, 'error');
-  assert.ok(by(mapTree(sample(), s))['office-servers-s1'].role.endsWith(' · degraded'));
+  assert.equal(mapServers(s).s1.alert, true);
+  assert.ok(mapServers(s).s1.note.endsWith(' · degraded'));
+  assert.equal(mapServers(s).s1.working, false);
   const d = servers();
   d.s1.status = 'down';
-  assert.equal(by(mapTree(sample(), d))['office-servers-s1'].office.status, 'error');
+  assert.deepEqual([mapServers(d).s1.alert, mapServers(d).s1.state], [true, 'down']);
   const q = servers();
   q.s1.scored_1h = 0;
-  assert.equal(by(mapTree(sample(), q))['office-servers-s1'].office.status, 'idle');
+  assert.deepEqual([mapServers(q).s1.alert, mapServers(q).s1.working], [false, false]);
 });
 
-test('a malformed servers view is refused whole; no servers view, no server room', () => {
-  assert.ok(!mapTree(sample()).some(a => a.office.group === SERVERS_KEY));
+test('a malformed servers view is refused whole', () => {
   const cases = [
     s => { s.version = 2; }, s => { s.hosts.items[0].state = 'busy'; }, s => { s.hosts.items[0].name = 'Forests-Mac'; },
     s => { s.hosts.items.push(structuredClone(s.hosts.items[0])); }, s => { s.s1.p50_ms = -1; },
@@ -146,8 +144,106 @@ test('a malformed servers view is refused whole; no servers view, no server room
   for (const change of cases) {
     const s = servers();
     change(s);
-    assert.throws(() => mapTree(sample(), s), /invalid office servers/, String(change));
+    assert.throws(() => mapServers(s), /invalid office servers/, String(change));
+    const g = new OfficeGateway(() => {});
+    assert.throws(() => g.update(sample(), s), /invalid office servers/, String(change));
+    assert.deepEqual(g.agents, [], 'nothing replaced');
   }
+});
+
+test('the bridge sends the server room in its hello and in every office.snapshot, never as people', () => {
+  const frames = [];
+  const g = new OfficeGateway(f => frames.push(f));
+  g.update(sample(), servers());                 // before connect: kept for the hello
+  g.request({ type: 'req', id: 'c', method: 'connect' });
+  const hello = frames.find(f => f.type === 'res' && f.id === 'c').payload;
+  assert.deepEqual(hello.snapshot.cortadosServers, mapServers(servers()));
+  assert.ok(!hello.snapshot.health.agents.some(a => a.id.startsWith('office-servers-')));
+  g.update(sample(), servers());
+  const snap = frames.filter(f => f.event === 'office.snapshot').at(-1).payload;
+  assert.deepEqual(snap.servers, mapServers(servers()));
+  assert.ok(!snap.agents.some(a => a.office.group === SERVERS_KEY));
+  // no servers view yet (an older provider): no server room, said as null
+  const h = new OfficeGateway(f => frames.push(f));
+  h.request({ type: 'req', id: 'd', method: 'connect' });
+  assert.equal(frames.find(f => f.id === 'd').payload.snapshot.cortadosServers, null);
+  h.update(sample());
+  assert.equal(frames.filter(f => f.event === 'office.snapshot').at(-1).payload.servers, null);
+});
+
+// ---- the frame budget (office round 2 fix: "ROUTER • DISCONNECTED" with ~20 people) ----
+test('sessions.list lists no sessions: the Office has none, so Studio fetches no per-person history', () => {
+  // Measured 2026-11-27 (README "Frame budget"): listing one session per person made Studio's per-person session
+  // inference fetch sessions.preview and chat.history for every listed session (Claw3D 51337f7 OfficeScreen
+  // inferRunningFromAgentSessions; the bridge ignored its agentId) and its history bootstrap one chat.history per
+  // person: ~265 browser frames per connect for 20 people, over the Studio proxy's 120-frame burst.
+  const frames = [];
+  const g = new OfficeGateway(f => frames.push(f));
+  g.request({ type: 'req', id: 'c', method: 'connect' });
+  g.update(sample());
+  for (const params of [{}, { agentId: g.agents[0].id, includeUnknown: true, limit: 8 },
+    { agentId: g.agents[0].id, search: 'agent:' + g.agents[0].id + ':main', limit: 4 }]) {
+    g.request({ type: 'req', id: 's', method: 'sessions.list', params });
+    assert.deepEqual(frames.at(-1).payload, { sessions: [] });
+  }
+});
+
+test('the bridge rate cap grows with the roster, within a fixed bound', () => {
+  assert.equal(rateCap(0), RATE_BASE_FRAMES);
+  assert.equal(rateCap(20), RATE_BASE_FRAMES + 20 * RATE_FRAMES_PER_PERSON);
+  assert.equal(rateCap(10_000), RATE_MAX_FRAMES);
+  for (const bad of [-1, 1.5, NaN, undefined]) assert.equal(rateCap(bad), RATE_BASE_FRAMES);
+});
+
+test('presence goes out only when it changes: Studio reloads its whole fleet on each one', () => {
+  const frames = [];
+  const g = new OfficeGateway(f => frames.push(f));
+  g.request({ type: 'req', id: 'c', method: 'connect' });
+  const presences = () => frames.filter(f => f.event === 'presence').length;
+  g.update(sample());
+  assert.equal(presences(), 1);
+  const later = sample();
+  later.generated_at += 5;
+  g.update(later);
+  g.update(later);
+  assert.equal(presences(), 1, 'same people, same names: no presence');
+  assert.equal(frames.filter(f => f.event === 'office.snapshot').length, 3, 'the snapshot still goes out every poll');
+  g.update(named('Renamed'));
+  assert.equal(presences(), 2, 'a name changed');
+  const fewer = named('Renamed');
+  fewer.lobby.items = [];
+  g.update(fewer);
+  assert.equal(presences(), 3, 'people left');
+});
+
+test('after Studio reloads its fleet (agents.list), the next two polls announce working and failed people again', () => {
+  const frames = [];
+  const g = new OfficeGateway(f => frames.push(f));
+  g.request({ type: 'req', id: 'c', method: 'connect' });
+  const t = sample();
+  t.orchestrators.items.find(x => x.origin === MINE).tasks[0].status = 'running';
+  g.update(t);
+  const starts = () => frames.filter(f => f.event === 'agent' && f.payload.data.phase === 'start');
+  const working = g.agents.filter(a => a.office.status === 'working').map(a => a.id).sort();
+  const errors = g.agents.filter(a => a.office.status === 'error').map(a => a.id).sort();
+  assert.ok(working.length > 0);
+  const first = starts().length;
+  g.update(t);
+  assert.equal(starts().length, first, 'no reload: nothing announced again');
+  g.request({ type: 'req', id: 'l', method: 'agents.list', params: {} });
+  for (let poll = 0; poll < 2; poll += 1) {
+    const before = frames.length;
+    g.update(t);
+    const again = frames.slice(before).filter(f => f.event === 'agent' && f.payload.data.phase === 'start');
+    assert.deepEqual([...new Set(again.map(f => f.payload.agentId))].sort(), [...working, ...errors].sort());
+    // the same run for the working, so Studio keeps one run per person
+    for (const f of again.filter(f => working.includes(f.payload.agentId))) {
+      assert.equal(f.payload.runId, g.runs.get(f.payload.agentId));
+    }
+  }
+  const before = frames.length;
+  g.update(t);
+  assert.equal(frames.slice(before).filter(f => f.event === 'agent').length, 0, 'two polls, then quiet');
 });
 
 // ---- polling: one more exact GET, and the tree still decides the roster ----
@@ -182,7 +278,7 @@ test('the default poll asks for the tree and the server room, both GET, nothing 
       return { ok: true, json: async () => (url.pathname.endsWith('/servers') ? servers() : sample()) };
     } });
   assert.deepEqual(seen, [[SERVERS_PATH, 'GET'], ['/v1/cortados/office/tree', 'GET']]);
-  assert.ok(gateway.agents.some(a => a.id === 'office-servers-s1'));
+  assert.deepEqual(gateway.servers, mapServers(servers()));
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -207,7 +303,7 @@ test('a failing servers poll keeps the rooms and the last good server room', asy
   assert.deepEqual(updates[0], servers());
   assert.deepEqual(updates[1], servers());                 // round 2 failed: the last good room kept
   assert.ok(errors.some(m => /server room unavailable/.test(m)));
-  assert.ok(gateway.agents.some(a => a.office.group === SERVERS_KEY));
+  assert.deepEqual(gateway.servers, mapServers(servers()));
   assert.ok(gateway.agents.some(a => a.office.group === MINE));
 });
 
@@ -219,5 +315,5 @@ test('the hub validates both and replays both to a new client', () => {
   assert.deepEqual(hub.lastServers, servers());
   const g = new OfficeGateway(() => {});
   g.update(hub.last, hub.lastServers);
-  assert.ok(g.agents.some(a => a.id === 'office-servers-s1'));
+  assert.deepEqual(g.servers, mapServers(servers()));
 });

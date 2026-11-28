@@ -302,8 +302,13 @@ to the neutral `unknown` suit. When an Antigravity (Gemini) lane exists: add it 
   on it. It turns on when the gateway status is `connected` and every local agent (`remote:` ones aside) carries the
   bridge's id grammar, and off when a connected gateway lists any other local agent; otherwise it stays as it was. A
   stock gateway's agents never match, so it gets the stock office and the stock layout back.
-- **Layout** (1800 x 720, the local office canvas): 4 x 2 rooms of 430 x 340, each walled on three sides and open to
-  the middle corridor (a wall there would close the corridor: a wall's navigation padding is 15 px on a 25 px grid).
+- **Layout** (1800 x 720, the local office canvas): 4 x 2 rooms of 430 x 340 (rows at y 10 and 375), each walled at
+  the back and open to the middle corridor (a wall there would close the corridor: a wall's navigation padding is 15 px
+  on a 25 px grid). The side walls stop 60 px short of the corridor, and the bottom row starts on the 25 px grid (office
+  round 2 fix): full-height side walls closed the 20 px gap between the rows and sealed each column of rooms, so a
+  person spawned in another column had no path to their desk and wandered; off the grid, the bottom rooms' stacked
+  desks left no aisle to their right-hand seats. On Claw3D's own grid every seat is now reachable from every spawn
+  point and every other seat (rooms.test.mjs, with `CORTADOS_CLAW3D_CHECKOUT`; before: 3119 of 12716 and 1028 of 4556).
   Per room: the head desk in the middle of the top row with a report desk on each side, and 6 team desks in two rows
   of three. Desk `_uid`s are fixed (`cortados_r<room>_head0`, `_report0..1`, `_desk0..5`).
 - **Allocation** is sticky: a group keeps its room and a person their desk while they stay (and the desk is still the
