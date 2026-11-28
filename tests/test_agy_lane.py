@@ -295,6 +295,24 @@ class ProbeHonesty(AgyBase):
         # cursor movement alone, with no question, is still progress
         self.assertTrue(sc.agy_signing_in(SIGNING_IN + "\x1b[1A\r\x1b[2K ⣯ Signing in...\x1b[1B\x1b[1A\r ⣟ Signing in..."))
 
+    def test_every_escape_but_sgr_splits_a_fragment(self):
+        # review r2: cursor save/restore was not a break, so the question flattened into the restored spinner line
+        for prompt in (SIGNING_IN + "\n\x1b[sSigning in...\nContinue?\x1b[uSigning in...",      # the reviewer's repro
+                       SIGNING_IN + "\n\x1b7Signing in...\nContinue?\x1b8Signing in...",          # DEC save/restore
+                       SIGNING_IN + "Continue?\x1bM ⣯ Signing in...",                             # reverse index
+                       SIGNING_IN + "Continue?\x1b]0;agy\x07 ⣯ Signing in...",                    # OSC title (BEL)
+                       SIGNING_IN + "Continue?\x1b]2;agy\x1b\\ ⣯ Signing in...",                 # OSC title (ST)
+                       SIGNING_IN + "Continue?\x1b[?25l ⣯ Signing in...",                         # an unlisted CSI
+                       SIGNING_IN + "\x1b[1;33mCh\x1b[0m\x1b[1moose\x1b[0m an account\n"):        # SGR inside it
+            with self.subTest(prompt=prompt[-50:]):
+                self.assertFalse(sc.agy_signing_in(prompt))
+        # escapes alone, with no question, are still progress: save/restore, OSC title, SGR-coloured spinner
+        for progress in (SIGNING_IN + "\x1b[s ⣯ Signing in...\x1b[u ⣟ Signing in...\x1b[u ⣯ Signing in...",
+                         SIGNING_IN + "\x1b7 ⣯ Signing in...\x1b8 ⣟ Signing in...",
+                         SIGNING_IN + "\x1b]0;agy\x07\x1b[36m ⣯\x1b[0m Signing in..."):
+            with self.subTest(progress=progress[-50:]):
+                self.assertTrue(sc.agy_signing_in(progress))
+
     def test_a_repainted_question_is_refused_not_logged_in_at_once(self):
         binary, log = self.fake({"boot": SIGNING_IN + "Continue?\x1b[1A\r\x1b[2K Signing in...", "spin_s": 30,
                                  "boot_later": [BANNER], "usage": FIXTURE.read_text()})

@@ -804,24 +804,29 @@ _AGY_PROMPT_MARKERS = (r"https?://|www\.|browser|\bcode\b|\bpress\b(?!\s+(?:ctrl
                        r"|^\s*[>›❯]?\s*\d+[.)]\s|\?\s*$")
 
 
-# Where one screen FRAGMENT ends (review r1, 2026-11-27): a newline, a carriage return, and every CSI sequence that moves
-# the cursor or erases (cursor up/down/forward/back, next/previous line, column, position, vertical position, erase in
-# display/line, scroll, scroll region). _plain drops cursor-up, so "Continue?\x1b[1A\r\x1b[2K Signing in..." flattened to
-# one line ending "Signing in..." although "Continue?" stays on screen below the spinner; split here, each piece that
-# was ever painted is checked on its own.
-_AGY_FRAGMENT_BREAK = re.compile(rb"\r|\n|\x1b\[[0-9;?]*[A-HJKSTdfr]")
+# Where one screen FRAGMENT ends (review r1 and r2, 2026-11-27): a newline, a carriage return, and EVERY escape sequence
+# except SGR (CSI ... m: colours and styles, which may sit inside a question without moving anything). _plain drops
+# cursor movement, so "Continue?\x1b[1A\r\x1b[2K Signing in..." flattened to one line ending "Signing in..." although
+# "Continue?" stays on screen; r2 showed the same with cursor save/restore (CSI s/u, ESC 7/8), which an enumerated list
+# of breaks had missed. So the rule is inverted rather than enumerated: any CSI with another final or with intermediates,
+# any two-byte or charset ESC sequence (ESC 7, ESC 8, ESC M, ESC D, ESC E, ESC c, ESC ( B ...), any OSC/DCS/APC/PM/SOS
+# string (to BEL or ST, or to the next ESC when unterminated), and any unknown or truncated ESC is a break. A spurious
+# break only makes the check stricter (each piece is judged on its own); a missing one hides a question.
+_AGY_FRAGMENT_BREAK = re.compile(rb"\r|\n|\x1b[\]P_^X][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]|\x1b")
+_AGY_SGR = re.compile(rb"\x1b\[[0-9;:]*m")
 
 
 def _agy_fragments(raw: str) -> str:
-    """The screen text with one fragment per line (see _AGY_FRAGMENT_BREAK); other escapes removed as by _plain."""
-    return _plain(_AGY_FRAGMENT_BREAK.sub(b"\n", raw.encode("utf-8", "replace")))
+    """The screen text with one fragment per line (see _AGY_FRAGMENT_BREAK); SGR then removed as by _plain."""
+    return _plain(_AGY_FRAGMENT_BREAK.sub(lambda m: m.group(0) if _AGY_SGR.fullmatch(m.group(0)) else b"\n",
+                                          raw.encode("utf-8", "replace")))
 
 
 def agy_signing_in(shown: str) -> bool:
     """True while agy shows only its sign-in PROGRESS notice: the last "not signed in" notice has no account line after
     it, a "Signing in" spinner follows it, and nothing after it asks for anything (no sign-in rule, no prompt marker).
     `shown` is the raw screen (escapes kept). The prompt markers are tested against every FRAGMENT after the last notice
-    (split at newlines, carriage returns and cursor-movement / erase sequences), so a question or menu repainted under
+    (split at newlines, carriage returns and every escape sequence but SGR), so a question or menu repainted under
     or over the spinner still counts as a prompt; the other checks read the plain text."""
     plain = _plain(shown.encode("utf-8", "replace"))
     hits = list(re.finditer(_AGY_NOT_SIGNED_IN, plain, re.I))
