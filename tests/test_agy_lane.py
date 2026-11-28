@@ -66,6 +66,11 @@ def view(top):
 top = 0
 time.sleep(SCREENS.get("start_delay", 0))    # a slow start-up: nothing painted yet
 out(SCREENS["boot"])
+spin_end = time.time() + SCREENS.get("spin_s", 0)    # agy's "Signing in..." spinner repainting in place while it signs in
+frames = "⣷⣯⣟⡿⢿⣻⣽⣾"
+while time.time() < spin_end:
+    time.sleep(0.25)
+    out("\r\x1b[2K " + frames[int(time.time() * 4) % len(frames)] + " Signing in...")
 for step in SCREENS.get("boot_later", []):    # painted later, as agy does while it signs in
     time.sleep(0.6)
     if step.startswith("RAW:"):              # bytes as given: a bare LF stays a bare LF
@@ -244,11 +249,94 @@ class ProbeHonesty(AgyBase):
 
     def test_signing_in_that_never_finishes_is_refused_and_nothing_is_typed(self):
         binary, log = self.fake({"boot": SIGNING_IN})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)), \
+                self.short_allowance(4):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual(cm.exception.kind, "signin_timeout")      # slow, not "not logged in" (2026-11-27)
+        self.assertEqual(self.keys(log), b"")
+
+    # ---- 2026-11-27 on the Air: a signed-in agy's "Signing in..." outlasted the 12 s boot window (check unsettled,
+    # after_s 12.78, signing_in 1, account_lines 0). A progress notice alone is waited on, typing nothing, up to
+    # AGY_SIGNIN_ALLOWANCE_S; a sign-in prompt is still refused at once.
+    @staticmethod
+    def short_allowance(seconds: float):
+        return mock.patch.object(sc, "AGY_SETTLING", (sc.AGY_SETTLING[0], sc.AGY_SETTLING[1], seconds))
+
+    def test_signin_allowance_is_a_named_60_s_constant(self):
+        self.assertEqual(sc.AGY_SIGNIN_ALLOWANCE_S, 60.0)
+        self.assertEqual(sc.AGY_SETTLING, ("signin_timeout", sc.agy_signing_in, sc.AGY_SIGNIN_ALLOWANCE_S))
+        self.assertIn("signin_timeout", sc.LANE_STATE_TEXT)
+        self.assertNotEqual(sc.lane_state({"error": "x", "error_kind": "signin_timeout"}), "not logged in")
+
+    def test_progress_notice_is_told_apart_from_a_sign_in_prompt(self):
+        boot, picker = self.LOGIN_METHOD
+        spin = SIGNING_IN + "".join("\r\x1b[2K ⣯ Signing in..." for _ in range(40))
+        for progress in (SIGNING_IN, spin, SIGNING_IN + "Press ctrl+c to quit\n", boot):
+            with self.subTest(progress=progress[-40:]):
+                self.assertTrue(sc.agy_signing_in(progress))
+        for prompt in (SIGNING_IN + LOGGED_OUT, SIGNING_IN + self.PICKER, boot + picker,
+                       SIGNING_IN + "Open this link in your browser to continue\n",
+                       SIGNING_IN + "Enter the device code shown\n", SIGNING_IN + "Press any key to sign in\n",
+                       SIGNING_IN + "Continue? [y/n]\n", SIGNING_IN + "  1. Retry\n  2. Quit\n",
+                       "Welcome to the Antigravity CLI. You are currently not signed in.\n",     # no spinner
+                       SIGNING_IN + BANNER, BANNER):                                             # signed in
+            with self.subTest(prompt=prompt[-40:]):
+                self.assertFalse(sc.agy_signing_in(prompt))
+
+    def test_progress_notice_then_account_line_after_20_s_is_read(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "spin_s": 20, "boot_later": [BANNER],
+                                 "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary):                        # the real 12 s boot window and the real 60 s allowance
+            rec = sc._antigravity()
+        self.assertGreaterEqual(time.time() - t0, 20)
+        self.assertEqual(rec["tier"], "AI Pro")
+        self.assertEqual(self.keys(log), b"/usage\r")    # nothing typed before the account line, then only /usage
+
+    def test_progress_notice_past_the_allowance_is_signin_timeout_and_nothing_is_typed(self):
+        binary, log = self.fake({"boot": SIGNING_IN, "spin_s": 30, "boot_later": [BANNER],
+                                 "usage": FIXTURE.read_text()})
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)), \
+                self.short_allowance(6):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("signin_timeout", [], b""))
+        f = cm.exception.facts
+        self.assertEqual((f["check"], f["acting"], f["ready_seen"], f["allowance_s"]), ("settling", True, False, 6))
+        self.assertEqual((f["account_lines"], f["rules"]), (0, []))
+        self.assertGreaterEqual(f["after_s"], 6)
+        self.assertLess(f["after_s"], 10)
+        rec = sc._failed_record("antigravity", None, cm.exception)
+        self.assertEqual(rec["error_kind"], "signin_timeout")
+        self.assertEqual(rec["refusal"]["after_s"], f["after_s"])
+        self.assertEqual(sc.lane_state(rec), sc.LANE_STATE_TEXT["signin_timeout"])
+        entry = usage._one_lane("antigravity", rec, time.time(), sc.reading_freshness)
+        self.assertEqual((entry["error"], entry["state"]), ("signin_timeout", sc.LANE_STATE_TEXT["signin_timeout"]))
+        self.assertNotIn("@", json.dumps(rec))
+
+    def test_sign_in_picker_while_waiting_is_refused_at_once_and_nothing_is_typed(self):
+        _, picker = self.LOGIN_METHOD
+        binary, log = self.fake({"boot": SIGNING_IN, "spin_s": 5, "boot_later": [picker], "usage": FIXTURE.read_text()})
+        t0 = time.time()
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
-        self.assertEqual(cm.exception.kind, "not-logged-in")
-        self.assertEqual(self.keys(log), b"")
+        self.assertLess(time.time() - t0, 10)            # on sight, not at the end of the 60 s allowance
+        self.assertEqual((cm.exception.kind, cm.exception.typed, self.keys(log)), ("not-logged-in", [], b""))
+        self.assertEqual((cm.exception.facts["check"], cm.exception.facts["acting"]), ("refuse", False))
+        self.assertIn("login-method-picker", cm.exception.facts["rules"])
+
+    def test_sign_in_picker_is_not_waited_on(self):
+        binary, log = self.fake({"boot": SIGNING_IN + "Open this link in your browser to continue\n",
+                                 "usage": FIXTURE.read_text()})
+        t0 = time.time()
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+            with self.assertRaises(sc.ProbeRefused) as cm:
+                sc._antigravity()
+        self.assertLess(time.time() - t0, 6)             # judged at the end of the boot window, no allowance
+        self.assertEqual((cm.exception.kind, cm.exception.facts["check"], self.keys(log)),
+                         ("not-logged-in", "unsettled", b""))
 
     def test_signing_in_that_ends_on_a_sign_in_screen_is_refused_and_nothing_is_typed(self):
         binary, log = self.fake({"boot": SIGNING_IN, "boot_later": [LOGGED_OUT]})
@@ -343,13 +431,15 @@ class ProbeHonesty(AgyBase):
         self.assertNotIn("Welcome", flat)
 
     def test_unsettled_refusal_at_the_end_of_boot_names_its_check(self):
-        binary, log = self.fake({"boot": SIGNING_IN})
+        # the notice alone (no "Signing in" progress after it) is not waited on: refused unsettled at the end of boot
+        binary, log = self.fake({"boot": SIGNING_IN.split("\n\n", 1)[0] + "\n"})
         with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
         f = cm.exception.facts
         self.assertEqual((f["check"], f["acting"], f["ready_seen"], f["rules"]), ("unsettled", True, False, []))
-        self.assertEqual((f["notices"], f["signing_in"], f["account_lines"]), (1, 1, 0))
+        self.assertEqual((f["notices"], f["signing_in"], f["account_lines"]), (1, 0, 0))
+        self.assertLess(f["after_s"], 6)
         self.assertGreaterEqual(f["after_s"], 3)
 
     def test_a_failure_without_facts_drops_an_old_refusal(self):
@@ -427,7 +517,8 @@ class ProbeHonesty(AgyBase):
 
     def test_unsettled_without_a_trust_prompt_records_none(self):
         binary, log = self.fake({"boot": SIGNING_IN})
-        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)):
+        with self.env(binary), mock.patch.object(sc, "tui_capture", self.short_boot(sc.tui_capture)), \
+                self.short_allowance(4):
             with self.assertRaises(sc.ProbeRefused) as cm:
                 sc._antigravity()
         self.assertIs(cm.exception.facts["trust_prompt_seen"], False)

@@ -179,6 +179,7 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
                 cwd_check: Callable[[Path], None] | None = None, on_boot: Callable[[str], None] | None = None,
                 refuse_unsettled: tuple[tuple[str, str | Callable[[str], bool]], ...] = (),
                 refusal_facts: Callable[[str], dict[str, Any]] | None = None,
+                settling: tuple[str, Callable[[str], bool], float] | None = None,
                 answer_trust: bool = True, workdir: Path | None = None, workdir_fd: int | None = None,
                 on_spawn: Callable[[int], None] | None = None, on_reaped: Callable[[int], None] | None = None) -> str:
     """Open the CLI in a PTY, accept a folder-trust prompt for our own empty probe folder if shown (answer_trust), type
@@ -211,6 +212,11 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
     `ready` and each `refuse_unsettled` test are a regex or a predicate on the plain screen text (_screen_has).
     The boot window starts when the CLI first paints (its own start-up is waited for separately, up to boot_s); the read
     after a trust answer (answer_trust only) gets a fresh boot_s, as on main (#144 fix round 6 restored it).
+    `settling` is (kind, still_settling, allowance_s): when the boot read ends with `ready` not on screen and
+    `still_settling(screen)` true (the CLI shows only a progress notice, e.g. agy's "Signing in..." while it refreshes
+    its saved login), the read goes on, still typing nothing, until `ready` appears, the screen stops settling (a
+    prompt that `refuse` refuses mid-read, or anything else, judged as usual) or `allowance_s` seconds have passed since
+    the CLI first painted; then it refuses `kind` (check "settling"). `refuse` keeps being checked on every read.
     A ProbeRefused carries `facts`: fixed names and numbers only (which check, mid-read or about to act, ready seen,
     seconds since start, trust_prompt_seen), plus `refusal_facts(screen)` when given; never screen text."""
     if workdir is None:
@@ -343,8 +349,24 @@ def tui_capture(argv: list[str], command: str, done: str, env: dict[str, str], b
         if on_spawn is not None:
             on_spawn(pid)
         first_paint, _, _ = select.select([fd], [], [], boot_s)
-        boot_end = time.time() + (boot_s if first_paint else 0.0)
+        painted_at = time.time()
+        boot_end = painted_at + (boot_s if first_paint else 0.0)
         pump(boot_left(), until=ready)
+        if settling is not None and first_paint and not eof:
+            # a progress notice only (no prompt, no `ready`): wait for it to finish, up to the allowance from first paint;
+            # nothing is typed while waiting, and every read is still checked against `refuse` (pump)
+            settle_kind, still_settling, allowance_s = settling
+
+            def settled(shown: str) -> bool:
+                return bool(ready and _screen_has(ready, shown)) or not still_settling(shown)
+            if not settled(_plain(buf)):
+                settle_end = painted_at + allowance_s
+                while not eof and time.time() < settle_end and not settled(_plain(buf)):
+                    pump(settle_end - time.time(), until=settled)
+                if not eof and not settled(_plain(buf)):
+                    exc = refusal(settle_kind, stage, "settling", True, _plain(buf))
+                    exc.facts["allowance_s"] = allowance_s
+                    raise exc
         startup_chars = len(_plain(buf))
         ready_seen = bool(ready and _screen_has(ready, _plain(buf)))
         refused("boot")                               # answer_trust=False: a trust prompt refuses here, nothing typed
@@ -761,6 +783,42 @@ def agy_refusal_facts(shown: str) -> dict[str, Any]:
     }
 
 
+# agy refreshing its saved login (2026-11-27, the owner's Air under the provider's LaunchAgent): the notice and the
+# "Signing in..." spinner stayed up past the 12 s boot window (diagnostics: check unsettled, after_s 12.78,
+# signing_in 1, account_lines 0), and the probe refused a signed-in agy as not-logged-in. The owner: agy just takes a
+# while to sign in. So while ONLY that progress notice shows, the probe keeps reading (typing nothing) up to this many
+# seconds from agy's first paint, then refuses `signin_timeout`, which the views tell apart from "not logged in".
+# 60 s: several times the slowest refresh seen (~13 s and still going), yet well inside a sample interval.
+AGY_SIGNIN_ALLOWANCE_S = 60.0
+_AGY_SIGNING_IN = r"signing in"
+# What makes the text after the last notice a sign-in PROMPT rather than progress: the AGY_REFUSE sign-in rules
+# (login-method / account pickers, Google URLs, authorization codes, consent; refused mid-read), plus any line that asks
+# for a choice or a key or sends the owner elsewhere (a URL, a browser, a device code, a numbered menu, a y/n, a
+# question). "press ctrl+c" alone (a quit hint) is not a prompt. Such a screen is never waited on: it is judged at
+# once, as before (AGY_UNSETTLED refuses it not-logged-in).
+_AGY_PROMPT_MARKERS = (r"https?://|www\.|browser|\bcode\b|\bpress\b(?!\s+(?:ctrl|control)\s*\+?\s*c\b)"
+                       r"|\bchoose\b|\bselect\b|\benter\b|\[\s*y\s*/\s*n\s*\]|\(\s*y\s*/\s*n\s*\)"
+                       r"|^\s*[>›❯]?\s*\d+[.)]\s|\?\s*$")
+
+
+def agy_signing_in(shown: str) -> bool:
+    """True while agy shows only its sign-in PROGRESS notice: the last "not signed in" notice has no account line after
+    it, a "Signing in" spinner follows it, and nothing after it asks for anything (no sign-in rule, no prompt marker)."""
+    hits = list(re.finditer(_AGY_NOT_SIGNED_IN, shown, re.I))
+    if not hits:
+        return False
+    after = shown[hits[-1].end():]
+    if _agy_iso.banner_tier(after) is not None or not re.search(_AGY_SIGNING_IN, after, re.I):
+        return False
+    if re.search(_AGY_PROMPT_MARKERS, after, re.I | re.M):
+        return False
+    return not any(re.search(rule, after, re.I) for name, rule in _AGY_SIGN_IN_RULES if name != "not-signed-in-notice")
+
+
+# (kind, still settling, allowance): tui_capture's `settling` for the agy probe
+AGY_SETTLING = ("signin_timeout", agy_signing_in, AGY_SIGNIN_ALLOWANCE_S)
+
+
 def AGY_BOOT_READY(shown: str) -> bool:
     """The boot read stops once the banner's account line (signed in) is painted, else after boot_s. A trust prompt
     does not end it early: it is refused (`workspace_not_trusted`) at the end of the read, with nothing typed."""
@@ -778,6 +836,7 @@ LANE_STATE_TEXT = {
     "binary-missing": "not installed",
     "exec-failed": "could not start",
     "not-logged-in": "not logged in",
+    "signin_timeout": "sign-in not finished in time (agy still signing in)",
     "first-run-pending": "first-run setup pending",
     "forbidden-env": "refused: API key or ADC variable configured",
     "settings-refused": "refused: unsafe agy settings",
@@ -1177,7 +1236,7 @@ def _antigravity() -> dict[str, Any]:
         text = tui_capture([binary], "/usage", AGY_DONE, env, refuse=AGY_REFUSE, refuse_unsettled=AGY_UNSETTLED,
                            ready=AGY_BOOT_READY, inherit_path=False, diagnostics=diag, page=_agy_next_page,
                            cwd_check=lambda d: iso.check_dotenv(env["HOME"], d), on_boot=proven_boot,
-                           refusal_facts=agy_refusal_facts, answer_trust=False, workdir=folder,
+                           refusal_facts=agy_refusal_facts, settling=AGY_SETTLING, answer_trust=False, workdir=folder,
                            workdir_fd=ws.workspace_fd, on_spawn=ws.record_child, on_reaped=ws.clear_child)
     if not text.strip():
         if diag.get("eof") and diag.get("stage") in {"boot", "trust"}:
