@@ -49,7 +49,9 @@ $BackendCfg = Join-Path $CfgDir 'local-backend.json'
 $NodeCfg = Join-Path $NodeDir 'pc-node.json'
 $ActivityFile = Join-Path $CfgDir 'pc-activity.json'
 $Pythonw = Join-Path (Split-Path $Python -Parent) 'pythonw.exe'
-$User = "$env:USERDOMAIN\$env:USERNAME"
+# The account's real name from its token: over an OpenSSH session $env:USERDOMAIN is WORKGROUP, not the PC's name, so
+# "$env:USERDOMAIN\$env:USERNAME" named an account that does not exist (found installing on the PC, 2026-11-28).
+$User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Tasks = @('CortadOS-Strata', 'CortadOS-Gate', 'CortadOS-Activity')
 $RuleName = 'CortadOS local gate (tailnet only)'
 # Tailscale's address range (CGNAT 100.64.0.0/10): only tailnet peers may reach the gate's port.
@@ -115,6 +117,11 @@ if (-not $StrataExe) {
 Step "create $NodeDir and $LogDir" {
   New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
+# The manual switch is the flag file local_resources.local_switch_path() reads (~\.cortados\local-enabled). Serving is
+# on by default (owner 2026-11-24, node_policy), so a first install turns it on; a later run never does, because the
+# owner may have turned it off with the "serving OFF (game)" shortcut.
+$SwitchFlag = Join-Path $env:USERPROFILE '.cortados\local-enabled'
+$FirstInstall = -not (Test-Path $TokenFile)
 if (Test-Path $TokenFile) {
   Write-Host "token file exists: kept (never printed)"
 } else {
@@ -132,6 +139,12 @@ if (Test-Path $TokenFile) {
 Step "restrict the token file's ACL (icacls: this account read; SYSTEM, Administrators full)" {
   & icacls.exe $TokenFile /inheritance:r /grant:r "${User}:(R)" '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "icacls failed ($LASTEXITCODE)" }
+}
+if ($FirstInstall -and -not (Test-Path $SwitchFlag)) {
+  Step "turn the serving switch on ($SwitchFlag; serving is on by default, first install only)" {
+    New-Item -ItemType Directory -Force -Path (Split-Path $SwitchFlag -Parent) | Out-Null
+    Write-Ascii $SwitchFlag ''
+  }
 }
 if (Test-Path $BackendCfg) {
   Write-Host "backend config exists: kept ($BackendCfg)"

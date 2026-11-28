@@ -1131,3 +1131,40 @@ class WindowsScriptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallerScriptTests(unittest.TestCase):
+    """scripts/windows/install_pc_node.ps1 is never run here (no PowerShell on the Mac, and nothing may touch the PC), so
+    these check its text for the two fixes from the first real install (2026-11-28)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (ROOT / "scripts" / "windows" / "install_pc_node.ps1").read_text(encoding="ascii")
+        # Comment lines carry the reasons and may quote the old form; check the code lines only.
+        cls.code = "\n".join(line for line in cls.text.splitlines() if not line.lstrip().startswith("#"))
+
+    def test_the_account_comes_from_the_token_never_from_userdomain(self):
+        # Over OpenSSH $env:USERDOMAIN is WORKGROUP, so "$env:USERDOMAIN\$env:USERNAME" named no real account.
+        self.assertIn("$User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name", self.code)
+        self.assertNotIn("USERDOMAIN", self.code)
+        # The token ACL grants that account.
+        self.assertIn('"${User}:(R)"', self.code)
+
+    def test_the_switch_flag_is_the_path_the_gate_reads(self):
+        self.assertIn("$SwitchFlag = Join-Path $env:USERPROFILE '.cortados\\local-enabled'", self.code)
+        self.assertEqual(local_resources.local_switch_path().name, "local-enabled")
+        # The installer sets no CORTADOS_HOME for the gate, so the gate reads ~\.cortados\local-enabled.
+        self.assertNotIn("CORTADOS_HOME", self.code)
+
+    def test_the_switch_is_turned_on_at_first_install_only(self):
+        first = self.code.index("$FirstInstall = -not (Test-Path $TokenFile)")
+        token_made = self.code.index("Write-Ascii $TokenFile")
+        guard = self.code.index("if ($FirstInstall -and -not (Test-Path $SwitchFlag))")
+        # First install is decided before the token file is created, and the switch is written only under that guard.
+        self.assertLess(first, token_made)
+        self.assertLess(token_made, guard)
+        writes = [i for i in range(len(self.code)) if self.code.startswith("Write-Ascii $SwitchFlag", i)]
+        self.assertEqual(len(writes), 1)
+        self.assertGreater(writes[0], guard)
+        # The switch is never removed by the installer, so an owner's "off" survives a re-run and -Remove.
+        self.assertNotRegex(self.code, r"Remove-Item[^\n]*SwitchFlag")

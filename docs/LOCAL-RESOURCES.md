@@ -1980,8 +1980,12 @@ without another probe, S1's route (or another node) stands, and a pin gets a 503
 Dry run by default (`-Apply` makes the changes, `-Remove` takes them away). It registers `CortadOS-Strata` and
 `CortadOS-Gate` as startup tasks (S4U: no stored password, run with nobody signed in; highest privileges; priority
 Normal, because the default priority throttled Strata's expert loads ~25x; the gate 60 s after boot so Tailscale has its
-address) whose launchers restart the process 30 s after it exits, and `CortadOS-Activity` at logon. It creates the token
-file with its ACL, copies the example backend config if none exists, adds a firewall rule for the gate's port from the
+address) whose launchers restart the process 30 s after it exits, and `CortadOS-Activity` at logon. The tasks and the
+token ACL name the account from its Windows token (`WindowsIdentity.GetCurrent().Name`, `COMPUTER\user`), not
+`%USERDOMAIN%\%USERNAME%`: over OpenSSH `USERDOMAIN` is `WORKGROUP`, an account that does not exist (first install,
+2026-11-28). It creates the token file with its ACL and, on the first install only (no token file yet), turns the serving
+switch on (`%USERPROFILE%\.cortados\local-enabled`), because serving is on by default; a re-run never turns it on, so an
+owner's **serving OFF** stays off (`-Remove` keeps the token, so a run after it is a re-run too). It copies the example backend config if none exists, adds a firewall rule for the gate's port from the
 tailnet range only, and the two desktop shortcuts. PowerShell 5.1 safe (ASCII only). Deploy steps and acceptance checks:
 the runbook, section 12.
 
